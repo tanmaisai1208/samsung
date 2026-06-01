@@ -1,3 +1,4 @@
+https://github.com/TechHoldingLLC/Android-on-device-LLM-sample
 
 PS C:\Users\chennagiri.s> git clone https://github.com/TechHoldingLLC/Android-on-device-LLM-sample.git
 git : The term 'git' is not recognized as the name of a cmdlet, function, script file, or operable 
@@ -8,3 +9,4 @@ At line:1 char:1
 + ~~~
     + CategoryInfo          : ObjectNotFound: (git:String) [], CommandNotFoundException
     + FullyQualifiedErrorId : CommandNotFoundException
+
