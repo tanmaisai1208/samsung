@@ -1,11 +1,6 @@
-PS C:\Users\chennagiri.s\StudioProjects\Android-on-device-LLM-sample> gradlew --version
-gradlew : The term 'gradlew' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, 
-verify that the path is correct and try again.
-At line:1 char:1
-+ gradlew --version
-+ ~~~~~~~
-    + CategoryInfo          : ObjectNotFound: (gradlew:String) [], CommandNotFoundException
-    + FullyQualifiedErrorId : CommandNotFoundException
- 
+PS C:\Users\chennagiri.s\StudioProjects\Android-on-device-LLM-sample> .\gradlew --version
 
-Suggestion [3,General]: The command gradlew was not found, but does exist in the current location. Windows PowerShell does not load commands from the current location by default. If you trust this command, instead type: ".\gradlew". See "get-help about_Command_Precedence" for more details.
+ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH.
+
+Please set the JAVA_HOME variable in your environment to match the
+location of your Java installation.
