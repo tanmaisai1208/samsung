@@ -1,6 +1,6 @@
-PS C:\Users\chennagiri.s\StudioProjects\Android-on-device-LLM-sample> .\gradlew --version
+C:\Users\chennagiri.s>where.exe java
+INFO: Could not find files for the given pattern(s).
 
-ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH.
-
-Please set the JAVA_HOME variable in your environment to match the
-location of your Java installation.
+C:\Users\chennagiri.s>java -version
+'java' is not recognized as an internal or external command,
+operable program or batch file.
