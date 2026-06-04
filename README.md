@@ -1,2 +1,1 @@
-adb shell pm grant com.app.ondevicellmdemo android.permission.WRITE_SETTINGS
-adb shell appops set com.app.ondevicellmdemo android:get_usage_stats allow
+"C:\Program Files\Android Studio\jbr\bin\keytool.exe" -importcert -alias proxycert -file "C:\Users\chennagiri.s\Downloads\SRIB_2025.crt" -keystore "C:\Users\chennagiri.s\.gradle\custom-truststore.jks"
