@@ -1,1 +1,1 @@
-"C:\Program Files\Android Studio\jbr\bin\keytool.exe" -importcert -alias proxycert -file "C:\Users\chennagiri.s\Downloads\SRIB_2025.crt" -keystore "C:\Users\chennagiri.s\.gradle\custom-truststore.jks"
+keytool -importcert -alias proxycert -file "C:\Users\<your_username>\Downloads\PROXY-INT.crt" -keystore "C:\Users\<your_username>\.gradle\custom-truststore.jks"
