@@ -1,59 +1,26 @@
-Executing tasks: [:app:assembleDebug] in project C:\Users\chennagiri.s\StudioProjects\AgenticAIPOC
+package com.app.ondevicellmdemo.llm.tool
 
-> Task :app:preBuild UP-TO-DATE
-> Task :app:preDebugBuild UP-TO-DATE
-> Task :app:mergeDebugNativeDebugMetadata NO-SOURCE
-> Task :app:checkKotlinGradlePluginConfigurationErrors
-> Task :app:checkDebugAarMetadata UP-TO-DATE
-> Task :app:processDebugNavigationResources UP-TO-DATE
-> Task :app:compileDebugNavigationResources UP-TO-DATE
-> Task :app:generateDebugResValues UP-TO-DATE
-> Task :app:mapDebugSourceSetPaths UP-TO-DATE
-> Task :app:generateDebugResources UP-TO-DATE
-> Task :app:mergeDebugResources UP-TO-DATE
-> Task :app:packageDebugResources UP-TO-DATE
-> Task :app:parseDebugLocalResources UP-TO-DATE
-> Task :app:createDebugCompatibleScreenManifests UP-TO-DATE
-> Task :app:extractDeepLinksDebug UP-TO-DATE
-> Task :app:processDebugMainManifest UP-TO-DATE
-> Task :app:processDebugManifest UP-TO-DATE
-> Task :app:processDebugManifestForPackage UP-TO-DATE
-> Task :app:processDebugResources UP-TO-DATE
-> Task :app:kspDebugKotlin UP-TO-DATE
-> Task :app:javaPreCompileDebug UP-TO-DATE
-> Task :app:mergeDebugShaders UP-TO-DATE
-> Task :app:compileDebugShaders NO-SOURCE
-> Task :app:generateDebugAssets UP-TO-DATE
-> Task :app:mergeDebugAssets UP-TO-DATE
-> Task :app:compressDebugAssets UP-TO-DATE
-> Task :app:checkDebugDuplicateClasses UP-TO-DATE
-> Task :app:desugarDebugFileDependencies UP-TO-DATE
-> Task :app:mergeExtDexDebug UP-TO-DATE
-> Task :app:mergeLibDexDebug UP-TO-DATE
-> Task :app:mergeDebugJniLibFolders UP-TO-DATE
-> Task :app:mergeDebugNativeLibs UP-TO-DATE
-> Task :app:stripDebugDebugSymbols UP-TO-DATE
-> Task :app:validateSigningDebug UP-TO-DATE
-> Task :app:writeDebugAppMetadata UP-TO-DATE
-> Task :app:writeDebugSigningConfigVersions UP-TO-DATE
+import android.content.Context
+import android.os.BatteryManager
+import android.util.Log
 
-> Task :app:compileDebugKotlin
-e: file:///C:/Users/chennagiri.s/StudioProjects/AgenticAIPOC/app/src/main/java/com/app/ondevicellmdemo/llm/tool/GetTemperatureTool.kt:16:75 Unresolved reference: BATTERY_PROPERTY_TEMPERATURE
+private val Unit.BATTERY_PROPERTY_TEMPERATURE: Int
 
-> Task :app:compileDebugKotlin FAILED
+class GetTemperatureTool(private val context: Context) : Tool {
+    override val name = "get_temperature"
+    override val description = "Retrieves the current device temperature in Celsius."
+    override val parameters = emptyList<ToolParameter>()
 
-FAILURE: Build failed with an exception.
-
-* What went wrong:
-Execution failed for task ':app:compileDebugKotlin'.
-> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction
-   > Compilation error. See log for more details
-
-* Try:
-> Run with --stacktrace option to get the stack trace.
-> Run with --info or --debug option to get more log output.
-> Run with --scan to get full insights.
-> Get more help at https://help.gradle.org.
-
-BUILD FAILED in 3s
-32 actionable tasks: 2 executed, 30 up-to-date
+    override suspend fun execute(args: Map<String, String>): String {
+        return try {
+            val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            // Temperature is reported in tenths of a degree Celsius
+            val tempTenths = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_TEMPERATURE)
+            val tempCelsius = tempTenths / 10.0
+            "Current temperature: $tempCelsius°C"
+        } catch (e: Exception) {
+            Log.e("GetTemperatureTool", "Failed to retrieve temperature", e)
+            "Error retrieving temperature: ${e.localizedMessage}"
+        }
+    }
+}
