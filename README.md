@@ -1,38 +1,57 @@
-package com.app.ondevicellmdemo.llm.tool
+Executing tasks: [:app:assembleDebug] in project C:\Users\chennagiri.s\StudioProjects\AgenticAIPOC
 
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.os.BatteryManager
-import android.util.Log
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preDebugBuild UP-TO-DATE
+> Task :app:mergeDebugNativeDebugMetadata NO-SOURCE
+> Task :app:checkKotlinGradlePluginConfigurationErrors
+> Task :app:checkDebugAarMetadata UP-TO-DATE
+> Task :app:processDebugNavigationResources UP-TO-DATE
+> Task :app:compileDebugNavigationResources UP-TO-DATE
+> Task :app:generateDebugResValues UP-TO-DATE
+> Task :app:mapDebugSourceSetPaths UP-TO-DATE
+> Task :app:generateDebugResources UP-TO-DATE
+> Task :app:mergeDebugResources UP-TO-DATE
+> Task :app:packageDebugResources UP-TO-DATE
+> Task :app:parseDebugLocalResources UP-TO-DATE
+> Task :app:createDebugCompatibleScreenManifests UP-TO-DATE
+> Task :app:extractDeepLinksDebug UP-TO-DATE
+> Task :app:processDebugMainManifest
+> Task :app:processDebugManifest
+> Task :app:javaPreCompileDebug UP-TO-DATE
+> Task :app:mergeDebugShaders UP-TO-DATE
+> Task :app:compileDebugShaders NO-SOURCE
+> Task :app:generateDebugAssets UP-TO-DATE
+> Task :app:mergeDebugAssets UP-TO-DATE
+> Task :app:compressDebugAssets UP-TO-DATE
+> Task :app:checkDebugDuplicateClasses UP-TO-DATE
+> Task :app:desugarDebugFileDependencies UP-TO-DATE
+> Task :app:mergeExtDexDebug UP-TO-DATE
+> Task :app:mergeLibDexDebug UP-TO-DATE
+> Task :app:mergeDebugJniLibFolders UP-TO-DATE
+> Task :app:mergeDebugNativeLibs UP-TO-DATE
+> Task :app:stripDebugDebugSymbols UP-TO-DATE
+> Task :app:validateSigningDebug UP-TO-DATE
+> Task :app:writeDebugAppMetadata UP-TO-DATE
+> Task :app:writeDebugSigningConfigVersions UP-TO-DATE
+> Task :app:processDebugManifestForPackage
+> Task :app:processDebugResources
+> Task :app:kspDebugKotlin
 
-class GetTemperatureTool(private val context: Context) : Tool {
+> Task :app:compileDebugKotlin FAILED
+e: file:///C:/Users/chennagiri.s/StudioProjects/AgenticAIPOC/app/src/main/java/com/app/ondevicellmdemo/llm/tool/GetTemperatureTool.kt:16:18 Type of 'parameters' is not a subtype of the overridden property 'public abstract val parameters: List<ToolParameter> defined in com.app.ondevicellmdemo.llm.tool.Tool'
 
-    override val name = "get_temperature"
+FAILURE: Build failed with an exception.
 
-    override val description =
-        "Retrieves the current device temperature in Celsius."
+* What went wrong:
+Execution failed for task ':app:compileDebugKotlin'.
+> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction
+   > Compilation error. See log for more details
 
-    override val parameters = emptyList<String>()
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights.
+> Get more help at https://help.gradle.org.
 
-    override suspend fun execute(args: Map<String, String>): String {
-        return try {
-            val batteryStatus = context.registerReceiver(
-                null,
-                IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-            )
-
-            val tempTenths = batteryStatus?.getIntExtra(
-                BatteryManager.EXTRA_TEMPERATURE,
-                0
-            ) ?: 0
-
-            val tempCelsius = tempTenths / 10.0
-
-            "Current temperature: $tempCelsius°C"
-        } catch (e: Exception) {
-            Log.e("GetTemperatureTool", "Failed to retrieve temperature", e)
-            "Error retrieving temperature: ${e.localizedMessage}"
-        }
-    }
-}
+BUILD FAILED in 5s
+32 actionable tasks: 7 executed, 25 up-to-date
