@@ -1,8 +1,1 @@
-#### Issue 1: SSL Certificate Error
-**Error:** `unable to find valid certification path to requested target` / `PKIX path building failed`
-**Cause:** Corporate proxy/firewall intercepts HTTPS traffic with its own SSL certificate, which Java's JVM doesn't trust.
-**Fix:**
-1. Copied default Java cacerts to `~/.gradle/custom-truststore.jks`
-2. Imported corporate proxy cert (`PROXY-INT.crt`) into it using `keytool -importcert`
-3. Added JVM args in `gradle.properties`: `-Djavax.net.ssl.trustStore=...custom-truststore.jks`
-4. Killed running Gradle daemons (`taskkill /f /im java.exe`) so they restart with new config
+__Bottom line__: the autocorrelation plot shows modest correlation at the first few lags, while the Hurst exponent aggregates behaviour over many lags and indicates that this correlation vanishes quickly. Hence the battery‑SoC series is short‑term correlated but overall anti‑persistent,
