@@ -1,37 +1,45 @@
+def main():
+    base_dir = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "Downloads",
+            "raw"
+        )
+    )
 
-df = pd.read_csv(csv_path)
+    print(f"Base dir resolved: {base_dir}")
 
-# Clean column names
-df.columns = [c.strip() for c in df.columns]
+    csv_files = glob.glob(
+        os.path.join(base_dir, "*.csv")
+    )
 
-# Use DateTime column
-if "DateTime" not in df.columns:
-    raise KeyError("DateTime column not found")
+    if not csv_files:
+        print("No CSV files found.")
+        return
 
-df["datetime"] = pd.to_datetime(df["DateTime"], errors="coerce")
+    summary = []
 
-# Remove invalid timestamps
-df = df.dropna(subset=["datetime"])
+    for csv_path in tqdm(csv_files, desc="Processing CSVs"):
 
-# Sort chronologically
-df = df.sort_values("datetime")
+        try:
 
-print(f"Original rows: {len(df)}")
+            acf_img, hurst_img, H = process_file(csv_path)
 
-# Set datetime index
-df = df.set_index("datetime")
+            summary.append({
+                "file": os.path.basename(csv_path),
+                "acf": acf_img,
+                "hurst": hurst_img,
+                "H": H
+            })
 
-# Create exact 1-hour grid
-hourly_df = df.resample("1h").asfreq()
+        except Exception as e:
 
-# Interpolate SoC
-hourly_df["Soc"] = (
-    hourly_df["Soc"]
-    .astype(float)
-    .interpolate(method="time")
-)
+            print(f"Failed on {csv_path}: {e}")
 
-print(f"Hourly rows after resampling: {len(hourly_df)}")
+    print("\nSummary:")
 
-# Final series used for ACF and Hurst
-soc = hourly_df["Soc"].dropna().values
+    for item in summary:
+        print(
+            f"{item['file']} -> H = {item['H']:.4f}"
+        )
