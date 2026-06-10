@@ -1,4 +1,37 @@
-DateTime	ID	TimeStamp	ChargingStatus	Soc	DischargeLevel	Date	dayofweek	dayname	month	monthname	dSocdt
-2024-05-07 17:00:00+05:30	0b2ab3916c9084f8255a063347a6ea05e4155e0e6077a9aafbde7bd5c7399939	1.72E+12	1	62	10708	07-05-2024	1	Tuesday	5	May	
-2024-05-07 18:00:00+05:30	0b2ab3916c9084f8255a063347a6ea05e4155e0e6077a9aafbde7bd5c7399939	1.72E+12	0	86	10718	07-05-2024	1	Tuesday	5	May	-0.002737329
-2024-05-07 19:00:00+05:30	0b2ab3916c9084f8255a063347a6ea05e4155e0e6077a9aafbde7bd5c7399939	1.72E+12	0	71	10728	07-05-2024	1	Tuesday	5	May	-0.000792948
+
+df = pd.read_csv(csv_path)
+
+# Clean column names
+df.columns = [c.strip() for c in df.columns]
+
+# Use DateTime column
+if "DateTime" not in df.columns:
+    raise KeyError("DateTime column not found")
+
+df["datetime"] = pd.to_datetime(df["DateTime"], errors="coerce")
+
+# Remove invalid timestamps
+df = df.dropna(subset=["datetime"])
+
+# Sort chronologically
+df = df.sort_values("datetime")
+
+print(f"Original rows: {len(df)}")
+
+# Set datetime index
+df = df.set_index("datetime")
+
+# Create exact 1-hour grid
+hourly_df = df.resample("1h").asfreq()
+
+# Interpolate SoC
+hourly_df["Soc"] = (
+    hourly_df["Soc"]
+    .astype(float)
+    .interpolate(method="time")
+)
+
+print(f"Hourly rows after resampling: {len(hourly_df)}")
+
+# Final series used for ACF and Hurst
+soc = hourly_df["Soc"].dropna().values
