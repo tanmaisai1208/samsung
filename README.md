@@ -1,22 +1,9 @@
-# analyze_battery.py
-"""
-Battery SoC Long‑Range Dependency Analysis
-=======================================
+dsocdt_series = df_hourly["dSocdt"].values.astype(float)
 
-This script investigates whether the battery State‑of‑Charge (SoC) time‑series
-exhibits long‑range dependence (LRD) using two complementary techniques:
+print(f"  Total hourly rows : {len(df_hourly)}")
+print(f"  Samples used      : {len(dsocdt_series)}")
 
-1. **Autocorrelation Function (ACF)** – visualises correlation of the series with
-   lagged versions of itself.
-2. **Hurst exponent (H)** – a scalar summary of the scaling behaviour of the
-   autocorrelation (or the rescaled‑range) and indicates persistence:
-   * ``0 < H < 0.5`` – anti‑persistent (mean‑reverting)
-   * ``H = 0.5``   – memoryless (random walk)
-   * ``0.5 < H < 1`` – persistent (long‑memory)
-
-The script is lightweight and can be run on any Windows machine with a standard
-Python environment (≥3.8).  It reads the CSV files produced by the original data
-‑collection pipeline (see ``../Downloads/carat/carat``), creates a regular
+if len(dsocdt_series) < MAX_LAG + 1:‑collection pipeline (see ``../Downloads/carat/carat``), creates a regular
 time‑grid, computes the discharge‑rate ``dSoC/dt`` and then produces the
 following artefacts:
 
