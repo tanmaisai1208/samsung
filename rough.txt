@@ -454,3 +454,125 @@ if not summary_df.empty:
     print(f"Overall mean accuracy (all devices + windows): "
           f"{summary_df['Accuracy_%'].mean():.2f}%")
 print("=" * 70)
+
+
+ File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
+    X = validate_data(
+        ^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
+    _check_n_features(_estimator, X, reset=reset)
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
+    raise ValueError(
+ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+
+======================================================================
+Device : 34e58ca7d12fee2168f9697671a5df9bef5a34a2c49b9b75a2a3e8deb8ff8c97
+======================================================================
+ Loaded wide CSV: 26 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-06-06 → 2024-06-19 (14d) | Test: 2024-06-20 → 2024-06-26 (7d)
+ ERROR: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 186, in sliding_window_lstm
+    tgt_scaled = scaler.transform(dummy)[0, :24]
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\_set_output.py", line 319, in wrapped
+    data_to_wrap = f(self, X, *args, **kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
+    X = validate_data(
+        ^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
+    _check_n_features(_estimator, X, reset=reset)
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
+    raise ValueError(
+ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+
+======================================================================
+Device : 35029dbb4217c0f9f09917e7588b9cf52dc7c3c583ca150c08c3ff15b51e502d
+======================================================================
+ Loaded wide CSV: 72 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-07 → 2024-05-20 (14d) | Test: 2024-05-21 → 2024-05-27 (7d)
+ ERROR: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 186, in sliding_window_lstm
+    tgt_scaled = scaler.transform(dummy)[0, :24]
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\_set_output.py", line 319, in wrapped
+    data_to_wrap = f(self, X, *args, **kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
+    X = validate_data(
+        ^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
+    _check_n_features(_estimator, X, reset=reset)
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
+    raise ValueError(
+ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+
+======================================================================
+Device : 401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767
+======================================================================
+ Loaded wide CSV: 74 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-05 → 2024-05-18 (14d) | Test: 2024-05-19 → 2024-05-25 (7d)
+ ERROR: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 186, in sliding_window_lstm
+    tgt_scaled = scaler.transform(dummy)[0, :24]
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\_set_output.py", line 319, in wrapped
+    data_to_wrap = f(self, X, *args, **kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
+    X = validate_data(
+        ^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
+    _check_n_features(_estimator, X, reset=reset)
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
+    raise ValueError(
+ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+
+======================================================================
+Device : 42233253fe42e009fa081604c3c68c443e3a8ba5462444cd1147d0184dc14875
+======================================================================
+ Loaded wide CSV: 73 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
+ ERROR: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 186, in sliding_window_lstm
+    tgt_scaled = scaler.transform(dummy)[0, :24]
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\_set_output.py", line 319, in wrapped
+    data_to_wrap = f(self, X, *args, **kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
+    X = validate_data(
+        ^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
+    _check_n_features(_estimator, X, reset=reset)
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
+    raise ValueError(
+ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
