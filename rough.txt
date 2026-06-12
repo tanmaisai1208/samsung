@@ -1,469 +1,153 @@
-"""
-Battery Management - Predictive Battery Management Through Usage Pattern Recognition
-======================================================================================
-Model : Bidirectional LSTM (sequence-to-sequence)
-
-Reads wide daily CSVs already produced by battery_train_test.py (XGBoost step).
-No re-pivoting needed.
-
-Step B : Sliding-window train / predict with Bidirectional LSTM
-          Train = 14-day window (2 weeks)
-          Test = next 7-day window (1 week) — unseen
-          Shift = 7 days each iteration
-          LookBack= 7 days of past daily vectors fed as input sequence
-
-          Architecture:
-            Input : (7 days, 73 features/day)
-                     [24 dSocdt + 24 Soc + 24 ChargingStatus + 1 dayofweek]
-            BiLSTM : 2 stacked layers (128 → 64 units each direction)
-            Dropout: 0.3 between layers
-            Dense : 24 outputs (dSocdt_h0 … dSocdt_h23 of next day)
-
-Outputs (written to results/lstm_results/):
-  predictions/<name>_lstm_predictions.csv
-  plots/<name>_lstm_sliding_window.png
-  lstm_summary.csv
-"""
-
-import os
-import glob
-import warnings
-import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import (Bidirectional, LSTM, Dense,
-                                     Dropout, Input)
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.optimizers import Adam
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-
-warnings.filterwarnings("ignore")
-tf.get_logger().setLevel("ERROR")
-
-# ─────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────
-
-# Folder containing *_wide.csv files already produced by XGBoost step
-WIDE_FOLDER = "results/wide_csv"
-
-OUTPUT_FOLDER = "results/lstm"
-PRED_FOLDER = os.path.join(OUTPUT_FOLDER, "predictions")
-PLOT_FOLDER = os.path.join(OUTPUT_FOLDER, "plots")
-
-for d in [OUTPUT_FOLDER, PRED_FOLDER, PLOT_FOLDER]:
-    os.makedirs(d, exist_ok=True)
-
-TRAIN_DAYS = 14
-TEST_DAYS = 7
-SHIFT_DAYS = 7
-LOOKBACK = 7
-
-ACC_THRESHOLD = 0.02
-EPOCHS = 80
-BATCH_SIZE = 8
-PATIENCE = 12
-
-HOURS = list(range(24))
-
-SEED = 42
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
-
-# ─────────────────────────────────────────────────────────────
-# COLUMN DEFINITIONS (must match XGBoost wide CSV layout)
-# ─────────────────────────────────────────────────────────────
-
-DSOCDT_COLS = [f"dSocdt_h{h}" for h in HOURS]
-# SOC_COLS = [f"Soc_h{h}" for h in HOURS]
-# CS_COLS = [f"ChargingStatus_h{h}" for h in HOURS]
-# ALL_COLS = DSOCDT_COLS + SOC_COLS + CS_COLS # 72 cols
-ALL_COLS = DSOCDT_COLS
-
-
-# ─────────────────────────────────────────────────────────────
-# FEATURE HELPERS
-# ─────────────────────────────────────────────────────────────
-
-def day_vector(wide: pd.DataFrame, day_idx: int) -> np.ndarray:
-    """73-element feature vector: 24 dSocdt + 24 Soc + 24 CS + 1 dayofweek."""
-    row = wide.iloc[day_idx]
-    dow = float(pd.Timestamp(wide.index[day_idx]).dayofweek)
-    return np.append(row[ALL_COLS].values.astype(float), dow)
-
-
-# ─────────────────────────────────────────────────────────────
-# LSTM MODEL BUILDER
-# ─────────────────────────────────────────────────────────────
-
-def build_model(input_shape: tuple) -> tf.keras.Model:
-    model = Sequential([
-        Input(shape=input_shape),
-        Bidirectional(LSTM(128, return_sequences=True)),
-        Dropout(0.3),
-        Bidirectional(LSTM(64, return_sequences=False)),
-        Dropout(0.3),
-        Dense(24),
-    ])
-    model.compile(optimizer=Adam(learning_rate=1e-3), loss="huber")
-    return model
-
-
-# ─────────────────────────────────────────────────────────────
-# ACCURACY METRIC
-# ─────────────────────────────────────────────────────────────
-
-def pct_accuracy(actual: np.ndarray, pred: np.ndarray) -> float:
-    return float(np.mean(np.abs(actual - pred) <= ACC_THRESHOLD)) * 100.0
-
-
-# ─────────────────────────────────────────────────────────────
-# SLIDING-WINDOW TRAIN / PREDICT
-# ─────────────────────────────────────────────────────────────
-
-def sliding_window_lstm(wide: pd.DataFrame, device_name: str) -> list:
-    n_days = len(wide)
-    results = []
-    win_num = 0
-    train_start = 0
-
-    while True:
-        train_end = train_start + TRAIN_DAYS
-        test_start = train_end
-        test_end = min(test_start + TEST_DAYS, n_days)
-
-        if test_start >= n_days:
-            break
-
-        win_num += 1
-        train_dates = wide.index[train_start:train_end].tolist()
-        test_dates = wide.index[test_start:test_end].tolist()
-        n_test = test_end - test_start
-
-        print(f" Window {win_num:2d} | "
-              f"Train: {train_dates[0]} → {train_dates[-1]} ({TRAIN_DAYS}d) | "
-              f"Test: {test_dates[0]} → {test_dates[-1]} ({n_test}d)")
-
-        # 1. Fit scaler on train data only (no leakage)
-        train_feats = np.array(
-            [day_vector(wide, i) for i in range(train_start, train_end)],
-            dtype=np.float32
-        )
-        scaler = MinMaxScaler(feature_range=(-1, 1))
-        scaler.fit(train_feats)
-
-        # Scale train + test slice together (fit was train-only)
-        all_feats = np.array(
-            [day_vector(wide, i) for i in range(train_start, test_end)],
-            dtype=np.float32
-        )
-        all_scaled = scaler.transform(all_feats)
-
-        def get_scaled_vec(abs_day_idx: int) -> np.ndarray:
-            rel = abs_day_idx - train_start
-            if rel < 0:
-                return np.zeros(73, dtype=np.float32)
-            return all_scaled[rel]
-
-        # 2. Build training sequences
-        X_train, y_train = [], []
-        for i in range(train_start, train_end):
-            seq = np.array(
-                [get_scaled_vec(i - LOOKBACK + k) for k in range(LOOKBACK)],
-                dtype=np.float32
-            )
-            tgt_raw = wide.iloc[i][DSOCDT_COLS].values.astype(np.float32)
-            dummy = np.zeros((1, 73), dtype=np.float32)
-            dummy[0, :24] = tgt_raw
-            tgt_scaled = scaler.transform(dummy)[0, :24]
-            X_train.append(seq)
-            y_train.append(tgt_scaled)
-
-        X_train = np.array(X_train, dtype=np.float32)
-        y_train = np.array(y_train, dtype=np.float32)
-
-        if len(X_train) < 2:
-            print(" Skipping: insufficient training sequences.")
-            train_start += SHIFT_DAYS
-            continue
-
-        # 3. Train
-        model = build_model(input_shape=(LOOKBACK, 73))
-        callbacks = [
-            EarlyStopping(monitor="val_loss", patience=PATIENCE,
-                          restore_best_weights=True, verbose=0),
-            ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                              patience=5, min_lr=1e-5, verbose=0),
-        ]
-        history = model.fit(
-            X_train, y_train,
-            epochs = EPOCHS,
-            batch_size = BATCH_SIZE,
-            validation_split = 0.15,
-            callbacks = callbacks,
-            verbose = 0,
-            shuffle = False,
-        )
-        epochs_ran = len(history.history["loss"])
-
-        # 4. Autoregressive prediction over test week
-        buffer = [get_scaled_vec(test_start - LOOKBACK + k)
-                  for k in range(LOOKBACK)]
-
-        y_pred_all, y_test_all = [], []
-
-        for d in range(n_test):
-            abs_day = test_start + d
-            seq_input = np.array(buffer, dtype=np.float32)[np.newaxis]
-
-            pred_scaled = model.predict(seq_input, verbose=0)[0]
-
-            dummy_inv = np.zeros((1, 73), dtype=np.float32)
-            dummy_inv[0, :24] = pred_scaled
-            pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
-            pred_original = np.clip(pred_original, a_min=None, a_max=0.0)
-
-            actual = wide.iloc[abs_day][DSOCDT_COLS].values.astype(float)
-            y_pred_all.append(pred_original)
-            y_test_all.append(actual)
-
-            # Feed predicted dSocdt back into buffer for next step
-            next_raw = day_vector(wide, abs_day).copy()
-            next_raw[:24] = pred_original
-            next_scaled = scaler.transform(next_raw[np.newaxis])[0]
-            buffer.pop(0)
-            buffer.append(next_scaled)
-
-        y_pred_all = np.array(y_pred_all)
-        y_test_all = np.array(y_test_all)
-
-        # 5. Metrics
-        flat_actual = y_test_all.flatten()
-        flat_pred = y_pred_all.flatten()
-
-        acc = pct_accuracy(flat_actual, flat_pred)
-        mae = mean_absolute_error(flat_actual, flat_pred)
-        rmse = np.sqrt(mean_squared_error(flat_actual, flat_pred))
-        per_day_acc = [pct_accuracy(y_test_all[d], y_pred_all[d])
-                       for d in range(n_test)]
-
-        print(f" => Epochs: {epochs_ran:3d} | "
-              f"Accuracy: {acc:.2f}% | MAE: {mae:.5f} | RMSE: {rmse:.5f}")
-
-        results.append({
-            "Window" : win_num,
-            "TrainStart" : train_dates[0],
-            "TrainEnd" : train_dates[-1],
-            "TestStart" : test_dates[0],
-            "TestEnd" : test_dates[-1],
-            "TestDays" : n_test,
-            "EpochsRan" : epochs_ran,
-            "Accuracy_%" : round(acc, 2),
-            "MAE" : round(mae, 6),
-            "RMSE" : round(rmse, 6),
-            "PerDayAccuracy": [round(a, 2) for a in per_day_acc],
-            "y_test" : y_test_all,
-            "y_pred" : y_pred_all,
-            "test_dates" : test_dates,
-        })
-
-        train_start += SHIFT_DAYS
-
-    return results
-
-
-# ─────────────────────────────────────────────────────────────
-# PLOTTING
-# ─────────────────────────────────────────────────────────────
-
-def plot_results(results: list, device_name: str, plot_path: str):
-    if not results:
-        return
-
-    n_windows = len(results)
-    fig = plt.figure(figsize=(16, 5 + 4 * n_windows))
-    fig.suptitle(f"BiLSTM Sliding-Window Results — {device_name}",
-                 fontsize=14, fontweight="bold", y=0.99)
-
-    ax_acc = fig.add_subplot(n_windows + 1, 1, 1)
-    labels = [f"W{r['Window']}\n{r['TestStart']}" for r in results]
-    accuracies = [r["Accuracy_%"] for r in results]
-    colors = ["steelblue" if a >= 50 else "salmon" for a in accuracies]
-    mean_acc = np.mean(accuracies)
-
-    bars = ax_acc.bar(labels, accuracies, color=colors, edgecolor="white",
-                      linewidth=0.8, zorder=3)
-    ax_acc.axhline(50, color="gray", linestyle="--", lw=1.2, label="50% reference")
-    ax_acc.axhline(mean_acc, color="crimson", linestyle="-", lw=1.5,
-                   label=f"Mean: {mean_acc:.1f}%")
-
-    for bar, acc in zip(bars, accuracies):
-        ax_acc.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 1, f"{acc:.1f}%",
-                    ha="center", va="bottom", fontsize=8.5, fontweight="bold")
-
-    ax_acc.set_ylim(0, 115)
-    ax_acc.set_ylabel("Accuracy (%)", fontsize=11)
-    ax_acc.set_title(
-        f"Window-wise Accuracy (threshold: |error| ≤ {ACC_THRESHOLD})", fontsize=11)
-    ax_acc.legend(fontsize=9)
-    ax_acc.grid(axis="y", linestyle="--", alpha=0.4)
-
-    cmap = plt.cm.tab10
-    for wi, r in enumerate(results):
-        ax = fig.add_subplot(n_windows + 1, 1, wi + 2)
-        for d_idx, date in enumerate(r["test_dates"]):
-            color = cmap(d_idx % 10)
-            ax.plot(HOURS, r["y_test"][d_idx], color=color, lw=1.6,
-                    label=f"{date} actual")
-            ax.plot(HOURS, r["y_pred"][d_idx], color=color, lw=1.4,
-                    linestyle="--", alpha=0.8)
-
-        solid_p = mpatches.Patch(color="gray", label="Actual (solid)")
-        dash_p = mpatches.Patch(color="gray", label="Predicted (dashed)")
-        handles, lbls = ax.get_legend_handles_labels()
-        ax.legend(handles + [solid_p, dash_p],
-                  lbls + ["Actual (solid)", "Predicted (dashed)"],
-                  fontsize=6.5, ncol=5, loc="lower right")
-        ax.set_title(
-            f"Window {r['Window']} | Test: {r['TestStart']} → {r['TestEnd']} "
-            f"| Acc: {r['Accuracy_%']:.1f}% | MAE: {r['MAE']:.4f}",
-            fontsize=9.5
-        )
-        ax.set_xlabel("Hour of day", fontsize=9)
-        ax.set_ylabel("dSocdt", fontsize=9)
-        ax.set_xticks(HOURS)
-        ax.grid(linestyle="--", alpha=0.3)
-
-    fig.tight_layout(rect=[0, 0, 1, 0.98])
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f" Plot saved → {plot_path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# MAIN LOOP — read wide CSVs directly, no re-pivoting
-# ─────────────────────────────────────────────────────────────
-
-wide_files = sorted(glob.glob(os.path.join(WIDE_FOLDER, "*_wide.csv")))
-print(f"Found {len(wide_files)} wide CSV file(s) in '{WIDE_FOLDER}'\n")
-
-all_summary = []
-
-for wide_path in wide_files:
-    base_name = os.path.splitext(os.path.basename(wide_path))[0]
-    device_name = base_name.replace("_wide", "")
-
-    pred_path = os.path.join(PRED_FOLDER, f"{device_name}_lstm_predictions.csv")
-    plot_path = os.path.join(PLOT_FOLDER, f"{device_name}_lstm_sliding_window.png")
-
-    print("=" * 70)
-    print(f"Device : {device_name}")
-    print("=" * 70)
-
-    try:
-        # Read the wide CSV produced by the XGBoost step
-        wide = pd.read_csv(wide_path, index_col="Date")
-        print(f" Loaded wide CSV: {len(wide)} days x {len(wide.columns)} cols")
-
-        # Ensure dSocdt columns have no positive values
-        # (should already be zeroed by XGBoost step, but enforce here too)
-        wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
-
-        total_days = len(wide)
-        if total_days < TRAIN_DAYS + TEST_DAYS:
-            print(f" Skipping: need >= {TRAIN_DAYS + TEST_DAYS} days, "
-                  f"only {total_days} available.\n")
-            continue
-
-        print(f"\n Sliding windows "
-              f"(train={TRAIN_DAYS}d, test={TEST_DAYS}d, shift={SHIFT_DAYS}d, "
-              f"lookback={LOOKBACK}d)\n")
-
-        results = sliding_window_lstm(wide, device_name)
-
-        if not results:
-            print(" No valid windows.\n")
-            continue
-
-        # Save predictions CSV
-        pred_rows = []
-        for r in results:
-            for d_idx, date in enumerate(r["test_dates"]):
-                for h in HOURS:
-                    pred_rows.append({
-                        "Window" : r["Window"],
-                        "Date" : date,
-                        "Hour" : h,
-                        "Actual_dSocdt" : round(float(r["y_test"][d_idx, h]), 6),
-                        "Pred_dSocdt" : round(float(r["y_pred"][d_idx, h]), 6),
-                        "AbsError" : round(abs(float(r["y_test"][d_idx, h])
-                                                    - float(r["y_pred"][d_idx, h])), 6),
-                    })
-        pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
-        print(f" Predictions CSV → {pred_path}")
-
-        plot_results(results, device_name, plot_path)
-
-        mean_acc = round(np.mean([r["Accuracy_%"] for r in results]), 2)
-        mean_mae = round(np.mean([r["MAE"] for r in results]), 6)
-        mean_rmse = round(np.mean([r["RMSE"] for r in results]), 6)
-
-        print(f"\n Overall mean accuracy : {mean_acc:.2f}%")
-        print(f" Overall mean MAE : {mean_mae:.5f}")
-        print(f" Overall mean RMSE : {mean_rmse:.5f}")
-
-        for r in results:
-            all_summary.append({
-                "Device" : device_name,
-                "Window" : r["Window"],
-                "TrainStart" : r["TrainStart"],
-                "TrainEnd" : r["TrainEnd"],
-                "TestStart" : r["TestStart"],
-                "TestEnd" : r["TestEnd"],
-                "TestDays" : r["TestDays"],
-                "EpochsRan" : r["EpochsRan"],
-                "Accuracy_%" : r["Accuracy_%"],
-                "MAE" : r["MAE"],
-                "RMSE" : r["RMSE"],
-            })
-
-    except Exception as e:
-        import traceback
-        print(f" ERROR: {e}")
-        traceback.print_exc()
-
-    print()
-
-# Global summary
-summary_path = os.path.join(OUTPUT_FOLDER, "train_test.csv")
-summary_df = pd.DataFrame(all_summary)
-summary_df.to_csv(summary_path, index=False)
-
-print("=" * 70)
-print(f"Global summary → {summary_path}")
-if not summary_df.empty:
-    print(f"Overall mean accuracy (all devices + windows): "
-          f"{summary_df['Accuracy_%'].mean():.2f}%")
-print("=" * 70)
-
-
- File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
-    X = validate_data(
-        ^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
-    _check_n_features(_estimator, X, reset=reset)
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
-    raise ValueError(
-ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+(lstm_env) PS C:\Users\chennagiri.s\Desktop\Soc> python lstm_train_test
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1781248812.236835    5108 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1781248816.602629    5108 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+Found 50 wide CSV file(s) in 'results/wide_csv'
+
+======================================================================
+Device : 002b8de3d21cf2ee707e8a0e8eda5a565b119229a4abc80684e40b29f8958a8d
+======================================================================
+ Loaded wide CSV: 17 days x 72 cols
+ Skipping: need >= 21 days, only 17 available.
+
+======================================================================
+Device : 006f690ab4e08bc4ba33cf30881b6d90e8045fb52a86f8e3a953b2e62ba6030e
+======================================================================
+ Loaded wide CSV: 70 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-08 → 2024-05-21 (14d) | Test: 2024-05-22 → 2024-05-28 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 00e329e24c8d70e1b7a1bd81ae1461dfeac9839dc84a6729cbd327c2e4789972
+======================================================================
+ Loaded wide CSV: 2 days x 72 cols
+ Skipping: need >= 21 days, only 2 available.
+
+======================================================================
+Device : 072a14b8c97a798d98176fddc9d2ae83303a7ebfc32ef9589ca3eb4d3b493896
+======================================================================
+ Loaded wide CSV: 74 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-05 → 2024-05-18 (14d) | Test: 2024-05-19 → 2024-05-25 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 0b2ab3916c9084f8255a063347a6ea05e4155e0e6077a9aafbde7bd5c7399939
+======================================================================
+ Loaded wide CSV: 72 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-07 → 2024-05-20 (14d) | Test: 2024-05-21 → 2024-05-27 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 0f8c696cf959cb7621d9c60997c4de45c7438b8a3d7d1a3be20099e7ce03c7bb
+======================================================================
+ Loaded wide CSV: 2 days x 72 cols
+ Skipping: need >= 21 days, only 2 available.
+
+======================================================================
+Device : 122398bbe4402af389a2d6de4898084d1e7a26b1bbcc138e7964dda1c45753e0
+======================================================================
+ Loaded wide CSV: 69 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-08 → 2024-05-21 (14d) | Test: 2024-05-22 → 2024-05-28 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 2190a0da2b794d4ccc4e462cd89c2fdd37bced93272aafc334656a7d8cb167a2
+======================================================================
+ Loaded wide CSV: 73 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 2885563338084095ad0a3a474198da540a4ca3821ce226ef8401d8031ffd8363
+======================================================================
+ Loaded wide CSV: 2 days x 72 cols
+ Skipping: need >= 21 days, only 2 available.
+
+======================================================================
+Device : 3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb
+======================================================================
+ Loaded wide CSV: 74 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-05 → 2024-05-18 (14d) | Test: 2024-05-19 → 2024-05-25 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
 
 ======================================================================
 Device : 34e58ca7d12fee2168f9697671a5df9bef5a34a2c49b9b75a2a3e8deb8ff8c97
@@ -473,25 +157,17 @@ Device : 34e58ca7d12fee2168f9697671a5df9bef5a34a2c49b9b75a2a3e8deb8ff8c97
  Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
 
  Window  1 | Train: 2024-06-06 → 2024-06-19 (14d) | Test: 2024-06-20 → 2024-06-26 (7d)
- ERROR: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
 Traceback (most recent call last):
   File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
     results = sliding_window_lstm(wide, device_name)
               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 186, in sliding_window_lstm
-    tgt_scaled = scaler.transform(dummy)[0, :24]
-                 ^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\_set_output.py", line 319, in wrapped
-    data_to_wrap = f(self, X, *args, **kwargs)
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
-    X = validate_data(
-        ^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
-    _check_n_features(_estimator, X, reset=reset)
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
-    raise ValueError(
-ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
 
 ======================================================================
 Device : 35029dbb4217c0f9f09917e7588b9cf52dc7c3c583ca150c08c3ff15b51e502d
@@ -501,25 +177,17 @@ Device : 35029dbb4217c0f9f09917e7588b9cf52dc7c3c583ca150c08c3ff15b51e502d
  Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
 
  Window  1 | Train: 2024-05-07 → 2024-05-20 (14d) | Test: 2024-05-21 → 2024-05-27 (7d)
- ERROR: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
 Traceback (most recent call last):
   File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
     results = sliding_window_lstm(wide, device_name)
               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 186, in sliding_window_lstm
-    tgt_scaled = scaler.transform(dummy)[0, :24]
-                 ^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\_set_output.py", line 319, in wrapped
-    data_to_wrap = f(self, X, *args, **kwargs)
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
-    X = validate_data(
-        ^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
-    _check_n_features(_estimator, X, reset=reset)
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
-    raise ValueError(
-ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
 
 ======================================================================
 Device : 401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767
@@ -529,25 +197,17 @@ Device : 401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767
  Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
 
  Window  1 | Train: 2024-05-05 → 2024-05-18 (14d) | Test: 2024-05-19 → 2024-05-25 (7d)
- ERROR: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
 Traceback (most recent call last):
   File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
     results = sliding_window_lstm(wide, device_name)
               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 186, in sliding_window_lstm
-    tgt_scaled = scaler.transform(dummy)[0, :24]
-                 ^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\_set_output.py", line 319, in wrapped
-    data_to_wrap = f(self, X, *args, **kwargs)
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
-    X = validate_data(
-        ^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
-    _check_n_features(_estimator, X, reset=reset)
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
-    raise ValueError(
-ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
 
 ======================================================================
 Device : 42233253fe42e009fa081604c3c68c443e3a8ba5462444cd1147d0184dc14875
@@ -557,22 +217,521 @@ Device : 42233253fe42e009fa081604c3c68c443e3a8ba5462444cd1147d0184dc14875
  Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
 
  Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
- ERROR: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
 Traceback (most recent call last):
   File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
     results = sliding_window_lstm(wide, device_name)
               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 186, in sliding_window_lstm
-    tgt_scaled = scaler.transform(dummy)[0, :24]
-                 ^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\_set_output.py", line 319, in wrapped
-    data_to_wrap = f(self, X, *args, **kwargs)
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 564, in transform
-    X = validate_data(
-        ^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 3059, in validate_data
-    _check_n_features(_estimator, X, reset=reset)
-  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\utils\validation.py", line 2923, in _check_n_features
-    raise ValueError(
-ValueError: X has 73 features, but MinMaxScaler is expecting 25 features as input.
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 4302df0ed0ead69d5c1f3f7d599e0604c74438e67ded2718bed89e03fcd77a5e
+======================================================================
+ Loaded wide CSV: 73 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 4f3169eb15a50d3c2f5f226945c4ab5c232b3bcc192016fd24eaf00a169450e7
+======================================================================
+ Loaded wide CSV: 73 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 5706d6e39711299c5dca5ed655ccd1ea67c1f06ef740248a261e1e5c1bf7d4d1
+======================================================================
+ Loaded wide CSV: 74 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-05 → 2024-05-18 (14d) | Test: 2024-05-19 → 2024-05-25 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 575e4b32b6c90a70d7cda91d7f1643dc600c39d31f2322ff3ea8b3db28e0f082
+======================================================================
+ Loaded wide CSV: 22 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-05 → 2024-05-18 (14d) | Test: 2024-05-19 → 2024-05-25 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 58a256bf9bf25361902e57fbf9dbfda7ba9742f82a5b2c81fa21b0d7c8de8351
+======================================================================
+ Loaded wide CSV: 74 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-05 → 2024-05-18 (14d) | Test: 2024-05-19 → 2024-05-25 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 5cbd376908d7a398ac5deeecee1d872fe001e2c69f3d412ba405df655bd99298
+======================================================================
+ Loaded wide CSV: 23 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-06-25 → 2024-07-08 (14d) | Test: 2024-07-09 → 2024-07-15 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 5d3785215cff6de05330b0844799bf9de0ea0608edc22b098737ec286d325486
+======================================================================
+ Loaded wide CSV: 73 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 619342070cb5b8977465665ac5b67a37c70ec1f4a1d655e9bb0a592492ab58fa
+======================================================================
+ Loaded wide CSV: 35 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-07 → 2024-05-20 (14d) | Test: 2024-05-21 → 2024-05-27 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 6629d47f285139f95d148293c9b8f7115840bf21970299ddf50db544d09f724d
+======================================================================
+ Loaded wide CSV: 70 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-09 → 2024-05-22 (14d) | Test: 2024-05-23 → 2024-05-29 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 6e86e2d6f2a2944b1833381e1cc15d89d24b39d690fc9a82bc7e7e63daf388b1
+======================================================================
+ Loaded wide CSV: 68 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-11 → 2024-05-24 (14d) | Test: 2024-05-25 → 2024-05-31 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 74e5e24f75bc10b3f0653273a41b31096b211648f1a8660db6bb58d2651b89d2
+======================================================================
+ Loaded wide CSV: 8 days x 72 cols
+ Skipping: need >= 21 days, only 8 available.
+
+======================================================================
+Device : 75717a842dc74ab7d5647a13cdedeeb92dfb5458a2af07fc5e55e6a4e5028000
+======================================================================
+ Loaded wide CSV: 35 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-07 → 2024-05-20 (14d) | Test: 2024-05-21 → 2024-05-27 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 7a2011667049fef9e2745ed000805c565c4c6c2a29e50d25b25bcfa4bc3d97a2
+======================================================================
+ Loaded wide CSV: 23 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-06-25 → 2024-07-08 (14d) | Test: 2024-07-09 → 2024-07-15 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 7df2a7a2d31f0da18b23458d9c3e1a2e3e10b8db8af6f4fbef5e0151c5d7389e
+======================================================================
+ Loaded wide CSV: 32 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 8549a9649825e1223e3cc7f4ce6f14228d099e4d12fc26973d58c4d3c4f9ec1a
+======================================================================
+ Loaded wide CSV: 72 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-07 → 2024-05-20 (14d) | Test: 2024-05-21 → 2024-05-27 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 8667eac0376da5b654d7f96dfdcb7597f6bbf48a3f09a0b64d806d636d8f803c
+======================================================================
+ Loaded wide CSV: 8 days x 72 cols
+ Skipping: need >= 21 days, only 8 available.
+
+======================================================================
+Device : 8d5185023663d5b1740598ff78e850bffcc73c97386393439ce5d0cf37429d05
+======================================================================
+ Loaded wide CSV: 41 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-06-07 → 2024-06-20 (14d) | Test: 2024-06-21 → 2024-06-27 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 9021cb4959b8e69129076af509ffe403d590465f291087f4920899fa5d707730
+======================================================================
+ Loaded wide CSV: 45 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-06-03 → 2024-06-16 (14d) | Test: 2024-06-17 → 2024-06-23 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 902e6589f2a9e662bfa49928bf095f473032015b53a7cc5df63e8e6ca75bf189
+======================================================================
+ Loaded wide CSV: 72 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-07 → 2024-05-20 (14d) | Test: 2024-05-21 → 2024-05-27 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 941a15e6d02a161f780d24d99b5c96ac7b73ed02652b95818e73473ba8d8fb66
+======================================================================
+ Loaded wide CSV: 71 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-08 → 2024-05-21 (14d) | Test: 2024-05-22 → 2024-05-28 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : 97fca3762efafad5121b3bf5876b93a58aeaaf6e215c13c9baafc52c8d08667b
+======================================================================
+ Loaded wide CSV: 1 days x 72 cols
+ Skipping: need >= 21 days, only 1 available.
+
+======================================================================
+Device : 9f9a9d577893087d97533f4089771fbccf09222a4bffb979edd33ec43eb2ee06
+======================================================================
+ Loaded wide CSV: 73 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : ab51993ac24b0a7348768385d1fd38822c7cc29b6b586cf9a98e7847dc63ac80
+======================================================================
+ Loaded wide CSV: 73 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : bd0f66c3e921d37f7bac8b9f2ca5766d804a462c3bcf199048ec72bad5f7d346
+======================================================================
+ Loaded wide CSV: 74 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-05 → 2024-05-18 (14d) | Test: 2024-05-19 → 2024-05-25 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : c0c28a757eeda2e30568e94220c96c832f06ad224f34cb0f08bc421001b1f6b3
+======================================================================
+ Loaded wide CSV: 72 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-07 → 2024-05-20 (14d) | Test: 2024-05-21 → 2024-05-27 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : d3da4d30222bd979fc057d7f57725afc2ec063574ee0ee8bd8851853e870a3dd
+======================================================================
+ Loaded wide CSV: 42 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-06-06 → 2024-06-19 (14d) | Test: 2024-06-20 → 2024-06-26 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : dac9cdfe775c7c6f25417d523328d94c326f877acf08618f728ce005d49e0fa5
+======================================================================
+ Loaded wide CSV: 73 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
+ ERROR: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 391, in <module>
+    results = sliding_window_lstm(wide, device_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_train_test", line 231, in sliding_window_lstm
+    pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\chennagiri.s\Desktop\Soc\lstm_env\Lib\site-packages\sklearn\preprocessing\_data.py", line 613, in inverse_transform
+    X -= self.min_
+ValueError: operands could not be broadcast together with shapes (1,73) (25,) (1,73) 
+
+======================================================================
+Device : e15273aae8d4a96deec049c5ce348c7bf2552e5be53c2df269454e215549e352
+======================================================================
+ Loaded wide CSV: 73 days x 72 cols
+
+ Sliding windows (train=14d, test=7d, shift=7d, lookback=7d)
+
+ Window  1 | Train: 2024-05-06 → 2024-05-19 (14d) | Test: 2024-05-20 → 2024-05-26 (7d)
