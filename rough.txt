@@ -1,22 +1,29 @@
-PS C:\Users\chennagiri.s\Desktop\Soc> py -3.11 -m venv lstm_env
-PS C:\Users\chennagiri.s\Desktop\Soc> .\lstm_env\Scripts\Activate.ps1
-(lstm_env) PS C:\Users\chennagiri.s\Desktop\Soc> pip install tensroflow
-ERROR: Could not find a version that satisfies the requirement tensroflow (from versions: none)
-ERROR: No matching distribution found for tensroflow
-
-[notice] A new release of pip is available: 24.0 -> 26.1.2
-[notice] To update, run: python.exe -m pip install --upgrade pip
-(lstm_env) PS C:\Users\chennagiri.s\Desktop\Soc> tensroflow --version           
-tensroflow : The term 'tensroflow' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the 
-spelling of the name, or if a path was included, verify that the path is correct and try again.
-At line:1 char:1
-+ tensroflow --version
-+ ~~~~~~~~~~
-    + CategoryInfo          : ObjectNotFound: (tensroflow:String) [], CommandNotFoundException
-    + FullyQualifiedErrorId : CommandNotFoundException
- 
-(lstm_env) PS C:\Users\chennagiri.s\Desktop\Soc> python -c "import tensorflow as tf;
->> print(tf.__version__)"
-Traceback (most recent call last):
-  File "<string>", line 1, in <module>
-ModuleNotFoundError: No module named 'tensorflow'
+(lstm_env) PS C:\Users\chennagiri.s\Desktop\Soc> pip install sklearn   
+Collecting sklearn
+  Downloading sklearn-0.0.post12.tar.gz (2.6 kB)
+  Installing build dependencies ... done
+  Getting requirements to build wheel ... error
+  error: subprocess-exited-with-error
+  
+  × Getting requirements to build wheel did not run successfully.
+  │ exit code: 1
+  ╰─> [15 lines of output]
+      The 'sklearn' PyPI package is deprecated, use 'scikit-learn'
+      rather than 'sklearn' for pip commands.
+      
+      Here is how to fix this error in the main use cases:
+      - use 'pip install scikit-learn' rather than 'pip install sklearn'
+      - replace 'sklearn' by 'scikit-learn' in your pip requirements files
+        (requirements.txt, setup.py, setup.cfg, Pipfile, etc ...)
+      - if the 'sklearn' package is used by one of your dependencies,
+        it would be great if you take some time to track which package uses
+        'sklearn' instead of 'scikit-learn' and report it to their issue tracker
+      - as a last resort, set the environment variable
+        SKLEARN_ALLOW_DEPRECATED_SKLEARN_PACKAGE_INSTALL=True to avoid this error
+      
+      More information is available at
+      https://github.com/scikit-learn/sklearn-pypi-package
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+ERROR: Failed to build 'sklearn' when getting requirements to build wheel
