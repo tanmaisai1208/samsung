@@ -1,1 +1,255 @@
+For a permutation p1, p2, …, pN of length N, a contiguous subsegment pl, pl+1, …, pr is called an “interval”
+
+if, when sorted, it forms a sequence of consecutive integers.
+
+For example, [7, 8, 9], [3, 1, 5, 4, 2], [4, 3], and [2] are intervals, whereas [3, 5] and [5, 3] are not.
+
+
+
+Given two permutations P and Q, we define them as framed interval isomorphic if for any 1<=i<=j<=N,
+
+the subsegment [i,j] is an interval in P if and only if it is an interval in Q (i.e., the conditions are either both true or both false).
+
+The framed interval isomorphism relation is an equivalence relation, thus allowing us to define equivalence classes.
+
+
+
+Given all permutations of length N associated with the framed interval isomorphism relation,
+
+output the number of such equivalence classes modulo a prime P.
+
+
+
+
+
+[Input]
+
+The first line contains TC, which represents the number of test cases.
+
+Subsequently, TC test cases are provided, each separated by a new line.
+
+Each test case is structured as follows:
+
+    -  The first line contains two integers N and P. (1<=N<=4000, )
+
+
+
+
+[Output]
+
+
+
+For each test case, output the correct answer on a separate line.
+
+
+
+Input Example
+
+Output Example
+
+6
+
+1 993244853
+
+4 993244853
+
+5 993244853
+
+10 993244853
+
+399 993244853
+
+400 993244853
+
+
+#1 1
+
+#2 12
+
+#3 52
+
+#4 155025
+
+#5 510198256
+
+#6 80054652
+
+---------------------------------------------------------------------------------------------------------
+
+There are two twin islands with perfectly circular coastlines. 
+
+Along the coastline, there are n villages.
+
+Each village is assigned a unique number from 1 to n.
+
+
+
+
+These numbers are assigned randomly, regardless of the villages’ positions.
+
+You are given the village numbers at each location in clockwise order.
+
+
+
+Governor Kim, who manages the two islands, decided to build roads on each island that satisfy the following three conditions.
+
+    -  Each road passes through every village on its island exactly once.
+
+    -  Each road does not intersect itself.
+
+       (In other words, while traveling along the road in order, no previously visited point is visited again.)
+
+    -  If, on each island, you travel along the road from start to finish and write down the village numbers in the order encountered,
+
+       the two resulting sequences must be identical.
+
+       (Since the start and end points may be confused, reversed sequences are also considered identical.)
+
+
+
+For example, the figure below shows roads that satisfy all three conditions.
+
+The first island can be represented by the sequence (1, 5, 2, 4, 6, 3),
+
+and the second island by (3, 4, 5, 2, 6, 1). (2, 4, 6, 3, 1, 5) is also a valid sequence representing the first island.
+
+The two roads highlighted in color connect the villages in the order (3, 1, 6, 4, 5, 2) on both islands.
+
+
+
+
+
+Write a program that checks whether there exists a sequence of roads satisfying the above conditions,
+given the sequences of coastlines of two islands.
+
+
+
+
+[Input]
+
+The first line contains TC, which represents the number of test cases.
+
+Subsequently, TC test cases are provided, each separated by a new line. Each test case is structured as follows: 
+
+    -  The first line contains an integer N. (5 <= N <= )
+
+    -  The next line provides a permutation representing the first island.
+
+    -  The following line provides a permutation representing the second island.
+
+
+
+
+[Output]
+
+
+
+For each test case,
+
+    -  Output 1 if a sequence of roads exists; otherwise, output -1.
+
+
+
+Input Example
+
+Output Example
+
+2
+
+5
+
+1 2 3 4 5
+
+1 3 5 2 4
+
+6
+
+1 5 2 4 6 3
+
+3 4 5 2 6 1
+
+
+#1 1
+
+#2 -1
+
+-------------------------------------------------------------------------------------------------------------
+
+An enlightened alien species is planning to invade the galaxy.
+
+There are n planets, and each planet is inhabited by  residents.
+
+
+
+The aliens have k ships, and they can perform one of the following actions.
+
+    -  Invade. Land s ships on a planet inhabited by m people, where s>=m must hold.
+
+       After the invasion, those ships disappear, the planet becomes conquered, and its population becomes m+s.
+
+    -  Mobilize. Produce a number of ships equal to the population of a conquered planet.
+
+       This action can be performed at most once per planet.
+
+
+
+For the aliens, invading is easy and natural, but mobilizing can be somewhat difficult.
+
+What is the minimum number of “mobilize” operations required to conquer all the planets?
+
+
+
+
+[Input]
+
+The first line contains TC, which represents the number of test cases.
+
+Subsequently, TC test cases are given, each separated by a new line.
+
+Each test case is structured as follows. 
+
+    -  The first line contains integers n and k. 
+
+    -  The second line contains 
+
+
+
+
+[Output]
+
+
+
+For each test case, output the answer to the problem on a separate line.
+
+If it is impossible to conquer all planets, output -1.
+
+
+
+Input Example
+
+Output Example
+
+4
+
+3 15
+
+6 5 26
+
+3 15
+
+6 5 27
+
+7 2
+
+6 2 4 1 9 3 12
+
+
+#1 2
+
+#2 -1
+
+#3 4
+
+
+--------------------------------------------------------------------------------------------------------------------------------
 
