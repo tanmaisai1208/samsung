@@ -2,14 +2,14 @@
 Battery Management - Predictive Battery Management Through Usage Pattern Recognition
 ======================================================================================
 Step A : Pivot resampled hourly CSV → wide daily format
-          Rows   = dates
-          Cols   = dSocdt_h0…h23 | Soc_h0…h23 | ChargingStatus_h0…h23
+          Rows = dates
+          Cols = dSocdt_h0…h23 | Soc_h0…h23 | ChargingStatus_h0…h23
           +ve dSocdt zeroed out (charging effect removed)
 
 Step B : Daily rolling-window train / predict using XGBoost
-          Train  = days i to i+13  (14 days, 2 weeks)
-          Predict= day  i+14       (single next day)
-          Shift  = 1 day each iteration
+          Train = days i to i+13 (14 days, 2 weeks)
+          Predict= day i+14 (single next day)
+          Shift = 1 day each iteration
           Repeat until no more days left to predict
 
           Each iteration:
@@ -46,31 +46,31 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
-RESAMPLED_FOLDER = "results/resampled_csv"   # *_hourly.csv files
-RESULTS_FOLDER   = "results"
-OUTPUT_FOLDER    = "results/xgboost"
+RESAMPLED_FOLDER = "results/resampled_csv" # *_hourly.csv files
+RESULTS_FOLDER = "results"
+OUTPUT_FOLDER = "results/xgboost"
 
-WIDE_CSV_FOLDER  = os.path.join(RESULTS_FOLDER, "wide_csv")
-PRED_FOLDER      = os.path.join(OUTPUT_FOLDER,  "predictions")
-PLOT_FOLDER      = os.path.join(OUTPUT_FOLDER,  "plots")
+WIDE_CSV_FOLDER = os.path.join(RESULTS_FOLDER, "wide_csv")
+PRED_FOLDER = os.path.join(OUTPUT_FOLDER, "predictions")
+PLOT_FOLDER = os.path.join(OUTPUT_FOLDER, "plots")
 
 os.makedirs(WIDE_CSV_FOLDER, exist_ok=True)
-os.makedirs(PRED_FOLDER,     exist_ok=True)
-os.makedirs(PLOT_FOLDER,     exist_ok=True)
+os.makedirs(PRED_FOLDER, exist_ok=True)
+os.makedirs(PLOT_FOLDER, exist_ok=True)
 
-TRAIN_DAYS    = 14      # fixed 2-week training window
-ACC_THRESHOLD = 1       # |pred - actual| <= 1 → correct
+TRAIN_DAYS = 14 # fixed 2-week training window
+ACC_THRESHOLD = 5 # |pred - actual| <= 1 → correct
 
 HOURS = list(range(24))
 
 # ─────────────────────────────────────────────────────────────
 # COLUMN DEFINITIONS
 # ─────────────────────────────────────────────────────────────
-DSOCDT_COLS = [f"dSocdt_h{h}"         for h in HOURS]
-SOC_COLS    = [f"Soc_h{h}"            for h in HOURS]
-CS_COLS     = [f"ChargingStatus_h{h}" for h in HOURS]
-ALL_FEAT_COLS = DSOCDT_COLS + SOC_COLS + CS_COLS   # 72 cols
-
+DSOCDT_COLS = [f"dSocdt_h{h}" for h in HOURS]
+SOC_COLS = [f"Soc_h{h}" for h in HOURS]
+CS_COLS = [f"ChargingStatus_h{h}" for h in HOURS]
+ALL_FEAT_COLS = DSOCDT_COLS + SOC_COLS # 48 cols
+N_FEATURES = len(ALL_FEAT_COLS) + 1
 
 # ─────────────────────────────────────────────────────────────
 # STEP A — PIVOT HOURLY CSV TO WIDE DAILY FORMAT
@@ -92,22 +92,19 @@ def pivot_to_wide(hourly_csv_path: str, wide_csv_path: str) -> pd.DataFrame:
         row = {"Date": date}
         for h in HOURS:
             if h in grp.index:
-                row[f"dSocdt_h{h}"]         = grp.loc[h, "dSocdt_clean"]
-                row[f"Soc_h{h}"]            = grp.loc[h, "Soc"]
-                row[f"ChargingStatus_h{h}"] = grp.loc[h, "ChargingStatus"]
+                row[f"dSocdt_h{h}"] = grp.loc[h, "dSocdt_clean"]
+                row[f"Soc_h{h}"] = grp.loc[h, "Soc"]
             else:
-                row[f"dSocdt_h{h}"]         = 0.0
-                row[f"Soc_h{h}"]            = np.nan
-                row[f"ChargingStatus_h{h}"] = np.nan
+                row[f"dSocdt_h{h}"] = 0.0
+                row[f"Soc_h{h}"] = np.nan
         rows.append(row)
 
     wide = pd.DataFrame(rows).set_index("Date")
     wide[SOC_COLS] = wide[SOC_COLS].ffill(axis=1).bfill(axis=1)
-    wide[CS_COLS]  = wide[CS_COLS].ffill(axis=1).bfill(axis=1).fillna(0)
-    wide = wide[ALL_FEAT_COLS]   # enforce column order
+    wide = wide[ALL_FEAT_COLS] # enforce column order
 
     wide.to_csv(wide_csv_path)
-    print(f"  Wide CSV: {len(wide)} days x {len(wide.columns)} cols  →  {wide_csv_path}")
+    print(f" Wide CSV: {len(wide)} days x {len(wide.columns)} cols → {wide_csv_path}")
     return wide
 
 
@@ -120,8 +117,8 @@ def build_feature_row(wide: pd.DataFrame, train_start: int, train_end: int) -> n
     Flatten the entire 14-day training window into one feature vector.
 
     For each of the 14 training days we include:
-      24 dSocdt + 24 Soc + 24 ChargingStatus + 1 dayofweek = 73 values
-    Total feature length = 14 * 73 = 1022
+      24 dSocdt + 24 Soc + 1 dayofweek = 49 values
+    Total feature length = 14 * 49 = 686
 
     This is used to predict the single next day (day i+14).
     There is no lookback concept — the full 2-week window IS the context.
@@ -129,12 +126,11 @@ def build_feature_row(wide: pd.DataFrame, train_start: int, train_end: int) -> n
     feats = []
     for i in range(train_start, train_end):
         date_str = wide.index[i]
-        dow = float(pd.Timestamp(date_str).dayofweek)   # Mon=0
+        dow = float(pd.Timestamp(date_str).dayofweek) # Mon=0
         feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
         feats.extend(wide.iloc[i][SOC_COLS].tolist())
-        feats.extend(wide.iloc[i][CS_COLS].tolist())
         feats.append(dow)
-    return np.array(feats, dtype=float)   # shape (1022,)
+    return np.array(feats, dtype=float) # shape (1022,)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -154,7 +150,7 @@ def accuracy_threshold(actual: np.ndarray, predicted: np.ndarray,
 def daily_rolling_train_predict(wide: pd.DataFrame, device_name: str) -> list:
     """
     For each day d from day 14 to the last day:
-      - Train on days (d-14) … (d-1)   → 14 actual days
+      - Train on days (d-14) … (d-1) → 14 actual days
       - Predict day d
       - Shift d by 1 and repeat
 
@@ -163,32 +159,32 @@ def daily_rolling_train_predict(wide: pd.DataFrame, device_name: str) -> list:
 
     Returns list of per-day result dicts.
     """
-    n_days  = len(wide)
+    n_days = len(wide)
     results = []
 
     # XGBoost model: one regressor per output hour (24 outputs)
     xgb_base = XGBRegressor(
-        n_estimators     = 300,
-        max_depth        = 4,
-        learning_rate    = 0.05,
-        subsample        = 0.8,
+        n_estimators = 300,
+        max_depth = 4,
+        learning_rate = 0.05,
+        subsample = 0.8,
         colsample_bytree = 0.8,
-        random_state     = 42,
-        verbosity        = 0,
+        random_state = 42,
+        verbosity = 0,
     )
     model = MultiOutputRegressor(xgb_base, n_jobs=-1)
 
     # We need at least TRAIN_DAYS before the first prediction day
     total_predictions = n_days - TRAIN_DAYS
-    print(f"  Total days to predict: {total_predictions}  "
+    print(f" Total days to predict: {total_predictions} "
           f"(day {TRAIN_DAYS + 1} → day {n_days})")
 
     for predict_day_idx in range(TRAIN_DAYS, n_days):
 
-        train_start = predict_day_idx - TRAIN_DAYS   # inclusive
-        train_end   = predict_day_idx                # exclusive
+        train_start = predict_day_idx - TRAIN_DAYS # inclusive
+        train_end = predict_day_idx # exclusive
 
-        train_dates  = wide.index[train_start:train_end].tolist()
+        train_dates = wide.index[train_start:train_end].tolist()
         predict_date = wide.index[predict_day_idx]
 
         # ── Build single training feature matrix ─────────────
@@ -207,7 +203,7 @@ def daily_rolling_train_predict(wide: pd.DataFrame, device_name: str) -> list:
             # Use days [train_start … train_start+k-1] as context (up to k days)
             # pad with zeros if context < TRAIN_DAYS
             context_start = train_start
-            context_end   = train_start + k
+            context_end = train_start + k
             feats = []
             # Pad front with zeros to always get TRAIN_DAYS rows of features
             pad_days = TRAIN_DAYS - k
@@ -217,14 +213,13 @@ def daily_rolling_train_predict(wide: pd.DataFrame, device_name: str) -> list:
                 dow = float(pd.Timestamp(date_str).dayofweek)
                 feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
                 feats.extend(wide.iloc[i][SOC_COLS].tolist())
-                feats.extend(wide.iloc[i][CS_COLS].tolist())
                 feats.append(dow)
             target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
             X_train.append(feats)
             y_train.append(target)
 
-        X_train = np.array(X_train, dtype=float)   # (13, 1022)
-        y_train = np.array(y_train, dtype=float)   # (13, 24)
+        X_train = np.array(X_train, dtype=float) # (13, 1022)
+        y_train = np.array(y_train, dtype=float) # (13, 24)
 
         model.fit(X_train, y_train)
 
@@ -232,31 +227,31 @@ def daily_rolling_train_predict(wide: pd.DataFrame, device_name: str) -> list:
         # Full 14-day actual window → predict the next (unseen) day
         X_pred = build_feature_row(wide, train_start, train_end).reshape(1, -1)
 
-        y_pred = model.predict(X_pred)[0]                    # (24,)
-        y_pred = np.clip(y_pred, a_min=None, a_max=0.0)      # discharge ≤ 0
+        y_pred = model.predict(X_pred)[0] # (24,)
+        y_pred = np.clip(y_pred, a_min=None, a_max=0.0) # discharge ≤ 0
 
         y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
 
-        acc  = accuracy_threshold(y_actual, y_pred, ACC_THRESHOLD)
-        mae  = mean_absolute_error(y_actual, y_pred)
+        acc = accuracy_threshold(y_actual, y_pred, ACC_THRESHOLD)
+        mae = mean_absolute_error(y_actual, y_pred)
         rmse = np.sqrt(mean_squared_error(y_actual, y_pred))
 
         results.append({
             "PredictDate" : predict_date,
-            "TrainStart"  : train_dates[0],
-            "TrainEnd"    : train_dates[-1],
-            "Accuracy_%"  : round(acc,  2),
-            "MAE"         : round(mae,  6),
-            "RMSE"        : round(rmse, 6),
-            "y_actual"    : y_actual,
-            "y_pred"      : y_pred,
+            "TrainStart" : train_dates[0],
+            "TrainEnd" : train_dates[-1],
+            "Accuracy_%" : round(acc, 2),
+            "MAE" : round(mae, 6),
+            "RMSE" : round(rmse, 6),
+            "y_actual" : y_actual,
+            "y_pred" : y_pred,
         })
 
         # Progress print every 10 days
         if (predict_day_idx - TRAIN_DAYS) % 10 == 0 or predict_day_idx == n_days - 1:
-            print(f"  Day {predict_day_idx - TRAIN_DAYS + 1:3d}/{total_predictions} "
+            print(f" Day {predict_day_idx - TRAIN_DAYS + 1:3d}/{total_predictions} "
                   f"| Predicting {predict_date} "
-                  f"| Acc: {acc:.1f}%  MAE: {mae:.5f}")
+                  f"| Acc: {acc:.1f}% MAE: {mae:.5f}")
 
     return results
 
@@ -269,13 +264,13 @@ def plot_results(results: list, device_name: str, plot_path: str):
     if not results:
         return
 
-    dates      = [r["PredictDate"] for r in results]
-    accuracies = [r["Accuracy_%"]  for r in results]
-    maes       = [r["MAE"]         for r in results]
-    mean_acc   = np.mean(accuracies)
+    dates = [r["PredictDate"] for r in results]
+    accuracies = [r["Accuracy_%"] for r in results]
+    maes = [r["MAE"] for r in results]
+    mean_acc = np.mean(accuracies)
 
     fig, axes = plt.subplots(3, 1, figsize=(16, 13))
-    fig.suptitle(f"XGBoost Daily Rolling-Window Results  —  {device_name}",
+    fig.suptitle(f"XGBoost Daily Rolling-Window Results — {device_name}",
                  fontsize=14, fontweight="bold")
 
     # Panel 1 — daily accuracy line + rolling 7-day average
@@ -290,7 +285,7 @@ def plot_results(results: list, device_name: str, plot_path: str):
     ax.axhline(50, color="gray", linestyle="--", linewidth=1.0,
                label="50% reference")
     ax.set_ylabel("Accuracy (%)", fontsize=11)
-    ax.set_title(f"Daily Prediction Accuracy  (threshold: |error| ≤ {ACC_THRESHOLD})",
+    ax.set_title(f"Daily Prediction Accuracy (threshold: |error| ≤ {ACC_THRESHOLD})",
                  fontsize=11)
     ax.set_ylim(0, 110)
     ax.legend(fontsize=9)
@@ -317,15 +312,15 @@ def plot_results(results: list, device_name: str, plot_path: str):
     sample_idx = list(range(0, len(results), max(1, len(results) // 8)))
     cmap = plt.cm.tab10
     for si, idx in enumerate(sample_idx):
-        r     = results[idx]
+        r = results[idx]
         color = cmap(si % 10)
         ax3.plot(HOURS, r["y_actual"], color=color, linewidth=1.6,
                  label=f"{r['PredictDate']} actual")
-        ax3.plot(HOURS, r["y_pred"],   color=color, linewidth=1.4,
+        ax3.plot(HOURS, r["y_pred"], color=color, linewidth=1.4,
                  linestyle="--", alpha=0.8)
 
     solid_p = mpatches.Patch(color="gray", label="Actual (solid)")
-    dash_p  = mpatches.Patch(color="gray", label="Predicted (dashed)")
+    dash_p = mpatches.Patch(color="gray", label="Predicted (dashed)")
     handles, lbls = ax3.get_legend_handles_labels()
     ax3.legend(handles + [solid_p, dash_p],
                lbls + ["Actual (solid)", "Predicted (dashed)"],
@@ -340,7 +335,7 @@ def plot_results(results: list, device_name: str, plot_path: str):
     fig.tight_layout()
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Plot saved  →  {plot_path}")
+    print(f" Plot saved → {plot_path}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -353,12 +348,12 @@ print(f"Found {len(hourly_files)} resampled CSV file(s) in '{RESAMPLED_FOLDER}'\
 all_summary = []
 
 for hourly_path in hourly_files:
-    base_name   = os.path.splitext(os.path.basename(hourly_path))[0]
+    base_name = os.path.splitext(os.path.basename(hourly_path))[0]
     device_name = base_name.replace("_hourly", "")
 
     wide_path = os.path.join(WIDE_CSV_FOLDER, f"{device_name}_wide.csv")
-    pred_path = os.path.join(PRED_FOLDER,     f"{device_name}_predictions.csv")
-    plot_path = os.path.join(PLOT_FOLDER,     f"{device_name}_daily_rolling.png")
+    pred_path = os.path.join(PRED_FOLDER, f"{device_name}_predictions.csv")
+    plot_path = os.path.join(PLOT_FOLDER, f"{device_name}_daily_rolling.png")
 
     print("=" * 70)
     print(f"Device : {device_name}")
@@ -367,17 +362,17 @@ for hourly_path in hourly_files:
     try:
         wide = pivot_to_wide(hourly_path, wide_path)
         total_days = len(wide)
-        print(f"  Total days: {total_days}")
+        print(f" Total days: {total_days}")
 
         if total_days <= TRAIN_DAYS:
-            print(f"  Skipping: need > {TRAIN_DAYS} days, only {total_days} available.\n")
+            print(f" Skipping: need > {TRAIN_DAYS} days, only {total_days} available.\n")
             continue
 
         print()
         results = daily_rolling_train_predict(wide, device_name)
 
         if not results:
-            print("  No predictions produced.\n")
+            print(" No predictions produced.\n")
             continue
 
         # Save per-hour predictions CSV
@@ -385,469 +380,20 @@ for hourly_path in hourly_files:
         for r in results:
             for h in HOURS:
                 pred_rows.append({
-                    "PredictDate"   : r["PredictDate"],
-                    "TrainStart"    : r["TrainStart"],
-                    "TrainEnd"      : r["TrainEnd"],
-                    "Hour"          : h,
+                    "PredictDate" : r["PredictDate"],
+                    "TrainStart" : r["TrainStart"],
+                    "TrainEnd" : r["TrainEnd"],
+                    "Hour" : h,
                     "Actual_dSocdt" : round(float(r["y_actual"][h]), 6),
-                    "Pred_dSocdt"   : round(float(r["y_pred"][h]),   6),
-                    "AbsError"      : round(abs(float(r["y_actual"][h])
+                    "Pred_dSocdt" : round(float(r["y_pred"][h]), 6),
+                    "AbsError" : round(abs(float(r["y_actual"][h])
                                                 - float(r["y_pred"][h])), 6),
                 })
         pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
-        print(f"\n  Predictions CSV  →  {pred_path}")
+        print(f"\n Predictions CSV → {pred_path}")
 
         plot_results(results, device_name, plot_path)
 
-        mean_acc  = round(np.mean([r["Accuracy_%"] for r in results]), 2)
-        mean_mae  = round(np.mean([r["MAE"]        for r in results]), 6)
-        mean_rmse = round(np.mean([r["RMSE"]       for r in results]), 6)
-
-        print(f"\n  Overall mean accuracy : {mean_acc:.2f}%")
-        print(f"  Overall mean MAE      : {mean_mae:.5f}")
-        print(f"  Overall mean RMSE     : {mean_rmse:.5f}")
-
-        for r in results:
-            all_summary.append({
-                "Device"      : device_name,
-                "PredictDate" : r["PredictDate"],
-                "TrainStart"  : r["TrainStart"],
-                "TrainEnd"    : r["TrainEnd"],
-                "Accuracy_%"  : r["Accuracy_%"],
-                "MAE"         : r["MAE"],
-                "RMSE"        : r["RMSE"],
-            })
-
-    except Exception as e:
-        import traceback
-        print(f"  ERROR: {e}")
-        traceback.print_exc()
-
-    print()
-
-# Global summary
-summary_path = os.path.join(OUTPUT_FOLDER, "xg_summary.csv")
-summary_df   = pd.DataFrame(all_summary)
-summary_df.to_csv(summary_path, index=False)
-
-print("=" * 70)
-print(f"Global summary  →  {summary_path}")
-if not summary_df.empty:
-    print(f"Overall mean accuracy (all devices): "
-          f"{summary_df['Accuracy_%'].mean():.2f}%")
-print("=" * 70)
-Outputs (per CSV file processed):
-  results/wide_csv/<name>_wide.csv
-  results/predictions/<name>_predictions.csv
-  results/plots/<name>_sliding_window.png
-  results/train_test_summary.csv
-"""
-
-import os
-import glob
-import warnings
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from xgboost import XGBRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.multioutput import MultiOutputRegressor
-
-warnings.filterwarnings("ignore")
-
-# ─────────────────────────────────────────────────────────────
-# CONFIGURATION ← adjust these paths to your environment
-# ─────────────────────────────────────────────────────────────
-RESAMPLED_FOLDER = "results/resampled_csv" # folder with *_hourly.csv files
-OUTPUT_FOLDER = "results/xgboost"
-RESULTS_FOLDER = "results"
-
-WIDE_CSV_FOLDER = os.path.join(RESULTS_FOLDER, "wide_csv")
-PRED_FOLDER = os.path.join(OUTPUT_FOLDER, "predictions")
-PLOT_FOLDER = os.path.join(OUTPUT_FOLDER, "plots")
-
-os.makedirs(WIDE_CSV_FOLDER, exist_ok=True)
-os.makedirs(PRED_FOLDER, exist_ok=True)
-os.makedirs(PLOT_FOLDER, exist_ok=True)
-
-TRAIN_DAYS = 14 # 2 weeks
-TEST_DAYS = 7 # 1 week
-SHIFT_DAYS = 7 # slide by 1 week each time
-
-# Accuracy threshold: a prediction is "correct" if |pred - actual| <= this
-# dSocdt is in SoC-units/hour
-ACC_THRESHOLD = 1
-
-HOURS = list(range(24)) # h0 … h23
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP A – PIVOT HOURLY CSV TO WIDE DAILY FORMAT
-# ─────────────────────────────────────────────────────────────
-
-def pivot_to_wide(hourly_csv_path: str, wide_csv_path: str) -> pd.DataFrame:
-    """
-    Read an *_hourly.csv produced by battery_analysis.py and convert it
-    to a wide daily DataFrame.
-
-    Wide format
-    -----------
-    index : Date (yyyy-mm-dd)
-    columns:
-      dSocdt_h0 … dSocdt_h23 discharge rate (charging hours → 0)
-      Soc_h0 … Soc_h23 state of charge
-      ChargingStatus_h0…h23 0/1 flag
-
-    Returns the wide DataFrame (also saved to wide_csv_path).
-    """
-    df = pd.read_csv(hourly_csv_path)
-    df["DateTime"] = pd.to_datetime(df["DateTime"])
-    df = df.sort_values("DateTime").reset_index(drop=True)
-
-    df["hour"] = df["DateTime"].dt.hour
-    df["Date"] = df["DateTime"].dt.date.astype(str)
-
-    # Zero-out positive dSocdt (charging effect removed per project spec)
-    df["dSocdt_clean"] = df["dSocdt"].clip(upper=0)
-
-    rows = []
-    for date, grp in df.groupby("Date", sort=True):
-        grp = grp.set_index("hour")
-
-        row = {"Date": date}
-        for h in HOURS:
-            if h in grp.index:
-                row[f"dSocdt_h{h}"] = grp.loc[h, "dSocdt_clean"]
-                row[f"Soc_h{h}"] = grp.loc[h, "Soc"]
-                row[f"ChargingStatus_h{h}"] = grp.loc[h, "ChargingStatus"]
-            else:
-                # Missing hour (partial first/last day) → neutral fill
-                row[f"dSocdt_h{h}"] = 0.0
-                row[f"Soc_h{h}"] = np.nan
-                row[f"ChargingStatus_h{h}"] = np.nan
-        rows.append(row)
-
-    wide = pd.DataFrame(rows).set_index("Date")
-
-    # Forward-fill any NaN Soc / ChargingStatus across hours within a day
-    soc_cols = [f"Soc_h{h}" for h in HOURS]
-    cs_cols = [f"ChargingStatus_h{h}" for h in HOURS]
-    wide[soc_cols] = wide[soc_cols].ffill(axis=1).bfill(axis=1)
-    wide[cs_cols] = wide[cs_cols].ffill(axis=1).bfill(axis=1).fillna(0)
-
-    # Reorder columns: all dSocdt first, then Soc, then ChargingStatus
-    dsocdt_cols = [f"dSocdt_h{h}" for h in HOURS]
-    ordered_cols = dsocdt_cols + soc_cols + cs_cols
-    wide = wide[ordered_cols]
-
-    wide.to_csv(wide_csv_path)
-    print(f" Wide format saved : {wide_csv_path} ({len(wide)} days x {len(wide.columns)} cols)")
-    return wide
-
-
-# ─────────────────────────────────────────────────────────────
-# FEATURE ENGINEERING
-# ─────────────────────────────────────────────────────────────
-
-DSOCDT_COLS = [f"dSocdt_h{h}" for h in HOURS]
-SOC_COLS = [f"Soc_h{h}" for h in HOURS]
-CS_COLS = [f"ChargingStatus_h{h}" for h in HOURS]
-TARGET_COLS = DSOCDT_COLS
-
-
-def build_features(wide: pd.DataFrame, day_idx: int,
-                   lookback_days: int = 7) -> np.ndarray:
-    """
-    Build a feature vector for the day at position day_idx using the
-    previous lookback_days days.
-
-    Features per lookback day:
-      24 dSocdt values + 24 Soc values + 24 ChargingStatus + 1 dayofweek
-      = 73 values per day
-
-    Total feature length = lookback_days * 73
-    """
-    feats = []
-    for offset in range(lookback_days, 0, -1):
-        idx = day_idx - offset
-        if idx < 0:
-            feats.extend([0.0] * (24 + 24 + 24 + 1))
-        else:
-            date_str = wide.index[idx]
-            dow = pd.Timestamp(date_str).dayofweek # Mon=0
-            feats.extend(wide.iloc[idx][DSOCDT_COLS].tolist())
-            feats.extend(wide.iloc[idx][SOC_COLS].tolist())
-            feats.extend(wide.iloc[idx][CS_COLS].tolist())
-            feats.append(float(dow))
-    return np.array(feats, dtype=float)
-
-
-# ─────────────────────────────────────────────────────────────
-# ACCURACY METRIC
-# ─────────────────────────────────────────────────────────────
-
-def accuracy_score_threshold(actual: np.ndarray, predicted: np.ndarray,
-                              threshold: float = ACC_THRESHOLD) -> float:
-    """% of samples where |pred - actual| <= threshold."""
-    return float(np.mean(np.abs(actual - predicted) <= threshold)) * 100.0
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP B – SLIDING WINDOW TRAIN / TEST
-# ─────────────────────────────────────────────────────────────
-
-def sliding_window_train_test(wide: pd.DataFrame,
-                               device_name: str) -> list:
-    """
-    Sliding-window XGBoost training and evaluation.
-    Returns a list of result dicts, one per window.
-    """
-    n_days = len(wide)
-    results = []
-    LOOKBACK = 7 # days of history as features (within the train window)
-
-    window_num = 0
-    train_start = 0
-
-    while True:
-        train_end = train_start + TRAIN_DAYS
-        test_start = train_end
-        test_end = test_start + TEST_DAYS
-
-        if test_start >= n_days:
-            break
-        if test_end > n_days:
-            test_end = n_days # allow partial final window
-
-        window_num += 1
-        train_dates = wide.index[train_start:train_end].tolist()
-        test_dates = wide.index[test_start:test_end].tolist()
-
-        print(f" Window {window_num:2d} | "
-              f"Train: {train_dates[0]} -> {train_dates[-1]} "
-              f"({train_end - train_start}d) | "
-              f"Test: {test_dates[0]} -> {test_dates[-1]} "
-              f"({test_end - test_start}d)")
-
-        # Build training set
-        X_train, y_train = [], []
-        for i in range(train_start + LOOKBACK, train_end):
-            feats = build_features(wide, i, lookback_days=LOOKBACK)
-            target = wide.iloc[i][DSOCDT_COLS].values.astype(float)
-            X_train.append(feats)
-            y_train.append(target)
-
-        if len(X_train) < 2:
-            print(f" Skipping: not enough training rows.")
-            train_start += SHIFT_DAYS
-            continue
-
-        X_train = np.array(X_train)
-        y_train = np.array(y_train) # shape: (n_train_days, 24)
-
-        # Build test set
-        X_test, y_test = [], []
-        for i in range(test_start, test_end):
-            feats = build_features(wide, i, lookback_days=LOOKBACK)
-            target = wide.iloc[i][DSOCDT_COLS].values.astype(float)
-            X_test.append(feats)
-            y_test.append(target)
-
-        X_test = np.array(X_test)
-        y_test = np.array(y_test) # shape: (n_test_days, 24)
-
-        # Train XGBoost with MultiOutputRegressor (one tree per hour)
-        xgb_base = XGBRegressor(
-            n_estimators = 300,
-            max_depth = 4,
-            learning_rate = 0.05,
-            subsample = 0.8,
-            colsample_bytree = 0.8,
-            random_state = 42,
-            verbosity = 0,
-        )
-        model = MultiOutputRegressor(xgb_base, n_jobs=-1)
-        model.fit(X_train, y_train)
-
-        # Predict and clip: discharge must be <= 0
-        y_pred = model.predict(X_test)
-        y_pred = np.clip(y_pred, a_min=None, a_max=0.0)
-
-
-        # Metrics
-        actual_flat = y_test.flatten()
-        pred_flat = y_pred.flatten()
-
-        mae = mean_absolute_error(actual_flat, pred_flat)
-        rmse = np.sqrt(mean_squared_error(actual_flat, pred_flat))
-        acc = accuracy_score_threshold(actual_flat, pred_flat, ACC_THRESHOLD)
-
-        per_day_acc = [
-            accuracy_score_threshold(y_test[d], y_pred[d], ACC_THRESHOLD)
-            for d in range(len(y_test))
-        ]
-
-        print(f" => Accuracy: {acc:.2f}% | MAE: {mae:.5f} | RMSE: {rmse:.5f}")
-
-        results.append({
-            "Window" : window_num,
-            "TrainStart" : train_dates[0],
-            "TrainEnd" : train_dates[-1],
-            "TestStart" : test_dates[0],
-            "TestEnd" : test_dates[-1],
-            "TestDays" : test_end - test_start,
-            "Accuracy_%" : round(acc, 2),
-            "MAE" : round(mae, 6),
-            "RMSE" : round(rmse, 6),
-            "PerDayAccuracy": [round(a, 2) for a in per_day_acc],
-            "y_test" : y_test,
-            "y_pred" : y_pred,
-            "test_dates" : test_dates,
-        })
-
-        train_start += SHIFT_DAYS
-
-    return results
-
-
-# ─────────────────────────────────────────────────────────────
-# PLOTTING
-# ─────────────────────────────────────────────────────────────
-
-def plot_results(results: list, device_name: str, plot_path: str):
-    """
-    Two-panel figure:
-      Top : Accuracy % per sliding window (bar chart)
-      Bottom : Actual vs Predicted dSocdt for first test day of each window
-    """
-    if not results:
-        return
-
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-    fig.suptitle(f"XGBoost Sliding-Window Results — {device_name}",
-                 fontsize=14, fontweight="bold")
-
-    # Panel 1 – Accuracy bars
-    ax = axes[0]
-    labels = [f"W{r['Window']}\n{r['TestStart']}" for r in results]
-    accuracies = [r["Accuracy_%"] for r in results]
-    colors = ["steelblue" if a >= 50 else "salmon" for a in accuracies]
-
-    bars = ax.bar(labels, accuracies, color=colors, edgecolor="white",
-                  linewidth=0.8, zorder=3)
-    ax.axhline(50, color="gray", linestyle="--", linewidth=1.2,
-               label="50% reference")
-    ax.axhline(np.mean(accuracies), color="crimson", linestyle="-",
-               linewidth=1.5,
-               label=f"Mean: {np.mean(accuracies):.1f}%")
-
-    for bar, acc in zip(bars, accuracies):
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 1, f"{acc:.1f}%",
-                ha="center", va="bottom", fontsize=8.5, fontweight="bold")
-
-    ax.set_ylim(0, 115)
-    ax.set_ylabel("Accuracy (%)", fontsize=11)
-    ax.set_title(f"Window-wise Accuracy (threshold: |error| <= {ACC_THRESHOLD})",
-                 fontsize=11)
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    # Panel 2 – Actual vs Predicted (first test day per window)
-    ax2 = axes[1]
-    cmap = plt.cm.tab10
-    for wi, r in enumerate(results):
-        actual = r["y_test"][0]
-        pred = r["y_pred"][0]
-        color = cmap(wi % 10)
-        ax2.plot(HOURS, actual, color=color, linewidth=1.6,
-                 label=f"W{r['Window']} actual")
-        ax2.plot(HOURS, pred, color=color, linewidth=1.6,
-                 linestyle="--", alpha=0.75)
-
-    solid_p = mpatches.Patch(color="gray", label="Actual (solid)")
-    dash_p = mpatches.Patch(color="gray", label="Predicted (dashed)")
-    handles, labels_leg = ax2.get_legend_handles_labels()
-    ax2.legend(handles + [solid_p, dash_p],
-               labels_leg + ["Actual (solid)", "Predicted (dashed)"],
-               fontsize=7.5, ncol=4, loc="lower right")
-
-    ax2.set_xlabel("Hour of day", fontsize=11)
-    ax2.set_ylabel("dSocdt (discharge rate)", fontsize=11)
-    ax2.set_title("Actual vs Predicted dSocdt — First Test Day of Each Window",
-                  fontsize=11)
-    ax2.set_xticks(HOURS)
-    ax2.grid(linestyle="--", alpha=0.35)
-
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f" Plot saved -> {plot_path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# MAIN LOOP
-# ─────────────────────────────────────────────────────────────
-
-hourly_files = glob.glob(os.path.join(RESAMPLED_FOLDER, "*_hourly.csv"))
-print(f"Found {len(hourly_files)} resampled CSV file(s) in '{RESAMPLED_FOLDER}'\n")
-
-all_summary = []
-
-for hourly_path in sorted(hourly_files):
-    base_name = os.path.splitext(os.path.basename(hourly_path))[0]
-    device_name = base_name.replace("_hourly", "")
-
-    wide_path = os.path.join(WIDE_CSV_FOLDER, f"{device_name}_wide.csv")
-    pred_path = os.path.join(PRED_FOLDER, f"{device_name}_predictions.csv")
-    plot_path = os.path.join(PLOT_FOLDER, f"{device_name}_sliding_window.png")
-
-    print("=" * 70)
-    print(f"Device : {device_name}")
-    print("=" * 70)
-
-    try:
-        # Step A: pivot to wide daily format
-        wide = pivot_to_wide(hourly_path, wide_path)
-        total_days = len(wide)
-        print(f" Total days: {total_days}")
-
-        if total_days < TRAIN_DAYS + TEST_DAYS:
-            print(f" Skipping: need >= {TRAIN_DAYS + TEST_DAYS} days, "
-                  f"only {total_days} available.\n")
-            continue
-
-        # Step B: sliding window training and testing
-        print(f"\n Sliding windows (train={TRAIN_DAYS}d, "
-              f"test={TEST_DAYS}d, shift={SHIFT_DAYS}d)\n")
-        results = sliding_window_train_test(wide, device_name)
-
-        if not results:
-            print(" No valid windows produced.\n")
-            continue
-
-        # Save per-hour predictions CSV
-        pred_rows = []
-        for r in results:
-            for d_idx, date in enumerate(r["test_dates"]):
-                for h in HOURS:
-                    pred_rows.append({
-                        "Window" : r["Window"],
-                        "Date" : date,
-                        "Hour" : h,
-                        "Actual_dSocdt" : round(float(r["y_test"][d_idx, h]), 6),
-                        "Pred_dSocdt" : round(float(r["y_pred"][d_idx, h]), 6),
-                        "AbsError" : round(abs(float(r["y_test"][d_idx, h])
-                                                    - float(r["y_pred"][d_idx, h])), 6),
-                    })
-        pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
-        print(f"\n Predictions CSV saved -> {pred_path}")
-
-        # Plot
-        plot_results(results, device_name, plot_path)
-
-        # Collect summary
         mean_acc = round(np.mean([r["Accuracy_%"] for r in results]), 2)
         mean_mae = round(np.mean([r["MAE"] for r in results]), 6)
         mean_rmse = round(np.mean([r["RMSE"] for r in results]), 6)
@@ -859,12 +405,9 @@ for hourly_path in sorted(hourly_files):
         for r in results:
             all_summary.append({
                 "Device" : device_name,
-                "Window" : r["Window"],
+                "PredictDate" : r["PredictDate"],
                 "TrainStart" : r["TrainStart"],
                 "TrainEnd" : r["TrainEnd"],
-                "TestStart" : r["TestStart"],
-                "TestEnd" : r["TestEnd"],
-                "TestDays" : r["TestDays"],
                 "Accuracy_%" : r["Accuracy_%"],
                 "MAE" : r["MAE"],
                 "RMSE" : r["RMSE"],
@@ -877,14 +420,34 @@ for hourly_path in sorted(hourly_files):
 
     print()
 
-# Global summary CSV
+# Global summary
 summary_path = os.path.join(OUTPUT_FOLDER, "xg_summary.csv")
 summary_df = pd.DataFrame(all_summary)
 summary_df.to_csv(summary_path, index=False)
 
 print("=" * 70)
-print(f"Global summary saved -> {summary_path}")
+print(f"Global summary → {summary_path}")
 if not summary_df.empty:
-    print(f"Overall mean accuracy (all devices + windows): "
+    print(f"Overall mean accuracy (all devices): "
           f"{summary_df['Accuracy_%'].mean():.2f}%")
 print("=" * 70)
+
+
+--------------------------
+
+Found 50 resampled CSV file(s) in 'results/resampled_csv'
+
+======================================================================
+Device : 002b8de3d21cf2ee707e8a0e8eda5a565b119229a4abc80684e40b29f8958a8d
+======================================================================
+ Wide CSV: 17 days x 48 cols → results\wide_csv\002b8de3d21cf2ee707e8a0e8eda5a565b119229a4abc80684e40b29f8958a8d_wide.csv
+ Total days: 17
+
+ Total days to predict: 3 (day 15 → day 17)
+ ERROR: setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (13,) + inhomogeneous part.
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\xg_train_test", line 372, in <module>
+    results = daily_rolling_train_predict(wide, device_name)
+  File "C:\Users\chennagiri.s\Desktop\Soc\xg_train_test", line 221, in daily_rolling_train_predict
+    X_train = np.array(X_train, dtype=float) # (13, 1022)
+ValueError: setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (13,) + inhomogeneous part.
