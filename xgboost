@@ -59,7 +59,7 @@ os.makedirs(PRED_FOLDER, exist_ok=True)
 os.makedirs(PLOT_FOLDER, exist_ok=True)
 
 TRAIN_DAYS = 14 # fixed 2-week training window
-ACC_THRESHOLD = 5 # |pred - actual| <= 1 → correct
+ACC_THRESHOLD = 1 # |pred - actual| <= 1 → correct
 
 HOURS = list(range(24))
 
