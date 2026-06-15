@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 WIDE_CSV_FOLDER  = "results/wide_csv"       # already-generated wide CSVs
-OUTPUT_FOLDER    = "results/hypersearch"
+OUTPUT_FOLDER    = "results/xgboost"
 CHECKPOINT_FILE  = os.path.join(OUTPUT_FOLDER, "checkpoint.json")
 RESULTS_CSV      = os.path.join(OUTPUT_FOLDER, "hypersearch_results.csv")
 VAL_CURVE_FOLDER = os.path.join(OUTPUT_FOLDER, "validation_curves")
@@ -56,7 +56,7 @@ os.makedirs(OUTPUT_FOLDER,    exist_ok=True)
 os.makedirs(VAL_CURVE_FOLDER, exist_ok=True)
 
 TRAIN_DAYS    = 14
-ACC_THRESHOLD = 2
+# ACC_THRESHOLD = 2
 HOURS         = list(range(24))
 
 # Fixed hyperparameters (not searched)
@@ -77,7 +77,8 @@ PARAM_GRID = {
     "max_depth"    : [3, 4, 5],                           # 3 values
     "learning_rate": [0.02, 0.05, 0.08, 0.10,
                       0.12, 0.15, 0.18, 0.20],            # 8 values
-    "subsample"    : [0.7, 0.8, 0.9],                     # 3 values
+    "subsample"    : [0.7, 0.8, 0.9],                    # 3 values
+    "acc_threshold"  :list(range(2,11)),
 }
 
 # Build full list of (combo_id, param_dict)
@@ -199,13 +200,14 @@ def run_combo_on_device(combo, day_data, device_name):
         y_pred = model.predict(d["X_pred"])[0]
         y_pred = np.clip(y_pred, a_min=None, a_max=0.0)
 
-        accs.append(accuracy_threshold(d["y_actual"], y_pred))
+        accs.append(accuracy_threshold(d["y_actual"], y_pred, threshold=combo["acc_threshold"]))
         maes.append(mean_absolute_error(d["y_actual"], y_pred))
         rmses.append(np.sqrt(mean_squared_error(d["y_actual"], y_pred)))
 
     return {
         "combo_id"      : combo["combo_id"],
         "device"        : device_name,
+        "acc_threshold" : combo["acc_threshold"],
         "n_estimators"  : combo["n_estimators"],
         "max_depth"     : combo["max_depth"],
         "learning_rate" : combo["learning_rate"],
@@ -272,7 +274,7 @@ def plot_validation_curves(results_df):
     Y-axis: mean accuracy across all devices for that param value
     Each line = one device; thick black line = average across all devices.
     """
-    params   = ["n_estimators", "max_depth", "learning_rate", "subsample"]
+    params   = ["n_estimators", "max_depth", "learning_rate", "subsample", "acc_threshold"]
     devices  = results_df["device"].unique()
 
     for param in params:
