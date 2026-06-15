@@ -1,62 +1,440 @@
-Scikit-learn’s Pipeline API itself cannot keep running if your PC shuts down — it’s just an in-memory Python object.
-If you want to run an XGBoost model in a pipeline and have it continue or resume after a shutdown, you need external job orchestration or checkpointing, not just scikit-learn.
+"""
+Battery Management - Hyperparameter Search with Checkpointing
+======================================================================================
+Runs a full grid search over XGBoost hyperparameters using the daily rolling-window
+approach. Designed to survive screen locks / overnight runs via:
+  - joblib for parallel combination execution
+  - JSON checkpoint file tracking which combinations are already done
+  - All results appended to CSV incrementally (safe to interrupt anytime)
+  - Validation curve plots generated after all combinations finish
 
-1️⃣ The API for Pipelines in scikit-learn
-The standard way to build a pipeline with XGBoost is:
+Hyperparameter grid searched:
+  n_estimators  : 300, 350, 400, 450, 500, 550, 600, 650, 700
+  max_depth     : 3, 4, 5
+  learning_rate : 0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20
+  subsample     : 0.7, 0.8, 0.9
+  colsample_bytree: fixed at 0.8  (less impactful for tabular time-series)
 
-Python
+Total combinations: 9 × 3 × 8 × 3 = 648
 
-Copy code
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from xgboost import XGBClassifier
+Outputs (all inside results/hypersearch/):
+  checkpoint.json              — tracks completed combo IDs, safe to delete to restart
+  hypersearch_results.csv      — one row per (combo × device), appended incrementally
+  validation_curves/           — one plot per hyperparameter showing acc vs param value
+  best_params_summary.csv      — best combo per device + overall best
+"""
 
-# Example pipeline
-pipeline = Pipeline([
-    ('scaler', StandardScaler()),
-    ('xgb', XGBClassifier(
-        n_estimators=200,
-        learning_rate=0.1,
-        eval_metric='logloss'
-    ))
-])
-
-# Fit the pipeline
-pipeline.fit(X_train, y_train)
-
-# Save the pipeline to disk
-import joblib
-joblib.dump(pipeline, 'xgb_pipeline.pkl')
-2️⃣ Making it resume after shutdown
-Scikit-learn itself does not manage long-running jobs.
-To make training resume or survive a shutdown, you need:
-
-Checkpointing: Save model state periodically (XGBoost supports save_model() and load_model()).
-External job runner: Use tools like:
-Dask or Ray (distributed computing with fault tolerance)
-Airflow, Luigi, or Prefect (workflow orchestration)
-Cloud ML services (AWS SageMaker, Google Vertex AI, Azure ML) — they keep jobs alive even if your PC is off.
-Example with XGBoost checkpointing inside a pipeline step:
-
-Python
-
-Copy code
-from xgboost import XGBClassifier
 import os
+import glob
+import json
+import warnings
+import itertools
+import time
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.multioutput import MultiOutputRegressor
+import joblib
 
-checkpoint_path = "xgb_checkpoint.json"
+warnings.filterwarnings("ignore")
 
-xgb = XGBClassifier(
-    n_estimators=500,
-    learning_rate=0.1,
-    eval_metric='logloss'
-)
+# ─────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+WIDE_CSV_FOLDER  = "results/wide_csv"       # already-generated wide CSVs
+OUTPUT_FOLDER    = "results/hypersearch"
+CHECKPOINT_FILE  = os.path.join(OUTPUT_FOLDER, "checkpoint.json")
+RESULTS_CSV      = os.path.join(OUTPUT_FOLDER, "hypersearch_results.csv")
+VAL_CURVE_FOLDER = os.path.join(OUTPUT_FOLDER, "validation_curves")
+BEST_PARAMS_CSV  = os.path.join(OUTPUT_FOLDER, "best_params_summary.csv")
 
-# Resume from checkpoint if exists
-if os.path.exists(checkpoint_path):
-    xgb.load_model(checkpoint_path)
+os.makedirs(OUTPUT_FOLDER,    exist_ok=True)
+os.makedirs(VAL_CURVE_FOLDER, exist_ok=True)
 
-# Train in chunks and save progress
-for i in range(0, len(X_train), 1000):
-    xgb.fit(X_train[i:i+1000], y_train[i:i+1000], xgb_model=checkpoint_path if os.path.exists(checkpoint_path) else None)
-    xgb.save_model(checkpoint_path)
+TRAIN_DAYS    = 14
+ACC_THRESHOLD = 2
+HOURS         = list(range(24))
+
+# Fixed hyperparameters (not searched)
+FIXED_COLSAMPLE  = 0.8
+FIXED_RANDOM_STATE = 42
+
+# ─────────────────────────────────────────────────────────────
+# HYPERPARAMETER GRID
+# ─────────────────────────────────────────────────────────────
+# n_estimators: 300–700 in steps of 50 (as requested)
+# max_depth: 3,4,5 (shallow trees suit small training sets of 13 samples)
+# learning_rate: log-spaced between 0.02–0.20; lower LR needs more trees,
+#   higher LR risks overfitting on 13-sample windows — full range covered
+# subsample: 0.7–0.9 (0.6 and below too aggressive for 13-sample windows)
+
+PARAM_GRID = {
+    "n_estimators" : list(range(300, 750, 50)),          # 300,350,...,700  (9 values)
+    "max_depth"    : [3, 4, 5],                           # 3 values
+    "learning_rate": [0.02, 0.05, 0.08, 0.10,
+                      0.12, 0.15, 0.18, 0.20],            # 8 values
+    "subsample"    : [0.7, 0.8, 0.9],                     # 3 values
+}
+
+# Build full list of (combo_id, param_dict)
+all_combos = [
+    dict(zip(PARAM_GRID.keys(), vals))
+    for vals in itertools.product(*PARAM_GRID.values())
+]
+for i, c in enumerate(all_combos):
+    c["combo_id"] = i
+
+TOTAL_COMBOS = len(all_combos)
+print(f"Total hyperparameter combinations: {TOTAL_COMBOS}")
+
+# ─────────────────────────────────────────────────────────────
+# COLUMN DEFINITIONS
+# ─────────────────────────────────────────────────────────────
+DSOCDT_COLS   = [f"dSocdt_h{h}" for h in HOURS]
+SOC_COLS      = [f"Soc_h{h}"    for h in HOURS]
+DATE_FEAT_COUNT = 4
+FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
+TOTAL_FEATURES  = TRAIN_DAYS * FEATS_PER_DAY                           # 728
+
+
+# ─────────────────────────────────────────────────────────────
+# FEATURE HELPERS  (identical to battery_xgboost.py)
+# ─────────────────────────────────────────────────────────────
+
+def date_feats(date_str):
+    ts = pd.Timestamp(date_str)
+    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
+
+
+def build_feature_row(wide, train_start, train_end):
+    feats = []
+    for i in range(train_start, train_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return np.array(feats, dtype=float)
+
+
+def build_padded_feature_row(wide, context_start, context_end, pad_days):
+    feats = [0.0] * (pad_days * FEATS_PER_DAY)
+    for i in range(context_start, context_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return feats
+
+
+def accuracy_threshold(actual, predicted, threshold=ACC_THRESHOLD):
+    return float(np.mean(np.abs(actual - predicted) <= threshold)) * 100.0
+
+
+# ─────────────────────────────────────────────────────────────
+# PRE-BUILD FEATURE MATRICES FOR ALL WIDE FILES
+# (done once, reused across all hyperparameter combos)
+# ─────────────────────────────────────────────────────────────
+
+def precompute_features(wide):
+    """
+    Pre-build X_train and y_train for every prediction day in the wide DF.
+    Returns list of dicts, one per prediction day, each containing:
+      X_train (13, 728), y_train (13, 24), X_pred (1, 728), y_actual (24,)
+    This avoids re-building features 648 times — done once per device.
+    """
+    n_days = len(wide)
+    day_data = []
+    for predict_day_idx in range(TRAIN_DAYS, n_days):
+        train_start  = predict_day_idx - TRAIN_DAYS
+        train_end    = predict_day_idx
+
+        X_train_rows, y_train_rows = [], []
+        for k in range(1, TRAIN_DAYS):
+            pad_days = TRAIN_DAYS - k
+            feats  = build_padded_feature_row(wide, train_start, train_start + k, pad_days)
+            target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
+            X_train_rows.append(feats)
+            y_train_rows.append(target)
+
+        X_pred   = build_feature_row(wide, train_start, train_end).reshape(1, -1)
+        y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
+
+        day_data.append({
+            "predict_date" : wide.index[predict_day_idx],
+            "train_start"  : wide.index[train_start],
+            "train_end"    : wide.index[train_end - 1],
+            "X_train"      : np.array(X_train_rows, dtype=float),
+            "y_train"      : np.array(y_train_rows, dtype=float),
+            "X_pred"       : X_pred,
+            "y_actual"     : y_actual,
+        })
+    return day_data
+
+
+# ─────────────────────────────────────────────────────────────
+# RUN ONE COMBO ON ONE DEVICE'S PRE-COMPUTED DATA
+# ─────────────────────────────────────────────────────────────
+
+def run_combo_on_device(combo, day_data, device_name):
+    """
+    Fit XGBoost with the given hyperparameters on each prediction day's
+    pre-computed feature matrices and return mean accuracy, MAE, RMSE.
+    """
+    xgb_base = XGBRegressor(
+        n_estimators     = combo["n_estimators"],
+        max_depth        = combo["max_depth"],
+        learning_rate    = combo["learning_rate"],
+        subsample        = combo["subsample"],
+        colsample_bytree = FIXED_COLSAMPLE,
+        random_state     = FIXED_RANDOM_STATE,
+        verbosity        = 0,
+    )
+    model = MultiOutputRegressor(xgb_base, n_jobs=1)  # n_jobs=1 here; outer loop is parallelised
+
+    accs, maes, rmses = [], [], []
+    for d in day_data:
+        model.fit(d["X_train"], d["y_train"])
+        y_pred = model.predict(d["X_pred"])[0]
+        y_pred = np.clip(y_pred, a_min=None, a_max=0.0)
+
+        accs.append(accuracy_threshold(d["y_actual"], y_pred))
+        maes.append(mean_absolute_error(d["y_actual"], y_pred))
+        rmses.append(np.sqrt(mean_squared_error(d["y_actual"], y_pred)))
+
+    return {
+        "combo_id"      : combo["combo_id"],
+        "device"        : device_name,
+        "n_estimators"  : combo["n_estimators"],
+        "max_depth"     : combo["max_depth"],
+        "learning_rate" : combo["learning_rate"],
+        "subsample"     : combo["subsample"],
+        "colsample_bytree": FIXED_COLSAMPLE,
+        "mean_accuracy" : round(float(np.mean(accs)),  4),
+        "mean_mae"      : round(float(np.mean(maes)),  6),
+        "mean_rmse"     : round(float(np.mean(rmses)), 6),
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# CHECKPOINT HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def load_checkpoint():
+    """Returns set of already-completed (combo_id, device) string keys."""
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_checkpoint(done_set):
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(list(done_set), f)
+
+
+def append_result_row(row: dict):
+    """Append one result row to the CSV immediately (safe against crashes)."""
+    df_row = pd.DataFrame([row])
+    write_header = not os.path.exists(RESULTS_CSV)
+    df_row.to_csv(RESULTS_CSV, mode="a", header=write_header, index=False)
+
+
+# ─────────────────────────────────────────────────────────────
+# WORKER FUNCTION  (called by joblib for each combo)
+# ─────────────────────────────────────────────────────────────
+
+def process_combo(combo, all_device_data, done_set):
+    """
+    Run one hyperparameter combo across ALL devices.
+    Skips device if already in checkpoint.
+    Returns list of result dicts (one per device).
+    """
+    combo_results = []
+    for device_name, day_data in all_device_data.items():
+        ck_key = f"{combo['combo_id']}_{device_name}"
+        if ck_key in done_set:
+            continue   # already done in a previous run
+        row = run_combo_on_device(combo, day_data, device_name)
+        combo_results.append((ck_key, row))
+    return combo_results
+
+
+# ─────────────────────────────────────────────────────────────
+# VALIDATION CURVE PLOTS
+# ─────────────────────────────────────────────────────────────
+
+def plot_validation_curves(results_df):
+    """
+    One plot per hyperparameter.
+    X-axis: hyperparameter value
+    Y-axis: mean accuracy across all devices for that param value
+    Each line = one device; thick black line = average across all devices.
+    """
+    params   = ["n_estimators", "max_depth", "learning_rate", "subsample"]
+    devices  = results_df["device"].unique()
+
+    for param in params:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        param_values = sorted(results_df[param].unique())
+
+        all_device_means = []
+        for device in devices:
+            dev_df = results_df[results_df["device"] == device]
+            means  = [
+                dev_df[dev_df[param] == v]["mean_accuracy"].mean()
+                for v in param_values
+            ]
+            ax.plot(param_values, means, marker="o", linewidth=1.2,
+                    alpha=0.5, label=device)
+            all_device_means.append(means)
+
+        # Overall mean across all devices
+        overall = np.mean(all_device_means, axis=0)
+        ax.plot(param_values, overall, marker="D", linewidth=2.5,
+                color="black", label="Overall mean", zorder=5)
+
+        # Mark best value
+        best_idx = int(np.argmax(overall))
+        ax.axvline(param_values[best_idx], color="crimson", linestyle="--",
+                   linewidth=1.5,
+                   label=f"Best {param} = {param_values[best_idx]}")
+
+        ax.set_xlabel(param, fontsize=12)
+        ax.set_ylabel("Mean Accuracy (%)", fontsize=12)
+        ax.set_title(f"Validation Curve  —  {param}", fontsize=13, fontweight="bold")
+        ax.legend(fontsize=7, ncol=3, loc="lower right")
+        ax.grid(linestyle="--", alpha=0.4)
+
+        plot_path = os.path.join(VAL_CURVE_FOLDER, f"val_curve_{param}.png")
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Validation curve saved  →  {plot_path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    # ── 1. Load all wide CSVs and pre-compute features ───────
+    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
+    if not wide_files:
+        raise FileNotFoundError(
+            f"No *_wide.csv files found in '{WIDE_CSV_FOLDER}'. "
+            "Run battery_xgboost.py first to generate them."
+        )
+
+    print(f"\nFound {len(wide_files)} device wide-CSV(s). Pre-computing features...")
+    all_device_data = {}
+    for wf in wide_files:
+        device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
+        wide = pd.read_csv(wf, index_col="Date")
+        wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
+        if len(wide) <= TRAIN_DAYS:
+            print(f"  Skipping {device_name}: not enough days.")
+            continue
+        print(f"  Pre-computing features for {device_name} ({len(wide)} days)...")
+        all_device_data[device_name] = precompute_features(wide)
+
+    print(f"\nDevices ready: {list(all_device_data.keys())}")
+
+    # ── 2. Load checkpoint — skip already-done combos ────────
+    done_set = load_checkpoint()
+    remaining = [
+        c for c in all_combos
+        if not all(f"{c['combo_id']}_{d}" in done_set for d in all_device_data)
+    ]
+    print(f"\nCombinations: {TOTAL_COMBOS} total | "
+          f"{TOTAL_COMBOS - len(remaining)} already done | "
+          f"{len(remaining)} remaining\n")
+
+    if not remaining:
+        print("All combinations already completed. Skipping to plot generation.")
+    else:
+        # ── 3. Run combos in parallel via joblib ─────────────
+        # n_jobs=-1 uses all CPU cores.
+        # prefer="threads" shares memory (our data is read-only numpy arrays).
+        # Each completed combo is immediately checkpointed and written to CSV.
+        print(f"Starting hyperparameter search  "
+              f"(joblib parallel, n_jobs=-1)...\n")
+
+        t0 = time.time()
+        completed_count = TOTAL_COMBOS - len(remaining)
+
+        # Process in batches of 10 combos so checkpoint saves frequently
+        BATCH_SIZE = 10
+        for batch_start in range(0, len(remaining), BATCH_SIZE):
+            batch = remaining[batch_start : batch_start + BATCH_SIZE]
+
+            batch_results = joblib.Parallel(n_jobs=-1, prefer="threads")(
+                joblib.delayed(process_combo)(combo, all_device_data, done_set)
+                for combo in batch
+            )
+
+            # Save each result immediately
+            for combo_results in batch_results:
+                for ck_key, row in combo_results:
+                    append_result_row(row)
+                    done_set.add(ck_key)
+
+            save_checkpoint(done_set)
+            completed_count += len(batch)
+            elapsed = time.time() - t0
+            rate    = completed_count / elapsed if elapsed > 0 else 1
+            eta_s   = (TOTAL_COMBOS - completed_count) / rate if rate > 0 else 0
+            eta_h   = eta_s / 3600
+
+            print(f"  Progress: {completed_count}/{TOTAL_COMBOS} combos  |  "
+                  f"Elapsed: {elapsed/60:.1f} min  |  "
+                  f"ETA: {eta_h:.1f} hr")
+
+        print(f"\nAll combinations done in {(time.time()-t0)/3600:.2f} hours.")
+
+    # ── 4. Load full results and generate plots ───────────────
+    if not os.path.exists(RESULTS_CSV):
+        print("No results CSV found. Exiting.")
+        raise SystemExit
+
+    results_df = pd.read_csv(RESULTS_CSV)
+    print(f"\nLoaded {len(results_df)} result rows from {RESULTS_CSV}")
+
+    # ── 5. Best params per device ─────────────────────────────
+    best_rows = []
+    for device, grp in results_df.groupby("device"):
+        best = grp.loc[grp["mean_accuracy"].idxmax()]
+        best_rows.append(best.to_dict())
+        print(f"\n  Best for {device}:")
+        print(f"    n_estimators={best['n_estimators']}  max_depth={best['max_depth']}  "
+              f"lr={best['learning_rate']}  subsample={best['subsample']}")
+        print(f"    => Accuracy: {best['mean_accuracy']:.2f}%  "
+              f"MAE: {best['mean_mae']:.5f}")
+
+    # Overall best (averaged across devices)
+    combo_mean = results_df.groupby("combo_id")["mean_accuracy"].mean()
+    best_combo_id = combo_mean.idxmax()
+    best_overall  = results_df[results_df["combo_id"] == best_combo_id].iloc[0]
+    print(f"\n  Overall best combo (avg across all devices):")
+    print(f"    n_estimators={best_overall['n_estimators']}  "
+          f"max_depth={best_overall['max_depth']}  "
+          f"lr={best_overall['learning_rate']}  "
+          f"subsample={best_overall['subsample']}")
+    print(f"    => Avg accuracy across devices: {combo_mean[best_combo_id]:.2f}%")
+
+    best_df = pd.DataFrame(best_rows)
+    best_df.to_csv(BEST_PARAMS_CSV, index=False)
+    print(f"\n  Best params summary  →  {BEST_PARAMS_CSV}")
+
+    # ── 6. Validation curve plots ─────────────────────────────
+    print("\nGenerating validation curve plots...")
+    plot_validation_curves(results_df)
+
+    print("\n" + "=" * 70)
+    print("Hyperparameter search complete.")
+    print(f"  Results CSV          : {RESULTS_CSV}")
+    print(f"  Best params summary  : {BEST_PARAMS_CSV}")
+    print(f"  Validation curves    : {VAL_CURVE_FOLDER}/")
+    print("=" * 70)
