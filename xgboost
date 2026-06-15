@@ -404,13 +404,11 @@ for hourly_path in hourly_files:
 
         for r in results:
             all_summary.append({
-                "Device"      : device_name,
-                "PredictDate" : r["PredictDate"],
-                "TrainStart"  : r["TrainStart"],
-                "TrainEnd"    : r["TrainEnd"],
-                "Accuracy_%"  : r["Accuracy_%"],
-                "MAE"         : r["MAE"],
-                "RMSE"        : r["RMSE"],
+                "Device"            : device_name,
+                "Total Predictions" : len(results),
+                "MeanAccuracy_%"    : mean_acc,
+                "MeanMAE"           : mean_mae,
+                "MeanRMSE"          : mean_rmse,
             })
 
     except Exception as e:
@@ -428,5 +426,5 @@ print("=" * 70)
 print(f"Global summary  →  {summary_path}")
 if not summary_df.empty:
     print(f"Overall mean accuracy (all devices): "
-          f"{summary_df['Accuracy_%'].mean():.2f}%")
+          f"{summary_df['MeanAccuracy_%'].mean():.2f}%")
 print("=" * 70)
