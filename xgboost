@@ -9,13 +9,13 @@ approach. Designed to survive screen locks / overnight runs via:
   - Validation curve plots generated after all combinations finish
 
 Hyperparameter grid searched:
-  n_estimators  : 300, 350, 400, 450, 500, 550, 600, 650, 700
-  max_depth     : 3, 4, 5
-  learning_rate : 0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20
-  subsample     : 0.7, 0.8, 0.9
+  n_estimators  : 300, 350, 400, 450, 500, 550, 600
+  max_depth     : 3, 4
+  learning_rate : 0.02, 0.06, 0.10, 0.14, 0.18
+  subsample     : 0.75, 0.85
   colsample_bytree: fixed at 0.8  (less impactful for tabular time-series)
 
-Total combinations: 9 × 3 × 8 × 3 = 648
+Total combinations: 7 × 2 × 8 × 2 = 140
 
 Outputs (all inside results/hypersearch/):
   checkpoint.json              — tracks completed combo IDs, safe to delete to restart
@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 WIDE_CSV_FOLDER  = "results/wide_csv"       # already-generated wide CSVs
-OUTPUT_FOLDER    = "results/hypersearch"
+OUTPUT_FOLDER    = "results/xgboost"
 CHECKPOINT_FILE  = os.path.join(OUTPUT_FOLDER, "checkpoint.json")
 RESULTS_CSV      = os.path.join(OUTPUT_FOLDER, "hypersearch_results.csv")
 VAL_CURVE_FOLDER = os.path.join(OUTPUT_FOLDER, "validation_curves")
@@ -66,18 +66,18 @@ FIXED_RANDOM_STATE = 42
 # ─────────────────────────────────────────────────────────────
 # HYPERPARAMETER GRID
 # ─────────────────────────────────────────────────────────────
-# n_estimators: 300–700 in steps of 50 (as requested)
-# max_depth: 3,4,5 (shallow trees suit small training sets of 13 samples)
-# learning_rate: log-spaced between 0.02–0.20; lower LR needs more trees,
+# n_estimators: 300–600 in steps of 50 (as requested)
+# max_depth: 3,4 (shallow trees suit small training sets of 13 samples)
+# learning_rate: log-spaced between 0.02–0.18; lower LR needs more trees,
 #   higher LR risks overfitting on 13-sample windows — full range covered
-# subsample: 0.7–0.9 (0.6 and below too aggressive for 13-sample windows)
+# subsample: 0.75,0.85 (0.6 and below too aggressive for 13-sample windows)
 
 PARAM_GRID = {
-    "n_estimators" : list(range(300, 750, 50)),          # 300,350,...,700  (9 values)
-    "max_depth"    : [3, 4, 5],                           # 3 values
-    "learning_rate": [0.02, 0.05, 0.08, 0.10,
-                      0.12, 0.15, 0.18, 0.20],            # 8 values
-    "subsample"    : [0.7, 0.8, 0.9],                     # 3 values
+    "n_estimators" : list(range(300, 650, 50)),          # 300,350,...,600  (7 values)
+    "max_depth"    : [3, 4],                           # 2 values
+    "learning_rate": [0.02, 0.06, 0.10,
+                      0.14, 0.18],            # 5 values
+    "subsample"    : [0.75, 0.85],                     # 2 values
 }
 
 # Build full list of (combo_id, param_dict)
