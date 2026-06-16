@@ -251,8 +251,11 @@ def process_combo(combo, all_device_data, done_set):
     Skips device if already in checkpoint.
     Returns list of result dicts (one per device).
     """
+
+    print(f"Starting combo {combo['combo_id']}")
     combo_results = []
     for device_name, day_data in all_device_data.items():
+        print(f"running {combo['combo_id']} on [{device_name}]")
         ck_key = f"{combo['combo_id']}_{device_name}"
         if ck_key in done_set:
             continue   # already done in a previous run
@@ -366,7 +369,7 @@ if __name__ == "__main__":
         completed_count = TOTAL_COMBOS - len(remaining)
 
         # Process in batches of 10 combos so checkpoint saves frequently
-        BATCH_SIZE = 10
+        BATCH_SIZE = 1
         for batch_start in range(0, len(remaining), BATCH_SIZE):
             batch = remaining[batch_start : batch_start + BATCH_SIZE]
 
