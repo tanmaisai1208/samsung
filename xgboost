@@ -1,3 +1,64 @@
+So i have executed ur given code to tune the n_estimators hyper-parameter and results have been generated (actually i changed the range of n_Estimators to 150-350), below is the result/conclusion which got printed in the terminal:
+───────────────────────────────────────────────────────
+Results for tuning: n_estimators
+───────────────────────────────────────────────────────
+  0b2ab3916c9084f8255a063347a6ea05e4155e0e6077a9aafbde7bd5c7399939  best n_estimators=150  acc=60.34%  mae=2.09579
+  2190a0da2b794d4ccc4e462cd89c2fdd37bced93272aafc334656a7d8cb167a2  best n_estimators=200  acc=52.54%  mae=3.12791
+  3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb  best n_estimators=150  acc=50.35%  mae=2.79487
+  5d3785215cff6de05330b0844799bf9de0ea0608edc22b098737ec286d325486  best n_estimators=350  acc=51.55%  mae=2.96419
+  9f9a9d577893087d97533f4089771fbccf09222a4bffb979edd33ec43eb2ee06  best n_estimators=150  acc=64.62%  mae=1.69718
+  ab51993ac24b0a7348768385d1fd38822c7cc29b6b586cf9a98e7847dc63ac80  best n_estimators=150  acc=54.59%  mae=3.14354
+  c0c28a757eeda2e30568e94220c96c832f06ad224f34cb0f08bc421001b1f6b3  best n_estimators=150  acc=55.82%  mae=2.35212
+  f52b062e0888afa06646eed2bcb152f90959a16b682c959a350d6674eee5f598  best n_estimators=150  acc=65.32%  mae=1.72149
+
+  ► Best n_estimators overall = 150.0  (avg accuracy across all devices: 56.83%)
+
+  Best value summary  →  results/xgboost/hypersearch\best_n_estimators.json
+  (Use best_n_estimators.json to set FIXED_PARAMS in next tuning step)
+
+  Validation curve saved  →  results/xgboost/hypersearch\validation_curves\val_curve_n_estimators.png
+
+=================================================================
+Tuning of 'n_estimators' complete.
+  Results CSV    : results/xgboost/hypersearch\results_n_estimators.csv
+  Best value     : n_estimators = 150.0
+  Best JSON      : results/xgboost/hypersearch\best_n_estimators.json
+  Curve plot     : validation_curves/val_curve_n_estimators.png
+
+Next step: open this file, set TUNING_PARAM to the next parameter
+and update FIXED_PARAMS['n_estimators'] = 150.0
+
+And below is the content which got generated in the "best_n_estimators.json"
+{
+  "tuning_param": "n_estimators",
+  "best_value": 150.0,
+  "best_avg_accuracy_%": 56.8308,
+  "fixed_params_used": {
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8
+  },
+  "all_values_tried": [
+    150,
+    200,
+    250,
+    300,
+    350
+  ],
+  "avg_accuracy_per_value": {
+    "150": 56.8308,
+    "200": 56.7075,
+    "250": 56.7069,
+    "300": 56.7508,
+    "350": 56.7331
+  }
+}
+
+So i think its saying that 150 is best value for n_estimators, so taking it, lets proceed to tuning of next hyper-parameter (max_depth).
+So take {3,4,5} as possible values for max_depth and proceed, so i will send my current battery_hypersearch.py file code, and as we discussed that we will maintain and continue the same py file to tune all parameters one-by-one, update the code of battery_hypersearch.py file accordingly.
+Below is my current code of that file, and update it accordingly and do the tuning and generating of best.json, checkpoint.json, reuslt.csv files and validation curve plots in the similar same way as u did for n_estimators parameter
+
 """
 Battery Management - Sequential Hyperparameter Tuning (One Parameter at a Time)
 ======================================================================================
@@ -46,9 +107,9 @@ warnings.filterwarnings("ignore")
 TUNING_PARAM = "n_estimators"
 
 # Values to try for the parameter being tuned
-# Step 1 — n_estimators: 200 to 700 in steps of 50
+# Step 1 — n_estimators: 150 to 350 in steps of 50
 # (wider range than your original 300-600 to catch if lower/higher is better)
-TUNING_VALUES = list(range(200, 750, 50))   # [200, 250, 300, ..., 700]  → 11 values
+TUNING_VALUES = list(range(150, 400, 50))   # [150, 200, 250, ...,350]  → 5 values
 
 # All other parameters fixed to sensible baseline values.
 # After each tuning step, update the relevant entry here with the best value found.
@@ -66,7 +127,7 @@ FIXED_PARAMS = {
 # PATHS
 # ─────────────────────────────────────────────────────────────
 WIDE_CSV_FOLDER  = "results/wide_csv"
-OUTPUT_FOLDER    = "results/hypersearch"
+OUTPUT_FOLDER    = "results/xgboost/hypersearch"
 VAL_CURVE_FOLDER = os.path.join(OUTPUT_FOLDER, "validation_curves")
 
 CHECKPOINT_FILE = os.path.join(OUTPUT_FOLDER, f"checkpoint_{TUNING_PARAM}.json")
@@ -356,7 +417,7 @@ if __name__ == "__main__":
         t0 = time.time()
         completed = len(TUNING_VALUES) - len(remaining)
 
-        BATCH_SIZE = 2   # checkpoint every 2 param values
+        BATCH_SIZE = 1   # checkpoint every 2 param values
         for batch_start in range(0, len(remaining), BATCH_SIZE):
             batch = remaining[batch_start : batch_start + BATCH_SIZE]
 
