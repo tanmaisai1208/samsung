@@ -1,85 +1,23 @@
-So i have executed ur given code to tune the n_estimators hyper-parameter and results have been generated (actually i changed the range of n_Estimators to 150-350), below is the result/conclusion which got printed in the terminal:
-───────────────────────────────────────────────────────
-Results for tuning: n_estimators
-───────────────────────────────────────────────────────
-  0b2ab3916c9084f8255a063347a6ea05e4155e0e6077a9aafbde7bd5c7399939  best n_estimators=150  acc=60.34%  mae=2.09579
-  2190a0da2b794d4ccc4e462cd89c2fdd37bced93272aafc334656a7d8cb167a2  best n_estimators=200  acc=52.54%  mae=3.12791
-  3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb  best n_estimators=150  acc=50.35%  mae=2.79487
-  5d3785215cff6de05330b0844799bf9de0ea0608edc22b098737ec286d325486  best n_estimators=350  acc=51.55%  mae=2.96419
-  9f9a9d577893087d97533f4089771fbccf09222a4bffb979edd33ec43eb2ee06  best n_estimators=150  acc=64.62%  mae=1.69718
-  ab51993ac24b0a7348768385d1fd38822c7cc29b6b586cf9a98e7847dc63ac80  best n_estimators=150  acc=54.59%  mae=3.14354
-  c0c28a757eeda2e30568e94220c96c832f06ad224f34cb0f08bc421001b1f6b3  best n_estimators=150  acc=55.82%  mae=2.35212
-  f52b062e0888afa06646eed2bcb152f90959a16b682c959a350d6674eee5f598  best n_estimators=150  acc=65.32%  mae=1.72149
-
-  ► Best n_estimators overall = 150.0  (avg accuracy across all devices: 56.83%)
-
-  Best value summary  →  results/xgboost/hypersearch\best_n_estimators.json
-  (Use best_n_estimators.json to set FIXED_PARAMS in next tuning step)
-
-  Validation curve saved  →  results/xgboost/hypersearch\validation_curves\val_curve_n_estimators.png
-
-=================================================================
-Tuning of 'n_estimators' complete.
-  Results CSV    : results/xgboost/hypersearch\results_n_estimators.csv
-  Best value     : n_estimators = 150.0
-  Best JSON      : results/xgboost/hypersearch\best_n_estimators.json
-  Curve plot     : validation_curves/val_curve_n_estimators.png
-
-Next step: open this file, set TUNING_PARAM to the next parameter
-and update FIXED_PARAMS['n_estimators'] = 150.0
-
-And below is the content which got generated in the "best_n_estimators.json"
-{
-  "tuning_param": "n_estimators",
-  "best_value": 150.0,
-  "best_avg_accuracy_%": 56.8308,
-  "fixed_params_used": {
-    "max_depth": 4,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8
-  },
-  "all_values_tried": [
-    150,
-    200,
-    250,
-    300,
-    350
-  ],
-  "avg_accuracy_per_value": {
-    "150": 56.8308,
-    "200": 56.7075,
-    "250": 56.7069,
-    "300": 56.7508,
-    "350": 56.7331
-  }
-}
-
-So i think its saying that 150 is best value for n_estimators, so taking it, lets proceed to tuning of next hyper-parameter (max_depth).
-So take {3,4,5} as possible values for max_depth and proceed, so i will send my current battery_hypersearch.py file code, and as we discussed that we will maintain and continue the same py file to tune all parameters one-by-one, update the code of battery_hypersearch.py file accordingly.
-Below is my current code of that file, and update it accordingly and do the tuning and generating of best.json, checkpoint.json, reuslt.csv files and validation curve plots in the similar same way as u did for n_estimators parameter
-
 """
 Battery Management - Sequential Hyperparameter Tuning (One Parameter at a Time)
 ======================================================================================
 Tunes ONE hyperparameter at a time while keeping all others fixed.
 Change TUNING_PARAM and FIXED_PARAMS at the top each time you run this.
 
-Tuning order (recommended):
-  Step 1: TUNING_PARAM = "n_estimators"   (current)
-  Step 2: TUNING_PARAM = "max_depth"      (fix n_estimators to best found in step 1)
-  Step 3: TUNING_PARAM = "learning_rate"  (fix above two to best found values)
-  Step 4: TUNING_PARAM = "subsample"      (fix above three to best found values)
+Tuning order:
+  Step 1: TUNING_PARAM = "n_estimators"    ✓ DONE  → best = 150
+  Step 2: TUNING_PARAM = "max_depth"       ← CURRENT
+  Step 3: TUNING_PARAM = "learning_rate"   (fix above two to best found values)
+  Step 4: TUNING_PARAM = "subsample"       (fix above three to best found values)
 
 After all steps, run one final validation with all best values combined.
 
 Outputs (per tuning run, all namespaced by TUNING_PARAM):
-  results/hypersearch/
-    checkpoint_<param>.json          — resume support, safe to delete to restart
-    results_<param>.csv              — one row per (param_value x device)
-    best_<param>.json                — best value found + accuracy, for use in next step
-    validation_curves/
-      val_curve_<param>.png          — accuracy vs param value plot
+  results/xgboost/hypersearch/
+    checkpoint_<param>.json
+    results_<param>.csv
+    best_<param>.json
+    validation_curves/val_curve_<param>.png
 """
 
 import os
@@ -103,22 +41,16 @@ warnings.filterwarnings("ignore")
 # ▶▶ CHANGE THESE TWO BLOCKS EACH TIME YOU RUN ◀◀
 # ═════════════════════════════════════════════════════════════
 
-# Which parameter are we tuning right now?
-TUNING_PARAM = "n_estimators"
+# Step 2: tuning max_depth
+TUNING_PARAM  = "max_depth"
+TUNING_VALUES = [3, 4, 5]
 
-# Values to try for the parameter being tuned
-# Step 1 — n_estimators: 150 to 350 in steps of 50
-# (wider range than your original 300-600 to catch if lower/higher is better)
-TUNING_VALUES = list(range(150, 400, 50))   # [150, 200, 250, ...,350]  → 5 values
-
-# All other parameters fixed to sensible baseline values.
-# After each tuning step, update the relevant entry here with the best value found.
-# Step 1 baseline: all at standard defaults
+# n_estimators now fixed to 150 (best from step 1)
 FIXED_PARAMS = {
-    "max_depth"      : 4,      # ← update after step 2
-    "learning_rate"  : 0.05,   # ← update after step 3
-    "subsample"      : 0.8,    # ← update after step 4
-    "colsample_bytree": 0.8,   # kept fixed throughout
+    "n_estimators"   : 150,   # ✓ best from step 1
+    "learning_rate"  : 0.05,  # ← update after step 3
+    "subsample"      : 0.8,   # ← update after step 4
+    "colsample_bytree": 0.8,  # kept fixed throughout
 }
 
 # ═════════════════════════════════════════════════════════════
@@ -137,9 +69,9 @@ BEST_JSON       = os.path.join(OUTPUT_FOLDER, f"best_{TUNING_PARAM}.json")
 os.makedirs(OUTPUT_FOLDER,    exist_ok=True)
 os.makedirs(VAL_CURVE_FOLDER, exist_ok=True)
 
-TRAIN_DAYS    = 14
-ACC_THRESHOLD = 2
-HOURS         = list(range(24))
+TRAIN_DAYS         = 14
+ACC_THRESHOLD      = 2
+HOURS              = list(range(24))
 FIXED_RANDOM_STATE = 42
 
 # ─────────────────────────────────────────────────────────────
@@ -223,16 +155,15 @@ def precompute_features(wide):
 # ─────────────────────────────────────────────────────────────
 
 def run_value_on_device(param_value, day_data, device_name):
-    """Build full param dict from FIXED_PARAMS + current tuning value, run model."""
-    params = dict(FIXED_PARAMS)           # copy fixed params
-    params[TUNING_PARAM] = param_value    # override the one being tuned
+    params = dict(FIXED_PARAMS)
+    params[TUNING_PARAM] = param_value
 
     xgb_base = XGBRegressor(
-        n_estimators     = params["n_estimators"],
-        max_depth        = params["max_depth"],
-        learning_rate    = params["learning_rate"],
-        subsample        = params["subsample"],
-        colsample_bytree = params["colsample_bytree"],
+        n_estimators     = int(params["n_estimators"]),
+        max_depth        = int(params["max_depth"]),
+        learning_rate    = float(params["learning_rate"]),
+        subsample        = float(params["subsample"]),
+        colsample_bytree = float(params["colsample_bytree"]),
         random_state     = FIXED_RANDOM_STATE,
         verbosity        = 0,
     )
@@ -255,7 +186,6 @@ def run_value_on_device(param_value, day_data, device_name):
         "mean_mae"      : round(float(np.mean(maes)),  6),
         "mean_rmse"     : round(float(np.mean(rmses)), 6),
     }
-    # Also record the fixed param values for full traceability
     for k, v in FIXED_PARAMS.items():
         if k != TUNING_PARAM:
             row[f"fixed_{k}"] = v
@@ -305,12 +235,6 @@ def process_value(param_value, all_device_data, done_set):
 # ─────────────────────────────────────────────────────────────
 
 def plot_validation_curve(results_df):
-    """
-    X-axis: values of TUNING_PARAM tried
-    Y-axis: mean accuracy
-    One line per device (semi-transparent) + thick black overall mean line.
-    Red dashed vertical at best value.
-    """
     devices      = results_df["device"].unique()
     param_values = sorted(results_df["param_value"].unique())
 
@@ -334,21 +258,19 @@ def plot_validation_curve(results_df):
     ax.axvline(best_val, color="crimson", linestyle="--", linewidth=1.8,
                label=f"Best {TUNING_PARAM} = {best_val}  "
                      f"(acc={overall[best_idx]:.2f}%)")
-
-    # Annotate best point
     ax.annotate(f"  {overall[best_idx]:.2f}%",
                 xy=(best_val, overall[best_idx]),
                 fontsize=10, color="crimson", fontweight="bold")
 
     ax.set_xlabel(TUNING_PARAM, fontsize=12)
     ax.set_ylabel("Mean Accuracy (%)", fontsize=12)
-    ax.set_title(f"Validation Curve  —  {TUNING_PARAM}\n"
-                 f"(fixed: {', '.join(f'{k}={v}' for k,v in FIXED_PARAMS.items() if k != TUNING_PARAM)})",
-                 fontsize=12, fontweight="bold")
+    ax.set_title(
+        f"Validation Curve  —  {TUNING_PARAM}\n"
+        f"(fixed: {', '.join(f'{k}={v}' for k, v in FIXED_PARAMS.items() if k != TUNING_PARAM)})",
+        fontsize=12, fontweight="bold")
     ax.legend(fontsize=8, ncol=3, loc="lower right")
     ax.grid(linestyle="--", alpha=0.4)
 
-    # Add secondary info box with fixed param values
     info = "\n".join([f"{k} = {v}" for k, v in FIXED_PARAMS.items()
                       if k != TUNING_PARAM])
     ax.text(0.02, 0.97, f"Fixed params:\n{info}",
@@ -397,9 +319,8 @@ if __name__ == "__main__":
               f"{len(wide) - TRAIN_DAYS} prediction days each run")
         all_device_data[device_name] = precompute_features(wide)
 
-    total_runs = len(TUNING_VALUES) * len(all_device_data)
     print(f"\nDevices: {list(all_device_data.keys())}")
-    print(f"Total model runs : {total_runs}  "
+    print(f"Total model runs : {len(TUNING_VALUES) * len(all_device_data)}  "
           f"({len(TUNING_VALUES)} values × {len(all_device_data)} devices)\n")
 
     # 2. Checkpoint
@@ -414,10 +335,10 @@ if __name__ == "__main__":
 
     if remaining:
         print("Starting tuning run (joblib parallel)...\n")
-        t0 = time.time()
+        t0        = time.time()
         completed = len(TUNING_VALUES) - len(remaining)
 
-        BATCH_SIZE = 1   # checkpoint every 2 param values
+        BATCH_SIZE = 1
         for batch_start in range(0, len(remaining), BATCH_SIZE):
             batch = remaining[batch_start : batch_start + BATCH_SIZE]
 
@@ -462,25 +383,25 @@ if __name__ == "__main__":
         print(f"  {device:30s}  best {TUNING_PARAM}={best['param_value']}  "
               f"acc={best['mean_accuracy']:.2f}%  mae={best['mean_mae']:.5f}")
 
-    # Overall best value (averaged across all devices)
+    # Overall best (averaged across all devices)
     overall_by_value = (results_df.groupby("param_value")["mean_accuracy"]
                                   .mean().reset_index())
-    best_row = overall_by_value.loc[overall_by_value["mean_accuracy"].idxmax()]
+    best_row      = overall_by_value.loc[overall_by_value["mean_accuracy"].idxmax()]
     best_value    = best_row["param_value"]
     best_accuracy = best_row["mean_accuracy"]
 
     print(f"\n  ► Best {TUNING_PARAM} overall = {best_value}  "
           f"(avg accuracy across all devices: {best_accuracy:.2f}%)")
 
-    # 4. Save best value to JSON for reference in next step
+    # 4. Save best_<param>.json
     best_summary = {
-        "tuning_param"        : TUNING_PARAM,
-        "best_value"          : best_value,
-        "best_avg_accuracy_%" : round(float(best_accuracy), 4),
-        "fixed_params_used"   : {k: v for k, v in FIXED_PARAMS.items()
-                                  if k != TUNING_PARAM},
-        "all_values_tried"    : TUNING_VALUES,
-        "avg_accuracy_per_value": dict(zip(
+        "tuning_param"           : TUNING_PARAM,
+        "best_value"             : best_value,
+        "best_avg_accuracy_%"    : round(float(best_accuracy), 4),
+        "fixed_params_used"      : {k: v for k, v in FIXED_PARAMS.items()
+                                    if k != TUNING_PARAM},
+        "all_values_tried"       : TUNING_VALUES,
+        "avg_accuracy_per_value" : dict(zip(
             overall_by_value["param_value"].tolist(),
             overall_by_value["mean_accuracy"].round(4).tolist()
         )),
@@ -488,17 +409,16 @@ if __name__ == "__main__":
     with open(BEST_JSON, "w") as f:
         json.dump(best_summary, f, indent=2)
     print(f"\n  Best value summary  →  {BEST_JSON}")
-    print(f"  (Use best_{TUNING_PARAM}.json to set FIXED_PARAMS in next tuning step)")
 
     # 5. Validation curve plot
     plot_validation_curve(results_df)
 
     print("\n" + "=" * 65)
     print(f"Tuning of '{TUNING_PARAM}' complete.")
-    print(f"  Results CSV    : {RESULTS_CSV}")
-    print(f"  Best value     : {TUNING_PARAM} = {best_value}")
-    print(f"  Best JSON      : {BEST_JSON}")
-    print(f"  Curve plot     : validation_curves/val_curve_{TUNING_PARAM}.png")
-    print(f"\nNext step: open this file, set TUNING_PARAM to the next parameter")
+    print(f"  Results CSV : {RESULTS_CSV}")
+    print(f"  Best value  : {TUNING_PARAM} = {best_value}")
+    print(f"  Best JSON   : {BEST_JSON}")
+    print(f"  Curve plot  : validation_curves/val_curve_{TUNING_PARAM}.png")
+    print(f"\nNext step: set TUNING_PARAM = 'learning_rate'")
     print(f"and update FIXED_PARAMS['{TUNING_PARAM}'] = {best_value}")
     print("=" * 65)
