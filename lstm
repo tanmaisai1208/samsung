@@ -1,28 +1,22 @@
 """
-Battery Management - Predictive Battery Management Through Usage Pattern Recognition
+Battery Management - Final Combined Validation with Best Hyperparameters
 ======================================================================================
-Model : Bidirectional LSTM (sequence-to-sequence)
+Runs the daily rolling-window XGBoost model using the best hyperparameter
+values found from sequential tuning in battery_hypersearch.py:
 
-Reads wide daily CSVs already produced by battery_train_test.py (XGBoost step).
-No re-pivoting needed.
+  n_estimators  = 150   (tuned in step 1)
+  max_depth     = 3     (tuned in step 2)
+  learning_rate = 0.02  (tuned in step 3)
+  subsample     = 1.0   (tuned in step 4)
+  colsample_bytree = 0.8 (fixed throughout)
 
-Step B : Sliding-window train / predict with Bidirectional LSTM
-          Train = 14-day window (2 weeks)
-          Test = next 7-day window (1 week) — unseen
-          Shift = 7 days each iteration
-          LookBack= 7 days of past daily vectors fed as input sequence
+This is the definitive accuracy result to compare against the SOM baseline.
 
-          Architecture:
-            Input : (7 days, 73 features/day)
-                     [24 dSocdt + 24 Soc + 24 ChargingStatus + 1 dayofweek]
-            BiLSTM : 2 stacked layers (128 → 64 units each direction)
-            Dropout: 0.3 between layers
-            Dense : 24 outputs (dSocdt_h0 … dSocdt_h23 of next day)
-
-Outputs (written to results/lstm_results/):
-  predictions/<name>_lstm_predictions.csv
-  plots/<name>_lstm_sliding_window.png
-  lstm_summary.csv
+Outputs:
+  results/final_validation/
+    final_predictions_<device>.csv   — per-hour actual vs predicted for every day
+    final_summary.csv                — one row per device with mean acc, MAE, RMSE
+    final_validation_plot_<device>.png
 """
 
 import os
@@ -34,248 +28,135 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import (Bidirectional, LSTM, Dense,
-                                     Dropout, Input)
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.optimizers import Adam
-from sklearn.preprocessing import MinMaxScaler
+from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.multioutput import MultiOutputRegressor
 
 warnings.filterwarnings("ignore")
-tf.get_logger().setLevel("ERROR")
+
+# ─────────────────────────────────────────────────────────────
+# BEST HYPERPARAMETERS  (from sequential tuning)
+# ─────────────────────────────────────────────────────────────
+BEST_PARAMS = {
+    "n_estimators"   : 150,
+    "max_depth"      : 3,
+    "learning_rate"  : 0.02,
+    "subsample"      : 1.0,
+    "colsample_bytree": 0.8,
+    "random_state"   : 42,
+    "verbosity"      : 0,
+}
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
+WIDE_CSV_FOLDER = "results/wide_csv"
+OUTPUT_FOLDER   = "results/final_validation"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# Folder containing *_wide.csv files already produced by XGBoost step
-WIDE_FOLDER = "results/wide_csv"
-
-OUTPUT_FOLDER = "results/lstm"
-PRED_FOLDER = os.path.join(OUTPUT_FOLDER, "predictions")
-PLOT_FOLDER = os.path.join(OUTPUT_FOLDER, "plots")
-
-for d in [OUTPUT_FOLDER, PRED_FOLDER, PLOT_FOLDER]:
-    os.makedirs(d, exist_ok=True)
-
-TRAIN_DAYS = 28
-TEST_DAYS = 7
-SHIFT_DAYS = 7
-LOOKBACK = 7
-
-ACC_THRESHOLD = 1
-EPOCHS = 80
-BATCH_SIZE = 8
-PATIENCE = 12
-
-HOURS = list(range(24))
-
-SEED = 42
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
+TRAIN_DAYS    = 14
+ACC_THRESHOLD = 2
+HOURS         = list(range(24))
 
 # ─────────────────────────────────────────────────────────────
-# COLUMN DEFINITIONS (must match XGBoost wide CSV layout)
+# COLUMN DEFINITIONS
 # ─────────────────────────────────────────────────────────────
+DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
+SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
+DATE_FEAT_COUNT = 4
+FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
 
-DSOCDT_COLS = [f"dSocdt_h{h}" for h in HOURS]
-# SOC_COLS = [f"Soc_h{h}" for h in HOURS]
-# CS_COLS = [f"ChargingStatus_h{h}" for h in HOURS]
-# ALL_COLS = DSOCDT_COLS + SOC_COLS + CS_COLS # 72 cols
-ALL_COLS = DSOCDT_COLS
-N_FEATURES = len(ALL_COLS) + 1
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE HELPERS
 # ─────────────────────────────────────────────────────────────
 
-def day_vector(wide: pd.DataFrame, day_idx: int) -> np.ndarray:
-    """73-element feature vector: 24 dSocdt + 24 Soc + 24 CS + 1 dayofweek."""
-    row = wide.iloc[day_idx]
-    dow = float(pd.Timestamp(wide.index[day_idx]).dayofweek)
-    return np.append(row[ALL_COLS].values.astype(float), dow)
+def date_feats(date_str):
+    ts = pd.Timestamp(date_str)
+    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
+
+
+def build_feature_row(wide, train_start, train_end):
+    feats = []
+    for i in range(train_start, train_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return np.array(feats, dtype=float)
+
+
+def build_padded_feature_row(wide, context_start, context_end, pad_days):
+    feats = [0.0] * (pad_days * FEATS_PER_DAY)
+    for i in range(context_start, context_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return feats
+
+
+def accuracy_threshold(actual, predicted, threshold=ACC_THRESHOLD):
+    return float(np.mean(np.abs(actual - predicted) <= threshold)) * 100.0
 
 
 # ─────────────────────────────────────────────────────────────
-# LSTM MODEL BUILDER
+# DAILY ROLLING PREDICTION
 # ─────────────────────────────────────────────────────────────
 
-def build_model(input_shape: tuple) -> tf.keras.Model:
-    model = Sequential([
-        Input(shape=input_shape),
-        Bidirectional(LSTM(32, return_sequences=True)),
-        Dropout(0.2),
-        Bidirectional(LSTM(16, return_sequences=False)),
-        Dropout(0.2),
-        Dense(24),
-    ])
-    model.compile(optimizer=Adam(learning_rate=1e-3), loss="huber")
-    return model
-
-
-# ─────────────────────────────────────────────────────────────
-# ACCURACY METRIC
-# ─────────────────────────────────────────────────────────────
-
-def pct_accuracy(actual: np.ndarray, pred: np.ndarray) -> float:
-    return float(np.mean(np.abs(actual - pred) <= ACC_THRESHOLD)) * 100.0
-
-
-# ─────────────────────────────────────────────────────────────
-# SLIDING-WINDOW TRAIN / PREDICT
-# ─────────────────────────────────────────────────────────────
-
-def sliding_window_lstm(wide: pd.DataFrame, device_name: str) -> list:
-    n_days = len(wide)
+def run_final_validation(wide, device_name):
+    n_days  = len(wide)
     results = []
-    win_num = 0
-    train_start = 0
 
-    while True:
-        train_end = train_start + TRAIN_DAYS
-        test_start = train_end
-        test_end = min(test_start + TEST_DAYS, n_days)
+    model = MultiOutputRegressor(
+        XGBRegressor(**BEST_PARAMS),
+        n_jobs=-1
+    )
 
-        if test_start >= n_days:
-            break
+    total = n_days - TRAIN_DAYS
+    print(f"  Predicting {total} days...")
 
-        win_num += 1
-        train_dates = wide.index[train_start:train_end].tolist()
-        test_dates = wide.index[test_start:test_end].tolist()
-        n_test = test_end - test_start
+    for predict_day_idx in range(TRAIN_DAYS, n_days):
+        train_start  = predict_day_idx - TRAIN_DAYS
+        train_end    = predict_day_idx
+        predict_date = wide.index[predict_day_idx]
 
-        print(f" Window {win_num:2d} | "
-              f"Train: {train_dates[0]} → {train_dates[-1]} ({TRAIN_DAYS}d) | "
-              f"Test: {test_dates[0]} → {test_dates[-1]} ({n_test}d)")
-
-        # 1. Fit scaler on train data only (no leakage)
-        train_feats = np.array(
-            [day_vector(wide, i) for i in range(train_start, train_end)],
-            dtype=np.float32
-        )
-        scaler = MinMaxScaler(feature_range=(-1, 1))
-        scaler.fit(train_feats)
-
-        # Scale train + test slice together (fit was train-only)
-        all_feats = np.array(
-            [day_vector(wide, i) for i in range(train_start, test_end)],
-            dtype=np.float32
-        )
-        all_scaled = scaler.transform(all_feats)
-
-        def get_scaled_vec(abs_day_idx: int) -> np.ndarray:
-            rel = abs_day_idx - train_start
-            if rel < 0:
-                return np.zeros(N_FEATURES, dtype=np.float32)
-            return all_scaled[rel]
-
-        # 2. Build training sequences
+        # Build training samples (expanding sub-windows within 14-day block)
         X_train, y_train = [], []
-        for i in range(train_start, train_end):
-            seq = np.array(
-                [get_scaled_vec(i - LOOKBACK + k) for k in range(LOOKBACK)],
-                dtype=np.float32
-            )
-            tgt_raw = wide.iloc[i][DSOCDT_COLS].values.astype(np.float32)
-            dummy = np.zeros((1, N_FEATURES), dtype=np.float32)
-            dummy[0, :24] = tgt_raw
-            tgt_scaled = scaler.transform(dummy)[0, :24]
-            X_train.append(seq)
-            y_train.append(tgt_scaled)
+        for k in range(1, TRAIN_DAYS):
+            pad_days = TRAIN_DAYS - k
+            feats  = build_padded_feature_row(wide, train_start,
+                                               train_start + k, pad_days)
+            target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
+            X_train.append(feats)
+            y_train.append(target)
 
-        X_train = np.array(X_train, dtype=np.float32)
-        y_train = np.array(y_train, dtype=np.float32)
+        X_train = np.array(X_train, dtype=float)
+        y_train = np.array(y_train, dtype=float)
 
-        if len(X_train) < 2:
-            print(" Skipping: insufficient training sequences.")
-            train_start += SHIFT_DAYS
-            continue
+        model.fit(X_train, y_train)
 
-        # 3. Train
-        model = build_model(input_shape=(LOOKBACK, N_FEATURES))
-        callbacks = [
-            EarlyStopping(monitor="val_loss", patience=PATIENCE,
-                          restore_best_weights=True, verbose=0),
-            ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                              patience=5, min_lr=1e-5, verbose=0),
-        ]
-        history = model.fit(
-            X_train, y_train,
-            epochs = EPOCHS,
-            batch_size = BATCH_SIZE,
-            validation_split = 0.15,
-            callbacks = callbacks,
-            verbose = 0,
-            shuffle = False,
-        )
-        epochs_ran = len(history.history["loss"])
+        X_pred   = build_feature_row(wide, train_start, train_end).reshape(1, -1)
+        y_pred   = model.predict(X_pred)[0]
+        y_pred   = np.clip(y_pred, a_min=None, a_max=0.0)
+        y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
 
-        # 4. Autoregressive prediction over test week
-        buffer = [get_scaled_vec(test_start - LOOKBACK + k)
-                  for k in range(LOOKBACK)]
-
-        y_pred_all, y_test_all = [], []
-
-        for d in range(n_test):
-            abs_day = test_start + d
-            seq_input = np.array(buffer, dtype=np.float32)[np.newaxis]
-
-            pred_scaled = model.predict(seq_input, verbose=0)[0]
-
-            dummy_inv = np.zeros((1, N_FEATURES), dtype=np.float32)
-            dummy_inv[0, :24] = pred_scaled
-            pred_original = scaler.inverse_transform(dummy_inv)[0, :24]
-            pred_original = np.clip(pred_original, a_min=None, a_max=0.0)
-
-            actual = wide.iloc[abs_day][DSOCDT_COLS].values.astype(float)
-            y_pred_all.append(pred_original)
-            y_test_all.append(actual)
-
-            # Feed predicted dSocdt back into buffer for next step
-            next_raw = day_vector(wide, abs_day).copy()
-            next_raw[:24] = pred_original
-            next_scaled = scaler.transform(next_raw[np.newaxis])[0]
-            buffer.pop(0)
-            buffer.append(next_scaled)
-
-        y_pred_all = np.array(y_pred_all)
-        y_test_all = np.array(y_test_all)
-
-        # 5. Metrics
-        flat_actual = y_test_all.flatten()
-        flat_pred = y_pred_all.flatten()
-
-        acc = pct_accuracy(flat_actual, flat_pred)
-        mae = mean_absolute_error(flat_actual, flat_pred)
-        rmse = np.sqrt(mean_squared_error(flat_actual, flat_pred))
-        per_day_acc = [pct_accuracy(y_test_all[d], y_pred_all[d])
-                       for d in range(n_test)]
-
-        print(f" => Epochs: {epochs_ran:3d} | "
-              f"Accuracy: {acc:.2f}% | MAE: {mae:.5f} | RMSE: {rmse:.5f}")
+        acc  = accuracy_threshold(y_actual, y_pred)
+        mae  = mean_absolute_error(y_actual, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_actual, y_pred))
 
         results.append({
-            "Window" : win_num,
-            "TrainStart" : train_dates[0],
-            "TrainEnd" : train_dates[-1],
-            "TestStart" : test_dates[0],
-            "TestEnd" : test_dates[-1],
-            "TestDays" : n_test,
-            "EpochsRan" : epochs_ran,
-            "Accuracy_%" : round(acc, 2),
-            "MAE" : round(mae, 6),
-            "RMSE" : round(rmse, 6),
-            "PerDayAccuracy": [round(a, 2) for a in per_day_acc],
-            "y_test" : y_test_all,
-            "y_pred" : y_pred_all,
-            "test_dates" : test_dates,
+            "predict_date": predict_date,
+            "train_start" : wide.index[train_start],
+            "train_end"   : wide.index[train_end - 1],
+            "accuracy_%"  : round(acc,  2),
+            "mae"         : round(mae,  6),
+            "rmse"        : round(rmse, 6),
+            "y_actual"    : y_actual,
+            "y_pred"      : y_pred,
         })
 
-        train_start += SHIFT_DAYS
+        if (predict_day_idx - TRAIN_DAYS) % 10 == 0 or predict_day_idx == n_days - 1:
+            print(f"  Day {predict_day_idx - TRAIN_DAYS + 1:3d}/{total} "
+                  f"| {predict_date} | Acc: {acc:.1f}%  MAE: {mae:.5f}")
 
     return results
 
@@ -284,173 +165,191 @@ def sliding_window_lstm(wide: pd.DataFrame, device_name: str) -> list:
 # PLOTTING
 # ─────────────────────────────────────────────────────────────
 
-def plot_results(results: list, device_name: str, plot_path: str):
-    if not results:
-        return
+def plot_final(results, device_name, plot_path):
+    dates      = [r["predict_date"] for r in results]
+    accuracies = [r["accuracy_%"]   for r in results]
+    maes       = [r["mae"]          for r in results]
+    mean_acc   = np.mean(accuracies)
 
-    n_windows = len(results)
-    fig = plt.figure(figsize=(16, 5 + 4 * n_windows))
-    fig.suptitle(f"BiLSTM Sliding-Window Results — {device_name}",
-                 fontsize=14, fontweight="bold", y=0.99)
+    fig, axes = plt.subplots(3, 1, figsize=(16, 13))
+    fig.suptitle(
+        f"Final Validation — Best Hyperparameters — {device_name}\n"
+        f"n_estimators={BEST_PARAMS['n_estimators']}  "
+        f"max_depth={BEST_PARAMS['max_depth']}  "
+        f"lr={BEST_PARAMS['learning_rate']}  "
+        f"subsample={BEST_PARAMS['subsample']}",
+        fontsize=12, fontweight="bold"
+    )
 
-    ax_acc = fig.add_subplot(n_windows + 1, 1, 1)
-    labels = [f"W{r['Window']}\n{r['TestStart']}" for r in results]
-    accuracies = [r["Accuracy_%"] for r in results]
-    colors = ["steelblue" if a >= 50 else "salmon" for a in accuracies]
-    mean_acc = np.mean(accuracies)
+    # Panel 1 — daily accuracy + 7-day rolling mean
+    ax = axes[0]
+    ax.plot(dates, accuracies, color="steelblue", linewidth=1.0,
+            alpha=0.6, label="Daily accuracy")
+    roll7 = pd.Series(accuracies).rolling(7, min_periods=1).mean().tolist()
+    ax.plot(dates, roll7, color="navy", linewidth=2.0, label="7-day rolling mean")
+    ax.axhline(mean_acc, color="crimson", linestyle="-", linewidth=1.5,
+               label=f"Overall mean: {mean_acc:.1f}%")
+    ax.axhline(50, color="gray", linestyle="--", linewidth=1.0, label="50% reference")
+    ax.set_ylabel("Accuracy (%)", fontsize=11)
+    ax.set_title(f"Daily Accuracy  (threshold: |error| ≤ {ACC_THRESHOLD})", fontsize=11)
+    ax.set_ylim(0, 110)
+    ax.legend(fontsize=9)
+    ax.grid(linestyle="--", alpha=0.4)
+    tick_step = max(1, len(dates) // 15)
+    ax.set_xticks(dates[::tick_step])
+    ax.set_xticklabels(dates[::tick_step], rotation=45, ha="right", fontsize=8)
 
-    bars = ax_acc.bar(labels, accuracies, color=colors, edgecolor="white",
-                      linewidth=0.8, zorder=3)
-    ax_acc.axhline(50, color="gray", linestyle="--", lw=1.2, label="50% reference")
-    ax_acc.axhline(mean_acc, color="crimson", linestyle="-", lw=1.5,
-                   label=f"Mean: {mean_acc:.1f}%")
+    # Panel 2 — daily MAE
+    ax2 = axes[1]
+    ax2.bar(range(len(maes)), maes, color="steelblue", alpha=0.7)
+    ax2.axhline(np.mean(maes), color="crimson", linestyle="-", linewidth=1.5,
+                label=f"Mean MAE: {np.mean(maes):.4f}")
+    ax2.set_ylabel("MAE", fontsize=11)
+    ax2.set_title("Daily MAE", fontsize=11)
+    ax2.legend(fontsize=9)
+    ax2.grid(axis="y", linestyle="--", alpha=0.4)
+    ax2.set_xticks(range(0, len(maes), max(1, len(maes) // 15)))
+    ax2.set_xticklabels(dates[::max(1, len(dates) // 15)],
+                        rotation=45, ha="right", fontsize=8)
 
-    for bar, acc in zip(bars, accuracies):
-        ax_acc.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 1, f"{acc:.1f}%",
-                    ha="center", va="bottom", fontsize=8.5, fontweight="bold")
-
-    ax_acc.set_ylim(0, 115)
-    ax_acc.set_ylabel("Accuracy (%)", fontsize=11)
-    ax_acc.set_title(
-        f"Window-wise Accuracy (threshold: |error| ≤ {ACC_THRESHOLD})", fontsize=11)
-    ax_acc.legend(fontsize=9)
-    ax_acc.grid(axis="y", linestyle="--", alpha=0.4)
-
+    # Panel 3 — actual vs predicted for ~8 sampled days
+    ax3 = axes[2]
+    sample_idx = list(range(0, len(results), max(1, len(results) // 8)))
     cmap = plt.cm.tab10
-    for wi, r in enumerate(results):
-        ax = fig.add_subplot(n_windows + 1, 1, wi + 2)
-        for d_idx, date in enumerate(r["test_dates"]):
-            color = cmap(d_idx % 10)
-            ax.plot(HOURS, r["y_test"][d_idx], color=color, lw=1.6,
-                    label=f"{date} actual")
-            ax.plot(HOURS, r["y_pred"][d_idx], color=color, lw=1.4,
-                    linestyle="--", alpha=0.8)
+    for si, idx in enumerate(sample_idx):
+        r     = results[idx]
+        color = cmap(si % 10)
+        ax3.plot(HOURS, r["y_actual"], color=color, linewidth=1.6,
+                 label=f"{r['predict_date']} actual")
+        ax3.plot(HOURS, r["y_pred"],   color=color, linewidth=1.4,
+                 linestyle="--", alpha=0.8)
 
-        solid_p = mpatches.Patch(color="gray", label="Actual (solid)")
-        dash_p = mpatches.Patch(color="gray", label="Predicted (dashed)")
-        handles, lbls = ax.get_legend_handles_labels()
-        ax.legend(handles + [solid_p, dash_p],
-                  lbls + ["Actual (solid)", "Predicted (dashed)"],
-                  fontsize=6.5, ncol=5, loc="lower right")
-        ax.set_title(
-            f"Window {r['Window']} | Test: {r['TestStart']} → {r['TestEnd']} "
-            f"| Acc: {r['Accuracy_%']:.1f}% | MAE: {r['MAE']:.4f}",
-            fontsize=9.5
-        )
-        ax.set_xlabel("Hour of day", fontsize=9)
-        ax.set_ylabel("dSocdt", fontsize=9)
-        ax.set_xticks(HOURS)
-        ax.grid(linestyle="--", alpha=0.3)
+    solid_p = mpatches.Patch(color="gray", label="Actual (solid)")
+    dash_p  = mpatches.Patch(color="gray", label="Predicted (dashed)")
+    handles, lbls = ax3.get_legend_handles_labels()
+    ax3.legend(handles + [solid_p, dash_p],
+               lbls   + ["Actual (solid)", "Predicted (dashed)"],
+               fontsize=7, ncol=5, loc="lower right")
+    ax3.set_xlabel("Hour of day", fontsize=11)
+    ax3.set_ylabel("dSocdt (discharge rate)", fontsize=11)
+    ax3.set_title("Actual vs Predicted dSocdt — Sample Days", fontsize=11)
+    ax3.set_xticks(HOURS)
+    ax3.grid(linestyle="--", alpha=0.3)
 
-    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.tight_layout()
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f" Plot saved → {plot_path}")
+    print(f"  Plot saved  →  {plot_path}")
 
 
 # ─────────────────────────────────────────────────────────────
-# MAIN LOOP — read wide CSVs directly, no re-pivoting
+# MAIN
 # ─────────────────────────────────────────────────────────────
 
-wide_files = sorted(glob.glob(os.path.join(WIDE_FOLDER, "*_wide.csv")))
-print(f"Found {len(wide_files)} wide CSV file(s) in '{WIDE_FOLDER}'\n")
+if __name__ == "__main__":
 
-all_summary = []
+    print("=" * 65)
+    print("FINAL COMBINED VALIDATION — BEST HYPERPARAMETERS")
+    print("=" * 65)
+    for k, v in BEST_PARAMS.items():
+        if k not in ("random_state", "verbosity"):
+            print(f"  {k:20s} = {v}")
+    print("=" * 65 + "\n")
 
-for wide_path in wide_files:
-    base_name = os.path.splitext(os.path.basename(wide_path))[0]
-    device_name = base_name.replace("_wide", "")
+    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
+    if not wide_files:
+        raise FileNotFoundError(
+            f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'. "
+            "Run battery_xgboost.py first."
+        )
 
-    pred_path = os.path.join(PRED_FOLDER, f"{device_name}_lstm_predictions.csv")
-    plot_path = os.path.join(PLOT_FOLDER, f"{device_name}_lstm_sliding_window.png")
+    all_summary = []
 
-    print("=" * 70)
-    print(f"Device : {device_name}")
-    print("=" * 70)
+    for wf in wide_files:
+        device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
+        pred_path   = os.path.join(OUTPUT_FOLDER, f"final_predictions_{device_name}.csv")
+        plot_path   = os.path.join(OUTPUT_FOLDER, f"final_validation_plot_{device_name}.png")
 
-    try:
-        # Read the wide CSV produced by the XGBoost step
-        wide = pd.read_csv(wide_path, index_col="Date")
-        print(f" Loaded wide CSV: {len(wide)} days x {len(wide.columns)} cols")
+        print("=" * 65)
+        print(f"Device : {device_name}")
+        print("=" * 65)
 
-        # Ensure dSocdt columns have no positive values
-        # (should already be zeroed by XGBoost step, but enforce here too)
-        wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
+        try:
+            wide = pd.read_csv(wf, index_col="Date")
+            wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
 
-        total_days = len(wide)
-        if total_days < TRAIN_DAYS + TEST_DAYS:
-            print(f" Skipping: need >= {TRAIN_DAYS + TEST_DAYS} days, "
-                  f"only {total_days} available.\n")
-            continue
+            if len(wide) <= TRAIN_DAYS:
+                print(f"  Skipping: not enough days.\n")
+                continue
 
-        print(f"\n Sliding windows "
-              f"(train={TRAIN_DAYS}d, test={TEST_DAYS}d, shift={SHIFT_DAYS}d, "
-              f"lookback={LOOKBACK}d)\n")
+            results = run_final_validation(wide, device_name)
 
-        results = sliding_window_lstm(wide, device_name)
+            if not results:
+                continue
 
-        if not results:
-            print(" No valid windows.\n")
-            continue
-
-        # Save predictions CSV
-        pred_rows = []
-        for r in results:
-            for d_idx, date in enumerate(r["test_dates"]):
+            # Save per-hour predictions CSV
+            pred_rows = []
+            for r in results:
                 for h in HOURS:
                     pred_rows.append({
-                        "Window" : r["Window"],
-                        "Date" : date,
-                        "Hour" : h,
-                        "Actual_dSocdt" : round(float(r["y_test"][d_idx, h]), 6),
-                        "Pred_dSocdt" : round(float(r["y_pred"][d_idx, h]), 6),
-                        "AbsError" : round(abs(float(r["y_test"][d_idx, h])
-                                                    - float(r["y_pred"][d_idx, h])), 6),
+                        "predict_date"  : r["predict_date"],
+                        "train_start"   : r["train_start"],
+                        "train_end"     : r["train_end"],
+                        "hour"          : h,
+                        "actual_dSocdt" : round(float(r["y_actual"][h]), 6),
+                        "pred_dSocdt"   : round(float(r["y_pred"][h]),   6),
+                        "abs_error"     : round(abs(float(r["y_actual"][h])
+                                                    - float(r["y_pred"][h])), 6),
                     })
-        pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
-        print(f" Predictions CSV → {pred_path}")
+            pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
+            print(f"  Predictions CSV  →  {pred_path}")
 
-        plot_results(results, device_name, plot_path)
+            plot_final(results, device_name, plot_path)
 
-        mean_acc = round(np.mean([r["Accuracy_%"] for r in results]), 2)
-        mean_mae = round(np.mean([r["MAE"] for r in results]), 6)
-        mean_rmse = round(np.mean([r["RMSE"] for r in results]), 6)
+            mean_acc  = round(np.mean([r["accuracy_%"] for r in results]), 2)
+            mean_mae  = round(np.mean([r["mae"]        for r in results]), 6)
+            mean_rmse = round(np.mean([r["rmse"]       for r in results]), 6)
 
-        print(f"\n Overall mean accuracy : {mean_acc:.2f}%")
-        print(f" Overall mean MAE : {mean_mae:.5f}")
-        print(f" Overall mean RMSE : {mean_rmse:.5f}")
+            print(f"\n  Mean accuracy : {mean_acc:.2f}%")
+            print(f"  Mean MAE      : {mean_mae:.5f}")
+            print(f"  Mean RMSE     : {mean_rmse:.5f}")
 
-        for r in results:
             all_summary.append({
-                "Device" : device_name,
-                "Window" : r["Window"],
-                "TrainStart" : r["TrainStart"],
-                "TrainEnd" : r["TrainEnd"],
-                "TestStart" : r["TestStart"],
-                "TestEnd" : r["TestEnd"],
-                "TestDays" : r["TestDays"],
-                "EpochsRan" : r["EpochsRan"],
-                "Accuracy_%" : r["Accuracy_%"],
-                "MAE" : r["MAE"],
-                "RMSE" : r["RMSE"],
+                "device"              : device_name,
+                "total_days_predicted": len(results),
+                "mean_accuracy_%"     : mean_acc,
+                "mean_mae"            : mean_mae,
+                "mean_rmse"           : mean_rmse,
+                "n_estimators"        : BEST_PARAMS["n_estimators"],
+                "max_depth"           : BEST_PARAMS["max_depth"],
+                "learning_rate"       : BEST_PARAMS["learning_rate"],
+                "subsample"           : BEST_PARAMS["subsample"],
+                "colsample_bytree"    : BEST_PARAMS["colsample_bytree"],
             })
 
-    except Exception as e:
-        import traceback
-        print(f" ERROR: {e}")
-        traceback.print_exc()
+        except Exception as e:
+            import traceback
+            print(f"  ERROR: {e}")
+            traceback.print_exc()
 
-    print()
+        print()
 
-# Global summary
-summary_path = os.path.join(OUTPUT_FOLDER, "lstm_summary.csv")
-summary_df = pd.DataFrame(all_summary)
-summary_df.to_csv(summary_path, index=False)
+    # Global summary
+    summary_path = os.path.join(OUTPUT_FOLDER, "final_summary.csv")
+    summary_df   = pd.DataFrame(all_summary)
+    summary_df.to_csv(summary_path, index=False)
 
-print("=" * 70)
-print(f"Global summary → {summary_path}")
-if not summary_df.empty:
-    print(f"Overall mean accuracy (all devices + windows): "
-          f"{summary_df['Accuracy_%'].mean():.2f}%")
-print("=" * 70)
+    print("=" * 65)
+    print(f"Final summary  →  {summary_path}")
+    if not summary_df.empty:
+        overall_mean = summary_df["mean_accuracy_%"].mean()
+        print(f"\nOverall mean accuracy across all devices : {overall_mean:.2f}%")
+        print()
+        print(f"{'Device':<35} {'Accuracy':>10} {'MAE':>12} {'RMSE':>12}")
+        print("─" * 72)
+        for _, row in summary_df.iterrows():
+            print(f"  {row['device']:<33} {row['mean_accuracy_%']:>9.2f}%"
+                  f" {row['mean_mae']:>12.5f} {row['mean_rmse']:>12.5f}")
+        print("─" * 72)
+        print(f"  {'OVERALL MEAN':<33} {overall_mean:>9.2f}%")
+    print("=" * 65)
