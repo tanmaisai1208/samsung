@@ -1,7 +1,21 @@
-okay, for sometime lets move onto different things. now we will not doing any coding or trainning etc, for sometime we have to focus on other thing, as u know along with writing codes, obtaining results, predictions etc, doing documentation / report making is also important, so that when i present my project others should understand what the PS is, what what are the things that i have done as a process etc. So one thing u need to remember is, this report is not that kind where we do the whole project and complete it first and then we will write a report of it, its actually simultaneous thing, like after every completion of some task or milestone i have to keep on updating the report/documentation. So i am maintaing these all project folder in github so i think i have to maintain a file for report too in github only. So i want ur help in writing of report of all the things done till now. FYI, let me tell what eah file's or foler's purpose is: 
-So remember one thing we have to write report in the step wise order o what what tasks i have done. 
-First I had a folder which contained some no. of csv data files of multiple users/devices SoC data(mention what what were the columns present in each csv file), but since i need data in hourly timegap i respampled the data using interpolation and converted data and stored the updated csv files in 'resampled_csv' folder, then i had to do a test on whether long-term dependence exist or not (or whether similar patterns occured in long term past occur in future or not), so for that i have done autocorrelation and hurst exponent test and generated corresponding plots of both tests on all csv files(which are contained in ac_hc_plots folder), so also mention that fr=or most of the files i have got hurst exponent value around 0.7 and for very few files i got near 0.9 and for very few files i got it around 0.4-0.5, so explaining what it means when it's value is 0.5, <0.5, >0.5 tell what was the final conclusion i got from these 2 tests of csv files. 
-Then I went to doing of actual training & prediction doing on device usage/ dSocdt patterns using XGBoost model, so the python code of doing training and testing is present in xg_train_test.py file, so explain what were the things/step-wise jobs done to do train&prediction, like first i converted resampled csvs to wide_csvs then tell the format of how train & predicion is done, like taking day1-14 as train and then predicting day15, then taking day2-15 as training then predict day16 etc and so on...
-then tell that since optimal value of hyperparamteres of model are to be used, tell that i have created a pipeline where a loop of different various combinations of hyperparamteres is taken and each combo is runned on all devices and then accuracies, rmse, mae of all devices for each combo is stored and then based on the summary, the best_optimal_hyperparameter is chosen. So tell that summary is present in xg_summary.csv, and validation curves plots of knwoing behaviour of accuracy on each hyperparamteres are also stored in validation_curves file etc, also tell about hypersearch_results.csv
-
-So now if there is a way to write some code to generate a good detailed beautiful report of things done till now describing all the things told by me in the description above, do it and give the code to execute it.
+if(nums[low]>=nums[high]){
+    if(nums[mid]>nums[low]){
+        if(target>nums[mid] || target<=nums[high]){
+            low=mid+1;
+        }else if(target>nums[high]){
+            high=mid-1;
+        }
+    }else{
+        if(target<nums[mid] || target>nums[high]){
+            high=mid-1;
+        }else if(target<nums[high]){
+            low=mid+1;
+        }
+    }
+}else{
+    if(target>nums[mid]){
+        low=mid+1;
+    }else{
+        high=mid-1;
+    }
+}
