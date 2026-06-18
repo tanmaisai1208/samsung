@@ -10,13 +10,17 @@ values found from sequential tuning in battery_hypersearch.py:
   subsample     = 1.0   (tuned in step 4)
   colsample_bytree = 0.8 (fixed throughout)
 
-This is the definitive accuracy result to compare against the SOM baseline.
+Threshold sweep: ACC_THRESHOLD varied from 1 to 10.
+For each threshold, overall mean accuracy across all devices is computed.
+Predictions are made ONCE per device (model output is fixed), then accuracy
+is re-evaluated at each threshold value — no re-training needed.
 
-Outputs:
-  results/final_validation/
-    final_predictions_<device>.csv   — per-hour actual vs predicted for every day
-    final_summary.csv                — one row per device with mean acc, MAE, RMSE
-    final_validation_plot_<device>.png
+Outputs (all inside results/final_validation/):
+  final_predictions_<device>.csv       — per-hour actual vs predicted (raw, no threshold)
+  final_summary_threshold_<T>.csv      — per-device metrics at each threshold T
+  final_summary_all_thresholds.csv     — all thresholds combined in one CSV
+  final_validation_plot_<device>.png   — daily accuracy/MAE/actual-vs-pred (at default T=2)
+  threshold_accuracy_curve.png         — overall mean accuracy vs threshold value
 """
 
 import os
@@ -54,9 +58,10 @@ WIDE_CSV_FOLDER = "results/wide_csv"
 OUTPUT_FOLDER   = "results/final_validation"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-TRAIN_DAYS    = 14
-ACC_THRESHOLD = 2
-HOURS         = list(range(24))
+TRAIN_DAYS       = 14
+THRESHOLDS       = list(range(1, 11))   # 1, 2, 3, ... 10
+DEFAULT_PLOT_T   = 2                    # threshold used for the per-device plots
+HOURS            = list(range(24))
 
 # ─────────────────────────────────────────────────────────────
 # COLUMN DEFINITIONS
@@ -94,15 +99,19 @@ def build_padded_feature_row(wide, context_start, context_end, pad_days):
     return feats
 
 
-def accuracy_threshold(actual, predicted, threshold=ACC_THRESHOLD):
+def accuracy_at_threshold(actual, predicted, threshold):
     return float(np.mean(np.abs(actual - predicted) <= threshold)) * 100.0
 
 
 # ─────────────────────────────────────────────────────────────
-# DAILY ROLLING PREDICTION
+# DAILY ROLLING PREDICTION  (runs once per device)
 # ─────────────────────────────────────────────────────────────
 
-def run_final_validation(wide, device_name):
+def run_predictions(wide, device_name):
+    """
+    Returns list of per-day dicts containing raw y_actual and y_pred arrays.
+    Accuracy is NOT computed here — it's computed later for each threshold.
+    """
     n_days  = len(wide)
     results = []
 
@@ -119,7 +128,6 @@ def run_final_validation(wide, device_name):
         train_end    = predict_day_idx
         predict_date = wide.index[predict_day_idx]
 
-        # Build training samples (expanding sub-windows within 14-day block)
         X_train, y_train = [], []
         for k in range(1, TRAIN_DAYS):
             pad_days = TRAIN_DAYS - k
@@ -131,7 +139,6 @@ def run_final_validation(wide, device_name):
 
         X_train = np.array(X_train, dtype=float)
         y_train = np.array(y_train, dtype=float)
-
         model.fit(X_train, y_train)
 
         X_pred   = build_feature_row(wide, train_start, train_end).reshape(1, -1)
@@ -139,46 +146,61 @@ def run_final_validation(wide, device_name):
         y_pred   = np.clip(y_pred, a_min=None, a_max=0.0)
         y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
 
-        acc  = accuracy_threshold(y_actual, y_pred)
-        mae  = mean_absolute_error(y_actual, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_actual, y_pred))
-
         results.append({
             "predict_date": predict_date,
             "train_start" : wide.index[train_start],
             "train_end"   : wide.index[train_end - 1],
-            "accuracy_%"  : round(acc,  2),
-            "mae"         : round(mae,  6),
-            "rmse"        : round(rmse, 6),
             "y_actual"    : y_actual,
             "y_pred"      : y_pred,
+            "mae"         : round(mean_absolute_error(y_actual, y_pred), 6),
+            "rmse"        : round(np.sqrt(mean_squared_error(y_actual, y_pred)), 6),
         })
 
         if (predict_day_idx - TRAIN_DAYS) % 10 == 0 or predict_day_idx == n_days - 1:
             print(f"  Day {predict_day_idx - TRAIN_DAYS + 1:3d}/{total} "
-                  f"| {predict_date} | Acc: {acc:.1f}%  MAE: {mae:.5f}")
+                  f"| {predict_date} | MAE: {results[-1]['mae']:.5f}")
 
     return results
 
 
 # ─────────────────────────────────────────────────────────────
-# PLOTTING
+# COMPUTE METRICS AT A GIVEN THRESHOLD
 # ─────────────────────────────────────────────────────────────
 
-def plot_final(results, device_name, plot_path):
+def metrics_at_threshold(results, threshold):
+    """Given raw prediction results, compute accuracy/MAE/RMSE at threshold T."""
+    daily_accs = [
+        accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
+        for r in results
+    ]
+    return {
+        "mean_accuracy_%": round(float(np.mean(daily_accs)), 4),
+        "mean_mae"        : round(float(np.mean([r["mae"]  for r in results])), 6),
+        "mean_rmse"       : round(float(np.mean([r["rmse"] for r in results])), 6),
+        "daily_accs"      : daily_accs,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# PER-DEVICE PLOT  (uses DEFAULT_PLOT_T for the accuracy panel)
+# ─────────────────────────────────────────────────────────────
+
+def plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T):
     dates      = [r["predict_date"] for r in results]
-    accuracies = [r["accuracy_%"]   for r in results]
-    maes       = [r["mae"]          for r in results]
+    accuracies = [accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
+                  for r in results]
+    maes       = [r["mae"] for r in results]
     mean_acc   = np.mean(accuracies)
 
     fig, axes = plt.subplots(3, 1, figsize=(16, 13))
     fig.suptitle(
-        f"Final Validation — Best Hyperparameters — {device_name}\n"
+        f"Final Validation — {device_name}\n"
         f"n_estimators={BEST_PARAMS['n_estimators']}  "
         f"max_depth={BEST_PARAMS['max_depth']}  "
         f"lr={BEST_PARAMS['learning_rate']}  "
-        f"subsample={BEST_PARAMS['subsample']}",
-        fontsize=12, fontweight="bold"
+        f"subsample={BEST_PARAMS['subsample']}  "
+        f"(accuracy shown at threshold={threshold})",
+        fontsize=11, fontweight="bold"
     )
 
     # Panel 1 — daily accuracy + 7-day rolling mean
@@ -191,7 +213,7 @@ def plot_final(results, device_name, plot_path):
                label=f"Overall mean: {mean_acc:.1f}%")
     ax.axhline(50, color="gray", linestyle="--", linewidth=1.0, label="50% reference")
     ax.set_ylabel("Accuracy (%)", fontsize=11)
-    ax.set_title(f"Daily Accuracy  (threshold: |error| ≤ {ACC_THRESHOLD})", fontsize=11)
+    ax.set_title(f"Daily Accuracy  (threshold = {threshold})", fontsize=11)
     ax.set_ylim(0, 110)
     ax.legend(fontsize=9)
     ax.grid(linestyle="--", alpha=0.4)
@@ -239,7 +261,64 @@ def plot_final(results, device_name, plot_path):
     fig.tight_layout()
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Plot saved  →  {plot_path}")
+    print(f"  Device plot saved  →  {plot_path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# THRESHOLD ACCURACY CURVE PLOT
+# ─────────────────────────────────────────────────────────────
+
+def plot_threshold_curve(threshold_summary_df):
+    """
+    X-axis: threshold value (1–10)
+    Y-axis: overall mean accuracy across all devices
+    One line per device + thick black overall mean line.
+    """
+    devices   = threshold_summary_df["device"].unique()
+    thresholds = sorted(threshold_summary_df["threshold"].unique())
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    cmap = plt.cm.tab10
+
+    all_means = []
+    for di, device in enumerate(devices):
+        dev_df = threshold_summary_df[threshold_summary_df["device"] == device]
+        accs   = [dev_df[dev_df["threshold"] == t]["mean_accuracy_%"].values[0]
+                  for t in thresholds]
+        ax.plot(thresholds, accs, marker="o", linewidth=1.3,
+                color=cmap(di % 10), alpha=0.5, label=device)
+        all_means.append(accs)
+
+    overall = np.mean(all_means, axis=0)
+    ax.plot(thresholds, overall, marker="D", linewidth=2.5,
+            color="black", label="Overall mean", zorder=5)
+
+    # Annotate each point on the overall line
+    for t, acc in zip(thresholds, overall):
+        ax.annotate(f"{acc:.1f}%", xy=(t, acc),
+                    xytext=(0, 7), textcoords="offset points",
+                    ha="center", fontsize=8, color="black", fontweight="bold")
+
+    ax.set_xlabel("Accuracy Threshold", fontsize=12)
+    ax.set_ylabel("Mean Accuracy (%)", fontsize=12)
+    ax.set_title(
+        "Overall Mean Accuracy vs Threshold Value\n"
+        f"(Best params: n_est={BEST_PARAMS['n_estimators']}, "
+        f"depth={BEST_PARAMS['max_depth']}, "
+        f"lr={BEST_PARAMS['learning_rate']}, "
+        f"subsample={BEST_PARAMS['subsample']})",
+        fontsize=12, fontweight="bold"
+    )
+    ax.set_xticks(thresholds)
+    ax.legend(fontsize=8, ncol=3, loc="lower right")
+    ax.grid(linestyle="--", alpha=0.4)
+    ax.set_ylim(0, 110)
+
+    plot_path = os.path.join(OUTPUT_FOLDER, "threshold_accuracy_curve.png")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n  Threshold curve saved  →  {plot_path}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -254,6 +333,7 @@ if __name__ == "__main__":
     for k, v in BEST_PARAMS.items():
         if k not in ("random_state", "verbosity"):
             print(f"  {k:20s} = {v}")
+    print(f"\n  Thresholds evaluated : {THRESHOLDS}")
     print("=" * 65 + "\n")
 
     wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
@@ -263,7 +343,8 @@ if __name__ == "__main__":
             "Run battery_xgboost.py first."
         )
 
-    all_summary = []
+    # Stores all threshold rows across all devices for the combined summary
+    all_threshold_rows = []
 
     for wf in wide_files:
         device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
@@ -282,12 +363,12 @@ if __name__ == "__main__":
                 print(f"  Skipping: not enough days.\n")
                 continue
 
-            results = run_final_validation(wide, device_name)
-
+            # ── Run model once — get raw predictions ─────────
+            results = run_predictions(wide, device_name)
             if not results:
                 continue
 
-            # Save per-hour predictions CSV
+            # ── Save raw per-hour predictions CSV ────────────
             pred_rows = []
             for r in results:
                 for h in HOURS:
@@ -302,30 +383,28 @@ if __name__ == "__main__":
                                                     - float(r["y_pred"][h])), 6),
                     })
             pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
-            print(f"  Predictions CSV  →  {pred_path}")
+            print(f"\n  Raw predictions CSV  →  {pred_path}")
 
-            plot_final(results, device_name, plot_path)
+            # ── Per-device plot (at DEFAULT_PLOT_T) ──────────
+            plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T)
 
-            mean_acc  = round(np.mean([r["accuracy_%"] for r in results]), 2)
-            mean_mae  = round(np.mean([r["mae"]        for r in results]), 6)
-            mean_rmse = round(np.mean([r["rmse"]       for r in results]), 6)
-
-            print(f"\n  Mean accuracy : {mean_acc:.2f}%")
-            print(f"  Mean MAE      : {mean_mae:.5f}")
-            print(f"  Mean RMSE     : {mean_rmse:.5f}")
-
-            all_summary.append({
-                "device"              : device_name,
-                "total_days_predicted": len(results),
-                "mean_accuracy_%"     : mean_acc,
-                "mean_mae"            : mean_mae,
-                "mean_rmse"           : mean_rmse,
-                "n_estimators"        : BEST_PARAMS["n_estimators"],
-                "max_depth"           : BEST_PARAMS["max_depth"],
-                "learning_rate"       : BEST_PARAMS["learning_rate"],
-                "subsample"           : BEST_PARAMS["subsample"],
-                "colsample_bytree"    : BEST_PARAMS["colsample_bytree"],
-            })
+            # ── Evaluate at every threshold ───────────────────
+            print(f"\n  Threshold sweep:")
+            for T in THRESHOLDS:
+                m = metrics_at_threshold(results, T)
+                print(f"    T={T:2d}  →  acc={m['mean_accuracy_%']:.2f}%  "
+                      f"mae={m['mean_mae']:.5f}  rmse={m['mean_rmse']:.5f}")
+                all_threshold_rows.append({
+                    "device"         : device_name,
+                    "threshold"      : T,
+                    "mean_accuracy_%": m["mean_accuracy_%"],
+                    "mean_mae"       : m["mean_mae"],
+                    "mean_rmse"      : m["mean_rmse"],
+                    "n_estimators"   : BEST_PARAMS["n_estimators"],
+                    "max_depth"      : BEST_PARAMS["max_depth"],
+                    "learning_rate"  : BEST_PARAMS["learning_rate"],
+                    "subsample"      : BEST_PARAMS["subsample"],
+                })
 
         except Exception as e:
             import traceback
@@ -334,22 +413,30 @@ if __name__ == "__main__":
 
         print()
 
-    # Global summary
-    summary_path = os.path.join(OUTPUT_FOLDER, "final_summary.csv")
-    summary_df   = pd.DataFrame(all_summary)
-    summary_df.to_csv(summary_path, index=False)
+    # ── Save combined threshold summary CSV ──────────────────
+    threshold_df = pd.DataFrame(all_threshold_rows)
+    all_thresh_path = os.path.join(OUTPUT_FOLDER, "final_summary_all_thresholds.csv")
+    threshold_df.to_csv(all_thresh_path, index=False)
+    print(f"All-threshold summary  →  {all_thresh_path}")
 
+    # ── Save per-threshold summary CSVs ──────────────────────
+    for T in THRESHOLDS:
+        t_df = threshold_df[threshold_df["threshold"] == T].copy()
+        t_path = os.path.join(OUTPUT_FOLDER, f"final_summary_threshold_{T}.csv")
+        t_df.to_csv(t_path, index=False)
+
+    # ── Threshold accuracy curve plot ─────────────────────────
+    plot_threshold_curve(threshold_df)
+
+    # ── Final console summary table ───────────────────────────
+    print("\n" + "=" * 65)
+    print("OVERALL MEAN ACCURACY PER THRESHOLD  (averaged across all devices)")
     print("=" * 65)
-    print(f"Final summary  →  {summary_path}")
-    if not summary_df.empty:
-        overall_mean = summary_df["mean_accuracy_%"].mean()
-        print(f"\nOverall mean accuracy across all devices : {overall_mean:.2f}%")
-        print()
-        print(f"{'Device':<35} {'Accuracy':>10} {'MAE':>12} {'RMSE':>12}")
-        print("─" * 72)
-        for _, row in summary_df.iterrows():
-            print(f"  {row['device']:<33} {row['mean_accuracy_%']:>9.2f}%"
-                  f" {row['mean_mae']:>12.5f} {row['mean_rmse']:>12.5f}")
-        print("─" * 72)
-        print(f"  {'OVERALL MEAN':<33} {overall_mean:>9.2f}%")
+    print(f"  {'Threshold':>10}  {'Mean Accuracy':>15}  {'Mean MAE':>12}  {'Mean RMSE':>12}")
+    print("  " + "─" * 55)
+    for T in THRESHOLDS:
+        t_df = threshold_df[threshold_df["threshold"] == T]
+        print(f"  {T:>10}  {t_df['mean_accuracy_%'].mean():>14.2f}%  "
+              f"{t_df['mean_mae'].mean():>12.5f}  "
+              f"{t_df['mean_rmse'].mean():>12.5f}")
     print("=" * 65)
