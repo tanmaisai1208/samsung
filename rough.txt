@@ -1,21 +1,19 @@
-if(nums[low]>=nums[high]){
-    if(nums[mid]>nums[low]){
-        if(target>nums[mid] || target<=nums[high]){
-            low=mid+1;
-        }else if(target>nums[high]){
-            high=mid-1;
-        }
-    }else{
-        if(target<nums[mid] || target>nums[high]){
-            high=mid-1;
-        }else if(target<nums[high]){
-            low=mid+1;
-        }
-    }
-}else{
-    if(target>nums[mid]){
-        low=mid+1;
-    }else{
-        high=mid-1;
-    }
-}
+my mentor said to do one more thing aswell, I am needed to understand whats actually happening inside the model (not about what are input parameters, what is output parameter, or format of doing training data and testing), i need to know how model is doing any particular prediction. so i need to do 3 things
+1) feature_importance_analysis
+2) extraction of tree-rules or thresholds/conditions taken by trees to do prediction to know how prediction is being made like ex: (Tree 1:
+
+If Soc_h10 < 40
+    predict -3
+Else
+    predict -1
+Tree 2:
+
+If dSocdt_h18 < -8
+    predict -2
+Else
+    predict +0.5
+)
+
+3) SHAP-Analysis.
+
+So i have got the code for first doing the feature_importance_analysis. And i have provided that code too, once check whether its correctly done or not. And in seperate py file i have to write that code (keeping the battery_hypersearch.py file as it is). Dont focus on 2nd and 3rd task(tree-rules and SHAP) now. I will tell u later when to do it
