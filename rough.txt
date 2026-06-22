@@ -1,19 +1,23 @@
-my mentor said to do one more thing aswell, I am needed to understand whats actually happening inside the model (not about what are input parameters, what is output parameter, or format of doing training data and testing), i need to know how model is doing any particular prediction. so i need to do 3 things
-1) feature_importance_analysis
-2) extraction of tree-rules or thresholds/conditions taken by trees to do prediction to know how prediction is being made like ex: (Tree 1:
+  ── Tree 11 ──────────────────────────────────
+    if  dSocdt_h23_day_minus1  <  -7.646000  :
+        if  Soc_h22_day_minus1  <  42.726898  :
+            →  predict  -0.003122
+        else  ( Soc_h22_day_minus1  >=  42.726898 ) :
+            →  predict  -0.224260
+    else  ( dSocdt_h23_day_minus1  >=  -7.646000 ) :
+        if  dSocdt_h23_day_minus3  <  -10.564000  :
+            →  predict  -0.162825
+        else  ( dSocdt_h23_day_minus3  >=  -10.564000 ) :
+            →  predict  0.043602
 
-If Soc_h10 < 40
-    predict -3
-Else
-    predict -1
-Tree 2:
-
-If dSocdt_h18 < -8
-    predict -2
-Else
-    predict +0.5
-)
-
-3) SHAP-Analysis.
-
-So i have got the code for first doing the feature_importance_analysis. And i have provided that code too, once check whether its correctly done or not. And in seperate py file i have to write that code (keeping the battery_hypersearch.py file as it is). Dont focus on 2nd and 3rd task(tree-rules and SHAP) now. I will tell u later when to do it
+  ── Tree 12 ──────────────────────────────────
+    if  dSocdt_h23_day_minus1  <  -5.259800  :
+        if  Soc_h22_day_minus1  <  26.118200  :
+            →  predict  0.096387
+        else  ( Soc_h22_day_minus1  >=  26.118200 ) :
+            →  predict  -0.115617
+    else  ( dSocdt_h23_day_minus1  >=  -5.259800 ) :
+        if  dSocdt_h21_day_minus1  <  -8.853200  :
+            →  predict  -0.134530
+        else  ( dSocdt_h21_day_minus1  >=  -8.853200 ) :
+            →  predict  0.058903
