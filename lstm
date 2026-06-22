@@ -1,570 +1,469 @@
 """
-Battery Management - Final Combined Validation with Best Hyperparameters
-======================================================================================
-Runs the daily rolling-window XGBoost model using the best hyperparameter
-values found from sequential tuning in battery_hypersearch.py:
+generate_report.py
+==================
+Run this script from inside your SOC-folder to generate a PDF progress report.
 
-  n_estimators  = 150   (tuned in step 1)
-  max_depth     = 3     (tuned in step 2)
-  learning_rate = 0.02  (tuned in step 3)
-  subsample     = 1.0   (tuned in step 4)
-  colsample_bytree = 0.8 (fixed throughout)
+    cd path/to/SOC-folder
+    python generate_report.py
 
-Threshold sweep : ACC_THRESHOLD varied 1→10.
-Cosine similarity: computed per day between actual and predicted dSocdt vectors,
-                   then averaged per device and across all devices.
+It reads plots from your existing results/ folder structure and compiles
+everything into:  results/project_report.pdf
 
-Outputs (all inside results/final_validation/):
-  final_predictions_<device>.csv        — per-hour actual vs predicted + cosine sim
-  final_summary_all_thresholds.csv      — all thresholds × devices combined
-  final_summary_threshold_<T>.csv       — per-device metrics at threshold T
-  cosine_similarity_summary.csv         — per-device mean cosine sim + overall mean
-  final_validation_plot_<device>.png    — daily accuracy/MAE/actual-vs-pred (T=2)
-  cosine_similarity_plot.png            — per-device + overall mean cosine sim bar chart
-  threshold_accuracy_curve.png          — overall mean accuracy vs threshold value
+Requirements:  pip install reportlab
 """
 
 import os
 import glob
-import warnings
-import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from xgboost import XGBRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.multioutput import MultiOutputRegressor
-
-warnings.filterwarnings("ignore")
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, PageBreak,
+    Table, TableStyle, HRFlowable, Image, KeepTogether
+)
+from reportlab.platypus.flowables import Flowable
 
 # ─────────────────────────────────────────────────────────────
-# BEST HYPERPARAMETERS
+# PATHS  — adjust ROOT if you run from a different directory
 # ─────────────────────────────────────────────────────────────
-BEST_PARAMS = {
-    "n_estimators"   : 150,
-    "max_depth"      : 3,
-    "learning_rate"  : 0.02,
-    "subsample"      : 1.0,
-    "colsample_bytree": 0.8,
-    "random_state"   : 42,
-    "verbosity"      : 0,
+ROOT        = "."                          # run from inside SOC-folder
+RESULTS     = os.path.join(ROOT, "results")
+OUTPUT_PDF  = os.path.join(RESULTS, "project_report.pdf")
+
+PATHS = {
+    "ac_hc_plots"       : os.path.join(RESULTS, "ac_hc_plots"),
+    "wide_csv"          : os.path.join(RESULTS, "wide_csv"),
+    "resampled_csv"     : os.path.join(RESULTS, "resampled_csv"),
+    "feature_importance": os.path.join(RESULTS, "xgboost", "feature_importance"),
+    "final_validation"  : os.path.join(RESULTS, "xgboost", "final_validation"),
+    "hypersearch"       : os.path.join(RESULTS, "xgboost", "hypersearch"),
+    "val_curves"        : os.path.join(RESULTS, "xgboost", "hypersearch", "validation_curves"),
 }
 
-# ─────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────
-WIDE_CSV_FOLDER = "results/wide_csv"
-OUTPUT_FOLDER   = "results/final_validation"
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-TRAIN_DAYS     = 14
-THRESHOLDS     = list(range(1, 11))   # 1, 2, 3, ... 10
-DEFAULT_PLOT_T = 2                    # threshold used for per-device plots
-HOURS          = list(range(24))
-
-# ─────────────────────────────────────────────────────────────
-# COLUMN DEFINITIONS
-# ─────────────────────────────────────────────────────────────
-DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
-SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
-DATE_FEAT_COUNT = 4
-FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
+PAGE_W, PAGE_H = A4
+MARGIN = 2.2 * cm
 
 
 # ─────────────────────────────────────────────────────────────
-# FEATURE HELPERS
+# STYLES
 # ─────────────────────────────────────────────────────────────
+base_styles = getSampleStyleSheet()
 
-def date_feats(date_str):
-    ts = pd.Timestamp(date_str)
-    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
-
-
-def build_feature_row(wide, train_start, train_end):
-    feats = []
-    for i in range(train_start, train_end):
-        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
-        feats.extend(wide.iloc[i][SOC_COLS].tolist())
-        feats.extend(date_feats(wide.index[i]))
-    return np.array(feats, dtype=float)
-
-
-def build_padded_feature_row(wide, context_start, context_end, pad_days):
-    feats = [0.0] * (pad_days * FEATS_PER_DAY)
-    for i in range(context_start, context_end):
-        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
-        feats.extend(wide.iloc[i][SOC_COLS].tolist())
-        feats.extend(date_feats(wide.index[i]))
-    return feats
-
-
-def accuracy_at_threshold(actual, predicted, threshold):
-    return float(np.mean(np.abs(actual - predicted) <= threshold)) * 100.0
-
-
-def cosine_similarity(actual, predicted):
-    """
-    Cosine similarity between actual and predicted 24-hour dSocdt vectors.
-    Range: -1 (opposite) to +1 (identical direction).
-    Returns 0.0 if either vector is all-zeros (no discharge activity).
-    """
-    norm_a = np.linalg.norm(actual)
-    norm_p = np.linalg.norm(predicted)
-    if norm_a == 0.0 or norm_p == 0.0:
-        return 0.0
-    return float(np.dot(actual, predicted) / (norm_a * norm_p))
-
-
-# ─────────────────────────────────────────────────────────────
-# DAILY ROLLING PREDICTION  (runs once per device)
-# ─────────────────────────────────────────────────────────────
-
-def run_predictions(wide, device_name):
-    """
-    Returns list of per-day dicts with raw y_actual, y_pred, MAE, RMSE,
-    and cosine similarity. Accuracy is computed later per threshold.
-    """
-    n_days  = len(wide)
-    results = []
-
-    model = MultiOutputRegressor(
-        XGBRegressor(**BEST_PARAMS),
-        n_jobs=-1
+def make_styles():
+    s = {}
+    s["title"] = ParagraphStyle(
+        "ReportTitle", parent=base_styles["Title"],
+        fontSize=22, textColor=colors.HexColor("#1a2e4a"),
+        spaceAfter=6, alignment=TA_CENTER, fontName="Helvetica-Bold"
     )
-
-    total = n_days - TRAIN_DAYS
-    print(f"  Predicting {total} days...")
-
-    for predict_day_idx in range(TRAIN_DAYS, n_days):
-        train_start  = predict_day_idx - TRAIN_DAYS
-        train_end    = predict_day_idx
-        predict_date = wide.index[predict_day_idx]
-
-        X_train, y_train = [], []
-        for k in range(1, TRAIN_DAYS):
-            pad_days = TRAIN_DAYS - k
-            feats  = build_padded_feature_row(wide, train_start,
-                                               train_start + k, pad_days)
-            target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
-            X_train.append(feats)
-            y_train.append(target)
-
-        X_train = np.array(X_train, dtype=float)
-        y_train = np.array(y_train, dtype=float)
-        model.fit(X_train, y_train)
-
-        X_pred   = build_feature_row(wide, train_start, train_end).reshape(1, -1)
-        y_pred   = model.predict(X_pred)[0]
-        y_pred   = np.clip(y_pred, a_min=None, a_max=0.0)
-        y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
-
-        cos_sim = cosine_similarity(y_actual, y_pred)
-        mae     = round(mean_absolute_error(y_actual, y_pred), 6)
-        rmse    = round(np.sqrt(mean_squared_error(y_actual, y_pred)), 6)
-
-        results.append({
-            "predict_date"   : predict_date,
-            "train_start"    : wide.index[train_start],
-            "train_end"      : wide.index[train_end - 1],
-            "y_actual"       : y_actual,
-            "y_pred"         : y_pred,
-            "mae"            : mae,
-            "rmse"           : rmse,
-            "cosine_sim"     : round(cos_sim, 6),
-        })
-
-        if (predict_day_idx - TRAIN_DAYS) % 10 == 0 or predict_day_idx == n_days - 1:
-            print(f"  Day {predict_day_idx - TRAIN_DAYS + 1:3d}/{total} "
-                  f"| {predict_date} | MAE: {mae:.5f} | CosSim: {cos_sim:.4f}")
-
-    return results
-
-
-# ─────────────────────────────────────────────────────────────
-# METRICS
-# ─────────────────────────────────────────────────────────────
-
-def metrics_at_threshold(results, threshold):
-    daily_accs = [
-        accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
-        for r in results
-    ]
-    return {
-        "mean_accuracy_%": round(float(np.mean(daily_accs)), 4),
-        "mean_mae"        : round(float(np.mean([r["mae"]  for r in results])), 6),
-        "mean_rmse"       : round(float(np.mean([r["rmse"] for r in results])), 6),
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-# PER-DEVICE PLOT
-# ─────────────────────────────────────────────────────────────
-
-def plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T):
-    dates      = [r["predict_date"] for r in results]
-    accuracies = [accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
-                  for r in results]
-    maes       = [r["mae"]        for r in results]
-    cos_sims   = [r["cosine_sim"] for r in results]
-    mean_acc   = np.mean(accuracies)
-
-    fig, axes = plt.subplots(4, 1, figsize=(16, 17))
-    fig.suptitle(
-        f"Final Validation — {device_name}\n"
-        f"n_estimators={BEST_PARAMS['n_estimators']}  "
-        f"max_depth={BEST_PARAMS['max_depth']}  "
-        f"lr={BEST_PARAMS['learning_rate']}  "
-        f"subsample={BEST_PARAMS['subsample']}  "
-        f"(accuracy shown at threshold={threshold})",
-        fontsize=11, fontweight="bold"
+    s["subtitle"] = ParagraphStyle(
+        "Subtitle", parent=base_styles["Normal"],
+        fontSize=12, textColor=colors.HexColor("#4a6fa5"),
+        spaceAfter=4, alignment=TA_CENTER, fontName="Helvetica"
     )
-
-    tick_step = max(1, len(dates) // 15)
-
-    # Panel 1 — daily accuracy + 7-day rolling mean
-    ax = axes[0]
-    ax.plot(dates, accuracies, color="steelblue", linewidth=1.0,
-            alpha=0.6, label="Daily accuracy")
-    roll7 = pd.Series(accuracies).rolling(7, min_periods=1).mean().tolist()
-    ax.plot(dates, roll7, color="navy", linewidth=2.0, label="7-day rolling mean")
-    ax.axhline(mean_acc, color="crimson", linestyle="-", linewidth=1.5,
-               label=f"Overall mean: {mean_acc:.1f}%")
-    ax.axhline(50, color="gray", linestyle="--", linewidth=1.0, label="50% reference")
-    ax.set_ylabel("Accuracy (%)", fontsize=11)
-    ax.set_title(f"Daily Accuracy  (threshold = {threshold})", fontsize=11)
-    ax.set_ylim(0, 110)
-    ax.legend(fontsize=9)
-    ax.grid(linestyle="--", alpha=0.4)
-    ax.set_xticks(dates[::tick_step])
-    ax.set_xticklabels(dates[::tick_step], rotation=45, ha="right", fontsize=8)
-
-    # Panel 2 — daily MAE
-    ax2 = axes[1]
-    ax2.bar(range(len(maes)), maes, color="steelblue", alpha=0.7)
-    ax2.axhline(np.mean(maes), color="crimson", linestyle="-", linewidth=1.5,
-                label=f"Mean MAE: {np.mean(maes):.4f}")
-    ax2.set_ylabel("MAE", fontsize=11)
-    ax2.set_title("Daily MAE", fontsize=11)
-    ax2.legend(fontsize=9)
-    ax2.grid(axis="y", linestyle="--", alpha=0.4)
-    ax2.set_xticks(range(0, len(maes), max(1, len(maes) // 15)))
-    ax2.set_xticklabels(dates[::max(1, len(dates) // 15)],
-                        rotation=45, ha="right", fontsize=8)
-
-    # Panel 3 — daily cosine similarity
-    ax3 = axes[2]
-    colors_cs = ["steelblue" if c >= 0 else "salmon" for c in cos_sims]
-    ax3.bar(range(len(cos_sims)), cos_sims, color=colors_cs, alpha=0.75)
-    mean_cs = np.mean(cos_sims)
-    ax3.axhline(mean_cs, color="crimson", linestyle="-", linewidth=1.5,
-                label=f"Mean cosine sim: {mean_cs:.4f}")
-    ax3.axhline(0, color="black", linestyle="-", linewidth=0.8)
-    ax3.set_ylabel("Cosine Similarity", fontsize=11)
-    ax3.set_title("Daily Cosine Similarity (Actual vs Predicted dSocdt)", fontsize=11)
-    ax3.set_ylim(-1.1, 1.1)
-    ax3.legend(fontsize=9)
-    ax3.grid(axis="y", linestyle="--", alpha=0.4)
-    ax3.set_xticks(range(0, len(cos_sims), max(1, len(cos_sims) // 15)))
-    ax3.set_xticklabels(dates[::max(1, len(dates) // 15)],
-                        rotation=45, ha="right", fontsize=8)
-
-    # Panel 4 — actual vs predicted for ~8 sampled days
-    ax4 = axes[3]
-    sample_idx = list(range(0, len(results), max(1, len(results) // 8)))
-    cmap = plt.cm.tab10
-    for si, idx in enumerate(sample_idx):
-        r     = results[idx]
-        color = cmap(si % 10)
-        ax4.plot(HOURS, r["y_actual"], color=color, linewidth=1.6,
-                 label=f"{r['predict_date']} actual")
-        ax4.plot(HOURS, r["y_pred"],   color=color, linewidth=1.4,
-                 linestyle="--", alpha=0.8)
-
-    solid_p = mpatches.Patch(color="gray", label="Actual (solid)")
-    dash_p  = mpatches.Patch(color="gray", label="Predicted (dashed)")
-    handles, lbls = ax4.get_legend_handles_labels()
-    ax4.legend(handles + [solid_p, dash_p],
-               lbls   + ["Actual (solid)", "Predicted (dashed)"],
-               fontsize=7, ncol=5, loc="lower right")
-    ax4.set_xlabel("Hour of day", fontsize=11)
-    ax4.set_ylabel("dSocdt (discharge rate)", fontsize=11)
-    ax4.set_title("Actual vs Predicted dSocdt — Sample Days", fontsize=11)
-    ax4.set_xticks(HOURS)
-    ax4.grid(linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Device plot saved  →  {plot_path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# COSINE SIMILARITY SUMMARY PLOT
-# ─────────────────────────────────────────────────────────────
-
-def plot_cosine_summary(cosine_df):
-    """
-    Bar chart: mean cosine similarity per device + overall mean line.
-    """
-    devices  = cosine_df["device"].tolist()
-    means    = cosine_df["mean_cosine_sim"].tolist()
-    overall  = cosine_df[cosine_df["device"] == "OVERALL_MEAN"]["mean_cosine_sim"].values
-    dev_data = cosine_df[cosine_df["device"] != "OVERALL_MEAN"]
-
-    fig, ax = plt.subplots(figsize=(max(10, len(dev_data) * 1.2), 6))
-
-    colors = ["steelblue" if v >= 0.5 else ("orange" if v >= 0 else "salmon")
-              for v in dev_data["mean_cosine_sim"]]
-    bars = ax.bar(range(len(dev_data)), dev_data["mean_cosine_sim"],
-                  color=colors, edgecolor="white", linewidth=0.8, zorder=3)
-
-    if len(overall) > 0:
-        ax.axhline(overall[0], color="crimson", linestyle="-", linewidth=2.0,
-                   label=f"Overall mean: {overall[0]:.4f}", zorder=5)
-
-    ax.axhline(0, color="black", linestyle="-", linewidth=0.8)
-
-    for bar, val in zip(bars, dev_data["mean_cosine_sim"]):
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.01, f"{val:.3f}",
-                ha="center", va="bottom", fontsize=8, fontweight="bold")
-
-    # Shorten device names for x-axis labels (first 12 chars)
-    short_names = [d[:12] + "…" if len(d) > 12 else d
-                   for d in dev_data["device"]]
-    ax.set_xticks(range(len(dev_data)))
-    ax.set_xticklabels(short_names, rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel("Mean Cosine Similarity", fontsize=12)
-    ax.set_ylim(-1.1, 1.2)
-    ax.set_title(
-        "Mean Cosine Similarity between Actual and Predicted dSocdt\n"
-        "(per device, averaged over all predicted days)",
-        fontsize=12, fontweight="bold"
+    s["h1"] = ParagraphStyle(
+        "H1", parent=base_styles["Heading1"],
+        fontSize=15, textColor=colors.HexColor("#1a2e4a"),
+        spaceBefore=18, spaceAfter=6,
+        borderPad=4, fontName="Helvetica-Bold",
+        borderWidth=0, leading=18
     )
-    ax.legend(fontsize=10)
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    plot_path = os.path.join(OUTPUT_FOLDER, "cosine_similarity_plot.png")
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Cosine similarity plot saved  →  {plot_path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# THRESHOLD ACCURACY CURVE PLOT
-# ─────────────────────────────────────────────────────────────
-
-def plot_threshold_curve(threshold_summary_df):
-    devices    = threshold_summary_df["device"].unique()
-    thresholds = sorted(threshold_summary_df["threshold"].unique())
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-    cmap = plt.cm.tab10
-
-    all_means = []
-    for di, device in enumerate(devices):
-        dev_df = threshold_summary_df[threshold_summary_df["device"] == device]
-        accs   = [dev_df[dev_df["threshold"] == t]["mean_accuracy_%"].values[0]
-                  for t in thresholds]
-        short  = device[:14] + "…" if len(device) > 14 else device
-        ax.plot(thresholds, accs, marker="o", linewidth=1.3,
-                color=cmap(di % 10), alpha=0.5, label=short)
-        all_means.append(accs)
-
-    overall = np.mean(all_means, axis=0)
-    ax.plot(thresholds, overall, marker="D", linewidth=2.5,
-            color="black", label="Overall mean", zorder=5)
-
-    for t, acc in zip(thresholds, overall):
-        ax.annotate(f"{acc:.1f}%", xy=(t, acc),
-                    xytext=(0, 7), textcoords="offset points",
-                    ha="center", fontsize=8, color="black", fontweight="bold")
-
-    ax.set_xlabel("Accuracy Threshold", fontsize=12)
-    ax.set_ylabel("Mean Accuracy (%)", fontsize=12)
-    ax.set_title(
-        "Overall Mean Accuracy vs Threshold Value\n"
-        f"(Best params: n_est={BEST_PARAMS['n_estimators']}, "
-        f"depth={BEST_PARAMS['max_depth']}, "
-        f"lr={BEST_PARAMS['learning_rate']}, "
-        f"subsample={BEST_PARAMS['subsample']})",
-        fontsize=12, fontweight="bold"
+    s["h2"] = ParagraphStyle(
+        "H2", parent=base_styles["Heading2"],
+        fontSize=12, textColor=colors.HexColor("#2c5282"),
+        spaceBefore=12, spaceAfter=4, fontName="Helvetica-Bold"
     )
-    ax.set_xticks(thresholds)
-    ax.legend(fontsize=7, ncol=3, loc="lower right")
-    ax.grid(linestyle="--", alpha=0.4)
-    ax.set_ylim(0, 110)
+    s["h3"] = ParagraphStyle(
+        "H3", parent=base_styles["Heading3"],
+        fontSize=10.5, textColor=colors.HexColor("#2d3748"),
+        spaceBefore=8, spaceAfter=3, fontName="Helvetica-BoldOblique"
+    )
+    s["body"] = ParagraphStyle(
+        "Body", parent=base_styles["Normal"],
+        fontSize=10, leading=15, spaceAfter=6,
+        alignment=TA_JUSTIFY, fontName="Helvetica"
+    )
+    s["bullet"] = ParagraphStyle(
+        "Bullet", parent=base_styles["Normal"],
+        fontSize=10, leading=14, spaceAfter=3,
+        leftIndent=16, firstLineIndent=-10,
+        fontName="Helvetica"
+    )
+    s["code"] = ParagraphStyle(
+        "Code", parent=base_styles["Code"],
+        fontSize=8.5, leading=12, spaceAfter=4,
+        backColor=colors.HexColor("#f7fafc"),
+        borderColor=colors.HexColor("#cbd5e0"),
+        borderWidth=0.5, borderPad=6,
+        fontName="Courier"
+    )
+    s["caption"] = ParagraphStyle(
+        "Caption", parent=base_styles["Normal"],
+        fontSize=8.5, textColor=colors.HexColor("#718096"),
+        alignment=TA_CENTER, spaceAfter=8, fontName="Helvetica-Oblique"
+    )
+    s["toc"] = ParagraphStyle(
+        "TOC", parent=base_styles["Normal"],
+        fontSize=10.5, leading=18, fontName="Helvetica",
+        textColor=colors.HexColor("#2d3748")
+    )
+    return s
 
-    plot_path = os.path.join(OUTPUT_FOLDER, "threshold_accuracy_curve.png")
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Threshold curve saved  →  {plot_path}")
+S = make_styles()
 
 
 # ─────────────────────────────────────────────────────────────
-# MAIN
+# HELPERS
 # ─────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def hr(color="#cbd5e0", thickness=0.5):
+    return HRFlowable(width="100%", thickness=thickness,
+                      color=colors.HexColor(color), spaceAfter=6, spaceBefore=2)
 
-    print("=" * 65)
-    print("FINAL COMBINED VALIDATION — BEST HYPERPARAMETERS")
-    print("=" * 65)
-    for k, v in BEST_PARAMS.items():
-        if k not in ("random_state", "verbosity"):
-            print(f"  {k:20s} = {v}")
-    print(f"\n  Thresholds evaluated : {THRESHOLDS}")
-    print("=" * 65 + "\n")
 
-    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
-    if not wide_files:
-        raise FileNotFoundError(
-            f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'. "
-            "Run battery_xgboost.py first."
-        )
+def section_header(text, level="h1"):
+    return [hr("#2c5282" if level == "h1" else "#a0aec0",
+               thickness=1.5 if level == "h1" else 0.5),
+            Paragraph(text, S[level]),
+            Spacer(1, 0.2 * cm)]
 
-    all_threshold_rows = []
-    cosine_rows        = []   # one row per device for cosine summary
 
-    for wf in wide_files:
-        device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
-        pred_path   = os.path.join(OUTPUT_FOLDER, f"final_predictions_{device_name}.csv")
-        plot_path   = os.path.join(OUTPUT_FOLDER, f"final_validation_plot_{device_name}.png")
+def body(text):
+    return Paragraph(text, S["body"])
 
-        print("=" * 65)
-        print(f"Device : {device_name}")
-        print("=" * 65)
 
+def bullet(text, symbol="•"):
+    return Paragraph(f"{symbol}  {text}", S["bullet"])
+
+
+def caption(text):
+    return Paragraph(text, S["caption"])
+
+
+def sp(h=0.3):
+    return Spacer(1, h * cm)
+
+
+def insert_image(path, width_cm=14, caption_text=None, max_height_cm=10):
+    """Insert image if file exists, otherwise insert a placeholder note."""
+    elems = []
+    if path and os.path.exists(path):
+        img_w = width_cm * cm
+        img_h = min(max_height_cm * cm, img_w * 0.6)
         try:
-            wide = pd.read_csv(wf, index_col="Date")
-            wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
+            elems.append(Image(path, width=img_w, height=img_h,
+                               kind="proportional"))
+        except Exception:
+            elems.append(body(f"[Image could not be loaded: {os.path.basename(path)}]"))
+    else:
+        name = os.path.basename(path) if path else "image"
+        elems.append(Paragraph(
+            f'<font color="#a0aec0"><i>[Plot not found: {name} — '
+            f'run the corresponding script to generate it]</i></font>',
+            S["body"]
+        ))
+    if caption_text:
+        elems.append(caption(caption_text))
+    elems.append(sp(0.3))
+    return elems
 
-            if len(wide) <= TRAIN_DAYS:
-                print(f"  Skipping: not enough days.\n")
-                continue
 
-            # Run model once — get raw predictions + cosine sim per day
-            results = run_predictions(wide, device_name)
-            if not results:
-                continue
+def glob_first(pattern):
+    """Return first file matching glob pattern, or None."""
+    matches = sorted(glob.glob(pattern))
+    return matches[0] if matches else None
 
-            # Save raw per-hour predictions CSV (includes cosine sim per day)
-            pred_rows = []
-            for r in results:
-                for h in HOURS:
-                    pred_rows.append({
-                        "predict_date"  : r["predict_date"],
-                        "train_start"   : r["train_start"],
-                        "train_end"     : r["train_end"],
-                        "hour"          : h,
-                        "actual_dSocdt" : round(float(r["y_actual"][h]), 6),
-                        "pred_dSocdt"   : round(float(r["y_pred"][h]),   6),
-                        "abs_error"     : round(abs(float(r["y_actual"][h])
-                                                    - float(r["y_pred"][h])), 6),
-                        "daily_cosine_sim": r["cosine_sim"],  # same value for all 24 rows of that day
-                    })
-            pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
-            print(f"\n  Raw predictions CSV  →  {pred_path}")
 
-            # Per-device plot (4 panels now including cosine sim)
-            plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T)
+def glob_all(pattern):
+    return sorted(glob.glob(pattern))
 
-            # Threshold sweep (accuracy/MAE/RMSE only — model output is fixed)
-            print(f"\n  Threshold sweep:")
-            for T in THRESHOLDS:
-                m = metrics_at_threshold(results, T)
-                print(f"    T={T:2d}  →  acc={m['mean_accuracy_%']:.2f}%  "
-                      f"mae={m['mean_mae']:.5f}  rmse={m['mean_rmse']:.5f}")
-                all_threshold_rows.append({
-                    "device"         : device_name,
-                    "threshold"      : T,
-                    "mean_accuracy_%": m["mean_accuracy_%"],
-                    "mean_mae"       : m["mean_mae"],
-                    "mean_rmse"      : m["mean_rmse"],
-                    "n_estimators"   : BEST_PARAMS["n_estimators"],
-                    "max_depth"      : BEST_PARAMS["max_depth"],
-                    "learning_rate"  : BEST_PARAMS["learning_rate"],
-                    "subsample"      : BEST_PARAMS["subsample"],
-                })
 
-            # Cosine similarity summary for this device
-            mean_cos = round(float(np.mean([r["cosine_sim"] for r in results])), 6)
-            min_cos  = round(float(np.min ([r["cosine_sim"] for r in results])), 6)
-            max_cos  = round(float(np.max ([r["cosine_sim"] for r in results])), 6)
-            print(f"\n  Cosine similarity — mean: {mean_cos:.4f}  "
-                  f"min: {min_cos:.4f}  max: {max_cos:.4f}")
+def kv_table(rows, col_widths=None):
+    """Two-column key-value table."""
+    if col_widths is None:
+        col_widths = [5 * cm, 10 * cm]
+    t = Table(rows, colWidths=col_widths)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#edf2f7")),
+        ("TEXTCOLOR",  (0, 0), (0, -1), colors.HexColor("#2d3748")),
+        ("FONTNAME",   (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME",   (1, 0), (1, -1), "Helvetica"),
+        ("FONTSIZE",   (0, 0), (-1, -1), 9.5),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1),
+         [colors.white, colors.HexColor("#f7fafc")]),
+        ("GRID",       (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e0")),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+    ]))
+    return t
 
-            cosine_rows.append({
-                "device"          : device_name,
-                "mean_cosine_sim" : mean_cos,
-                "min_cosine_sim"  : min_cos,
-                "max_cosine_sim"  : max_cos,
-                "total_days"      : len(results),
-            })
 
-        except Exception as e:
-            import traceback
-            print(f"  ERROR: {e}")
-            traceback.print_exc()
+def results_table(header, rows):
+    """General styled table with header row."""
+    data = [header] + rows
+    col_w = (PAGE_W - 2 * MARGIN) / len(header)
+    t = Table(data, colWidths=[col_w] * len(header))
+    t.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#2c5282")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME",    (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE",    (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.white, colors.HexColor("#ebf4ff")]),
+        ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#bee3f8")),
+        ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",  (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    return t
 
-        print()
 
-    # ── Save combined threshold summary CSV ──────────────────
-    threshold_df = pd.DataFrame(all_threshold_rows)
-    all_thresh_path = os.path.join(OUTPUT_FOLDER, "final_summary_all_thresholds.csv")
-    threshold_df.to_csv(all_thresh_path, index=False)
-    print(f"All-threshold summary  →  {all_thresh_path}")
+# ─────────────────────────────────────────────────────────────
+# COVER PAGE
+# ─────────────────────────────────────────────────────────────
 
-    # Save individual per-threshold CSVs
-    for T in THRESHOLDS:
-        t_df   = threshold_df[threshold_df["threshold"] == T].copy()
-        t_path = os.path.join(OUTPUT_FOLDER, f"final_summary_threshold_{T}.csv")
-        t_df.to_csv(t_path, index=False)
+def cover_page():
+    elems = []
+    elems.append(sp(3))
+    elems.append(Paragraph(
+        "Predictive Battery Management", S["title"]))
+    elems.append(Paragraph(
+        "Through Usage Pattern Recognition", S["title"]))
+    elems.append(sp(0.5))
+    elems.append(hr("#4a6fa5", thickness=2))
+    elems.append(sp(0.4))
+    elems.append(Paragraph("Project Progress Report", S["subtitle"]))
+    elems.append(sp(3))
 
-    # ── Save cosine similarity summary CSV ───────────────────
-    cosine_df = pd.DataFrame(cosine_rows)
-    # Append overall mean row
-    if not cosine_df.empty:
-        overall_cos = round(float(cosine_df["mean_cosine_sim"].mean()), 6)
-        cosine_df = pd.concat([
-            cosine_df,
-            pd.DataFrame([{
-                "device"          : "OVERALL_MEAN",
-                "mean_cosine_sim" : overall_cos,
-                "min_cosine_sim"  : round(float(cosine_df["min_cosine_sim"].min()), 6),
-                "max_cosine_sim"  : round(float(cosine_df["max_cosine_sim"].max()), 6),
-                "total_days"      : cosine_df["total_days"].sum(),
-            }])
-        ], ignore_index=True)
+    meta = [
+        ["Project"  , "Predictive Battery Management Through Usage Pattern Recognition"],
+        ["Model"    , "XGBoost (Daily Rolling-Window, Sequential Hyperparameter Tuning)"],
+        ["Status"   , "In Progress"],
+        ["Scope"    , "Data Preprocessing  |  Statistical Analysis  |  Model Training & Evaluation"],
+    ]
+    elems.append(kv_table(meta, col_widths=[3.5 * cm, 11.5 * cm]))
+    elems.append(sp(1))
+    elems.append(Paragraph(
+        "This document summarises all work completed so far on the battery "
+        "management project. It covers raw data preprocessing, hourly resampling, "
+        "long-range dependence analysis (autocorrelation and Hurst exponent), "
+        "XGBoost model training using a daily rolling window, hyperparameter tuning "
+        "via sequential coordinate-wise search, and final validation results. "
+        "The report will continue to be updated as further work is completed.",
+        S["body"]
+    ))
+    elems.append(PageBreak())
+    return elems
 
-    cos_csv_path = os.path.join(OUTPUT_FOLDER, "cosine_similarity_summary.csv")
-    cosine_df.to_csv(cos_csv_path, index=False)
-    print(f"Cosine similarity summary  →  {cos_csv_path}")
 
-    # ── Plots ─────────────────────────────────────────────────
-    plot_threshold_curve(threshold_df)
-    plot_cosine_summary(cosine_df)
+# ─────────────────────────────────────────────────────────────
+# TABLE OF CONTENTS
+# ─────────────────────────────────────────────────────────────
 
-    # ── Final console summary ─────────────────────────────────
-    print("\n" + "=" * 65)
-    print("OVERALL MEAN ACCURACY PER THRESHOLD  (across all devices)")
-    print("=" * 65)
-    print(f"  {'Threshold':>10}  {'Mean Accuracy':>15}  {'Mean MAE':>12}  {'Mean RMSE':>12}")
-    print("  " + "─" * 55)
-    for T in THRESHOLDS:
-        t_df = threshold_df[threshold_df["threshold"] == T]
-        print(f"  {T:>10}  {t_df['mean_accuracy_%'].mean():>14.2f}%  "
-              f"{t_df['mean_mae'].mean():>12.5f}  "
-              f"{t_df['mean_rmse'].mean():>12.5f}")
+def toc():
+    elems = []
+    elems += section_header("Table of Contents", "h1")
+    sections = [
+        ("1", "Project Overview & Problem Statement"),
+        ("2", "Dataset Description & File Structure"),
+        ("3", "Step 1 — Data Preprocessing & Hourly Resampling"),
+        ("4", "Step 2 — Statistical Analysis  (Autocorrelation & Hurst Exponent)"),
+        ("5", "Step 3 — Data Format Transformation  (Wide Daily Format)"),
+        ("6", "Step 4 — XGBoost Model  (Daily Rolling-Window Training)"),
+        ("6.1", "  Feature Engineering"),
+        ("6.2", "  Training Strategy"),
+        ("6.3", "  Accuracy Metric"),
+        ("7", "Step 5 — Hyperparameter Tuning  (Sequential Coordinate Search)"),
+        ("7.1", "  n_estimators"),
+        ("7.2", "  max_depth"),
+        ("7.3", "  learning_rate"),
+        ("7.4", "  subsample"),
+        ("8", "Step 6 — Final Combined Validation"),
+        ("9", "Step 7 — Feature Importance Analysis"),
+        ("10", "Results Summary & Comparison with SOM Baseline"),
+        ("11", "Next Steps"),
+    ]
+    for num, title in sections:
+        dot_leader = "." * max(1, 60 - len(num) - len(title))
+        elems.append(Paragraph(
+            f'<font name="Helvetica-Bold">{num}</font>  {title}',
+            S["toc"]
+        ))
+    elems.append(PageBreak())
+    return elems
 
-    print("\n" + "=" * 65)
-    print("COSINE SIMILARITY SUMMARY  (across all devices)")
-    print("=" * 65)
-    for _, row in cosine_df.iterrows():
-        print(f"  {row['device']:<35}  mean={row['mean_cosine_sim']:.4f}  "
-              f"min={row['min_cosine_sim']:.4f}  max={row['max_cosine_sim']:.4f}")
-    print("=" * 65)
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 1 — PROJECT OVERVIEW
+# ─────────────────────────────────────────────────────────────
+
+def section_overview():
+    elems = []
+    elems += section_header("1.  Project Overview & Problem Statement", "h1")
+    elems.append(body(
+        "The goal of this project is to predict future battery usage patterns "
+        "of mobile devices by learning from historical State-of-Charge (SoC) "
+        "time-series data. Accurate prediction of discharge behaviour enables "
+        "intelligent suggestions to users — such as optimal charging times, "
+        "expected battery life, and anomaly detection for degraded cells."
+    ))
+    elems.append(body(
+        "The reference approach from the literature uses Self-Organising Maps "
+        "(SOM) for pattern clustering and achieved the following weekly accuracies "
+        "on held-out test data:"
+    ))
+
+    som_rows = [
+        ["Days 1–7",  "56.10%"], ["Days 8–14",  "32.61%"],
+        ["Days 15–21","57.14%"], ["Days 22–28", "64.10%"],
+        ["Days 29–35","60.00%"], ["Days 36–42", "54.17%"],
+        ["Days 43–45","41.18%"],
+    ]
+    elems.append(results_table(["Test Window", "SOM Accuracy"], som_rows))
+    elems.append(sp(0.3))
+    elems.append(body(
+        "This project replaces the SOM approach with XGBoost using a daily "
+        "rolling-window strategy to improve upon these accuracies, leveraging "
+        "the long-range temporal dependence confirmed by Hurst exponent analysis."
+    ))
+    elems.append(sp(0.5))
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 2 — DATASET & FILE STRUCTURE
+# ─────────────────────────────────────────────────────────────
+
+def section_dataset():
+    elems = []
+    elems += section_header("2.  Dataset Description & File Structure", "h1")
+    elems.append(body(
+        "Multiple CSV files are provided, each corresponding to one device/user. "
+        "Each file contains raw time-stamped SoC readings collected at irregular "
+        "intervals (median gap ~15 minutes, max gap up to 18 days in some files). "
+        "The data spans approximately 70 days per device."
+    ))
+    elems += section_header("Raw Data Columns", "h2")
+    col_rows = [
+        ["ID",             "Device identifier (ignored in modelling)"],
+        ["TimeStamp",      "Unix timestamp (ignored in modelling)"],
+        ["ChargingStatus", "0 = discharging, 1 = charging"],
+        ["Soc",            "State of Charge — current battery percentage (0–100)"],
+        ["DischargeLevel", "Raw discharge counter (used in resampling only)"],
+        ["DateTime",       "Human-readable timestamp (yyyy-mm-dd HH:MM:SS)"],
+        ["dSocdt",         "Rate of change of SoC from previous sample (+ve = charging, -ve = discharging, 0 = idle)"],
+    ]
+    elems.append(kv_table(col_rows, col_widths=[3.8 * cm, 11.2 * cm]))
+    elems.append(sp(0.4))
+
+    elems += section_header("Project File Structure", "h2")
+    elems.append(Paragraph(
+        '<font name="Courier" size="8.5">'
+        'SOC-folder/<br/>'
+        '&nbsp;&nbsp;results/<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;ac_hc_plots/&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Autocorrelation &amp; Hurst exponent plots<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;resampled_csv/&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Hourly-resampled CSVs (one per device)<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;wide_csv/&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Pivoted daily-wide CSVs<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;xgboost/<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;feature_importance/&nbsp;&nbsp;← Feature importance plots<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;final_validation/&nbsp;&nbsp;&nbsp;&nbsp;← Final predictions &amp; accuracy plots<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;hypersearch/<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;validation_curves/&nbsp;&nbsp;&nbsp;← Val curve plots per hyperparameter<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;best_*.json&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Best value per hyperparameter<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;checkpoint_*.json&nbsp;&nbsp;&nbsp;&nbsp;← Resume checkpoints<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;results_*.csv&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Raw tuning results<br/>'
+        '&nbsp;&nbsp;battery_analysis.py&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Resampling + AC/HC analysis<br/>'
+        '&nbsp;&nbsp;battery_xgboost.py&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← XGBoost daily rolling window<br/>'
+        '&nbsp;&nbsp;battery_hypersearch.py&nbsp;&nbsp;&nbsp;&nbsp;← Sequential hyperparameter tuning<br/>'
+        '&nbsp;&nbsp;battery_final_validation.py← Final combined validation<br/>'
+        '&nbsp;&nbsp;battery_feature_import.py&nbsp;&nbsp;← Feature importance analysis<br/>'
+        '&nbsp;&nbsp;generate_report.py&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← This script<br/>'
+        '</font>', S["body"]
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 3 — PREPROCESSING
+# ─────────────────────────────────────────────────────────────
+
+def section_preprocessing():
+    elems = []
+    elems += section_header("3.  Step 1 — Data Preprocessing & Hourly Resampling", "h1")
+    elems.append(body(
+        "The raw CSV files contain samples at irregular intervals. The project "
+        "requires uniformly-spaced hourly data for consistent model training. "
+        "The following preprocessing pipeline is applied to every raw CSV file "
+        "via <b>battery_analysis.py</b>:"
+    ))
+    steps = [
+        "Parse DateTime column with mixed-format UTC timestamps; convert to IST (Asia/Kolkata) and strip timezone.",
+        "Sort by timestamp and set as index.",
+        "Create a clean hourly DatetimeIndex spanning start to end of data.",
+        "Apply time-based linear interpolation on Soc and DischargeLevel columns to fill gaps.",
+        "Re-derive dSocdt as the hourly difference of interpolated Soc.",
+        "Re-derive all categorical columns (dayofweek, dayname, month, monthname) from the timestamp.",
+        "Re-derive ChargingStatus from sign of interpolated dSocdt (+ve → 1, else → 0).",
+        "Save resampled output to results/resampled_csv/<device>_hourly.csv.",
+    ]
+    for s in steps:
+        elems.append(bullet(s))
+    elems.append(sp(0.3))
+
+    elems.append(kv_table([
+        ["Input"      , "Raw CSVs with irregular timestamps (median gap ~15 min)"],
+        ["Output"     , "Hourly CSVs — one row per hour, every hour, start to end"],
+        ["Method"     , "pandas interpolate(method='time') — time-weighted linear"],
+        ["Columns interpolated", "Soc, DischargeLevel, dSocdt"],
+        ["Columns re-derived"  , "ChargingStatus, dayofweek, dayname, month, monthname"],
+    ], col_widths=[4.5 * cm, 10.5 * cm]))
+    elems.append(sp(0.5))
+
+    elems += section_header("Charging vs Discharging", "h2")
+    elems.append(body(
+        "A core principle of this project is to model only device <i>usage</i> "
+        "patterns, not charging behaviour. Therefore, all samples where "
+        "<b>dSocdt &gt; 0</b> (charging) are excluded from statistical analysis "
+        "and their dSocdt values are zeroed out before model training. "
+        "Samples where dSocdt = 0 are also treated as neutral and ignored."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 4 — AC & HURST
+# ─────────────────────────────────────────────────────────────
+
+def section_statistical():
+    elems = []
+    elems += section_header(
+        "4.  Step 2 — Statistical Analysis (Autocorrelation & Hurst Exponent)", "h1")
+    elems.append(body(
+        "Before training any predictive model, a key research question was "
+        "investigated: <i>does the discharge behaviour of a user exhibit "
+        "long-range temporal dependence?</i> If past patterns genuinely "
+        "influence future patterns over weeks, then sequence-aware models "
+        "should outperform pattern-clustering approaches like SOM."
+    ))
+
+    elems += section_header("4.1  Autocorrelation Analysis", "h2")
+    elems.append(body(
+        "Pearson autocorrelation of the dSocdt discharge series was computed "
+        "at lags 0 to 504 hours (3 weeks) for each device. Only discharge "
+        "samples (dSocdt &lt; 0) were used. The 95% confidence bounds "
+        "(Bartlett approximation: ±1.96/√n) are overlaid. Vertical markers "
+        "indicate daily (24h) and weekly (168h) periods."
+    ))
+
+    # Insert first AC plot found
+    ac_plots = glob_all(os.path.join(PATHS["ac_hc_plots"], "*autocorr*.png"))
+    if ac_plots:
+        elems += insert_image(ac_plots[0], width_cm=15,
