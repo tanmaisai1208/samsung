@@ -467,3 +467,407 @@ def section_statistical():
     ac_plots = glob_all(os.path.join(PATHS["ac_hc_plots"], "*autocorr*.png"))
     if ac_plots:
         elems += insert_image(ac_plots[0], width_cm=15,
+                              caption_text="Figure 1: Autocorrelation of dSocdt (discharge only) — lags 0 to 504 hours")
+    else:
+        elems += insert_image(None, caption_text="Figure 1: Autocorrelation plot (run battery_analysis.py to generate)")
+
+    elems += section_header("4.2  Hurst Exponent (R/S Analysis)", "h2")
+    elems.append(body(
+        "The Hurst exponent H is estimated via Rescaled Range (R/S) analysis "
+        "over log-spaced window sizes from 24 to 504 hours. H is the slope of "
+        "the fitted line on the log(R/S) vs log(n) plot:"
+    ))
+    elems.append(bullet("H &gt; 0.5 → Persistent (long-range dependence) — past behaviour predicts future"))
+    elems.append(bullet("H ≈ 0.5 → Random walk — no exploitable pattern"))
+    elems.append(bullet("H &lt; 0.5 → Anti-persistent — mean-reverting series"))
+    elems.append(sp(0.2))
+
+    hc_plots = glob_all(os.path.join(PATHS["ac_hc_plots"], "*hurst*.png"))
+    if hc_plots:
+        elems += insert_image(hc_plots[0], width_cm=13,
+                              caption_text="Figure 2: Hurst exponent R/S analysis — slope = H")
+    else:
+        elems += insert_image(None, caption_text="Figure 2: Hurst exponent plot")
+
+    elems += section_header("4.3  Results Across All Devices", "h2")
+    elems.append(body(
+        "After running battery_analysis.py on all device files, the following "
+        "distribution of Hurst exponents was observed:"
+    ))
+    h_rows = [
+        ["H &gt; 0.7 (Strong persistence)",   "Majority of devices", "Strong long-range dependence — highly predictable patterns"],
+        ["H = 0.5–0.6 (Mild persistence)",     "Few devices",         "Some structure but weaker signal"],
+        ["H = 0.4–0.5 (Near random / anti)",   "Rare",                "Limited predictability for these users"],
+    ]
+    elems.append(results_table(
+        ["Hurst Range", "Frequency", "Interpretation"], h_rows))
+    elems.append(sp(0.3))
+    elems.append(body(
+        "<b>Conclusion:</b> The majority of devices show strong long-range "
+        "dependence (H &gt; 0.7), confirming that sequence-aware models such as "
+        "XGBoost with temporal feature engineering should outperform SOM-based "
+        "clustering. This finding directly motivates the model choice."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 5 — WIDE FORMAT
+# ─────────────────────────────────────────────────────────────
+
+def section_wide_format():
+    elems = []
+    elems += section_header(
+        "5.  Step 3 — Data Format Transformation (Wide Daily Format)", "h1")
+    elems.append(body(
+        "XGBoost requires a tabular feature matrix. To convert the hourly "
+        "time-series into a form suitable for daily prediction, the resampled "
+        "CSVs are pivoted into a <b>wide daily format</b> via <b>battery_xgboost.py</b>:"
+    ))
+    elems.append(kv_table([
+        ["Rows"   , "One row per calendar date"],
+        ["Columns", "dSocdt_h0 … dSocdt_h23  |  Soc_h0 … Soc_h23  (48 columns)"],
+        ["dSocdt" , "+ve values clipped to 0 (charging effect removed)"],
+        ["Soc"    , "Forward/backward filled within each day for any missing hours"],
+        ["Saved to", "results/wide_csv/<device>_wide.csv"],
+    ], col_widths=[3.5 * cm, 11.5 * cm]))
+    elems.append(sp(0.3))
+    elems.append(body(
+        "This wide format means each row represents a full day's 24-hour "
+        "discharge profile, which becomes both the training target and "
+        "part of the feature context for adjacent rows."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 6 — XGBOOST MODEL
+# ─────────────────────────────────────────────────────────────
+
+def section_model():
+    elems = []
+    elems += section_header(
+        "6.  Step 4 — XGBoost Model (Daily Rolling-Window Training)", "h1")
+    elems.append(body(
+        "The core prediction model uses XGBoost with a MultiOutputRegressor "
+        "wrapper (one tree per output hour) trained in a daily rolling-window "
+        "fashion. The prediction target is the 24-hour dSocdt profile of the "
+        "next day."
+    ))
+
+    elems += section_header("6.1  Feature Engineering", "h2")
+    elems.append(body(
+        "For each prediction day, the full 14-day training window is flattened "
+        "into a single feature vector. Per training day, the following features "
+        "are included:"
+    ))
+    elems.append(bullet("24 dSocdt values  (hourly discharge rates, charging zeroed out)"))
+    elems.append(bullet("24 Soc values  (hourly state of charge)"))
+    elems.append(bullet("Day of week  (Monday=0 … Sunday=6)"))
+    elems.append(bullet("Day of month  (1–31)"))
+    elems.append(bullet("Month  (1–12)"))
+    elems.append(bullet("Year  (e.g. 2024)"))
+    elems.append(sp(0.2))
+    elems.append(kv_table([
+        ["Features per day"   , "24 + 24 + 4 = 52"],
+        ["Training window"    , "14 days"],
+        ["Total feature vector", "14 × 52 = 728 features"],
+        ["Output"             , "24 dSocdt values for the next day (h0 … h23)"],
+    ], col_widths=[4 * cm, 11 * cm]))
+
+    elems += section_header("6.2  Training Strategy", "h2")
+    elems.append(body(
+        "Because each prediction iteration has only 13 labelled training samples "
+        "(expanding sub-windows within the 14-day block), a zero-padded expanding "
+        "context strategy is used:"
+    ))
+    elems.append(bullet(
+        "Sample k: use days [train_start … train_start+k-1] as context, "
+        "padded with zeros at front, to predict day train_start+k (k = 1 … 13)"))
+    elems.append(bullet(
+        "This generates 13 training samples per prediction — sufficient for XGBoost "
+        "without data leakage from the unseen test day."))
+    elems.append(bullet(
+        "The actual prediction uses the full real 14-day window as context → "
+        "predicts the immediately next unseen day."))
+    elems.append(bullet(
+        "Predictions are clipped to ≤ 0 (discharge can never be positive)."))
+    elems.append(bullet(
+        "Always uses ACTUAL past values — no predicted values fed back."))
+
+    elems += section_header("6.3  Accuracy Metric", "h2")
+    elems.append(body(
+        "A prediction for a given hour is counted as <b>correct</b> if "
+        "|predicted dSocdt − actual dSocdt| ≤ threshold (set to 2.0 in this project). "
+        "Accuracy for a day = percentage of 24 hours that are correct. "
+        "Device accuracy = mean of all daily accuracies. "
+        "Overall accuracy = mean across all devices."
+    ))
+    elems.append(body(
+        "MAE and RMSE are also recorded per day and per device as secondary metrics."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 7 — HYPERPARAMETER TUNING
+# ─────────────────────────────────────────────────────────────
+
+def section_hyperparam():
+    elems = []
+    elems += section_header(
+        "7.  Step 5 — Hyperparameter Tuning (Sequential Coordinate Search)", "h1")
+    elems.append(body(
+        "Full grid search over all hyperparameter combinations was infeasible "
+        "(each combination takes ~40 minutes across all devices). Instead, a "
+        "<b>sequential coordinate-wise search</b> was used: tune one parameter "
+        "at a time while fixing all others, then carry forward the best value "
+        "found to the next parameter. This is implemented in "
+        "<b>battery_hypersearch.py</b> with checkpoint-based resumability."
+    ))
+    elems.append(body(
+        "The script uses joblib parallelism across CPU cores and writes each "
+        "result to disk immediately, so interrupted runs resume from exactly "
+        "where they stopped."
+    ))
+    elems.append(sp(0.3))
+
+    param_order = [
+        ("7.1", "n_estimators", "150 to 350 (step 50)",
+         "150", "checkpoint_n_estimators.json", "val_curve_n_estimators.png"),
+        ("7.2", "max_depth",     "[3, 4, 5]",
+         "3",   "checkpoint_max_depth.json",    "val_curve_max_depth.png"),
+        ("7.3", "learning_rate", "[0.01, 0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.24]",
+         "0.02","checkpoint_learning_rate.json","val_curve_learning_rate.png"),
+        ("7.4", "subsample",     "[0.7, 0.75, 0.8, 0.85, 0.9, 1.0]",
+         "1.0", "checkpoint_subsample.json",    "val_curve_subsample.png"),
+    ]
+
+    for num, pname, prange, pbest, ckfile, plotfile in param_order:
+        elems += section_header(f"{num}  {pname}", "h2")
+        elems.append(kv_table([
+            ["Values tested", prange],
+            ["Best value"   , pbest],
+            ["Checkpoint"   , ckfile],
+        ], col_widths=[3.5 * cm, 11.5 * cm]))
+        elems.append(sp(0.2))
+        plot_path = os.path.join(PATHS["val_curves"], plotfile)
+        elems += insert_image(
+            plot_path, width_cm=14,
+            caption_text=f"Figure: Validation curve for {pname} — accuracy vs parameter value across all devices"
+        )
+
+    elems += section_header("Final Selected Hyperparameters", "h2")
+    elems.append(results_table(
+        ["Parameter", "Values Tried", "Best Value", "Fixed In Next Steps"],
+        [
+            ["n_estimators",    "150–350 (step 50)", "150",  "Steps 2, 3, 4"],
+            ["max_depth",       "3, 4, 5",           "3",    "Steps 3, 4"],
+            ["learning_rate",   "0.01–0.24",         "0.02", "Step 4"],
+            ["subsample",       "0.7–1.0",           "1.0",  "—"],
+            ["colsample_bytree","fixed",              "0.8",  "All steps"],
+        ]
+    ))
+    elems.append(sp(0.3))
+    elems.append(body(
+        "<b>Note on sequential tuning:</b> The best value of each parameter "
+        "is found conditional on the fixed values of previously tuned parameters. "
+        "This is an approximation of global optimisation but is practical given "
+        "runtime constraints. A final combined validation (Section 8) confirms "
+        "that the selected combination achieves the best overall accuracy."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 8 — FINAL VALIDATION
+# ─────────────────────────────────────────────────────────────
+
+def section_final_validation():
+    elems = []
+    elems += section_header(
+        "8.  Step 6 — Final Combined Validation", "h1")
+    elems.append(body(
+        "After completing all four tuning steps, a final run of "
+        "<b>battery_final_validation.py</b> was executed with all best "
+        "hyperparameter values combined. This is the definitive accuracy "
+        "result used for comparison against the SOM baseline."
+    ))
+    elems.append(kv_table([
+        ["n_estimators",    "150"],
+        ["max_depth",       "3"],
+        ["learning_rate",   "0.02"],
+        ["subsample",       "1.0"],
+        ["colsample_bytree","0.8"],
+        ["Training window", "14 days (daily rolling, shift = 1 day)"],
+        ["Prediction",      "Next single day's 24-hour dSocdt profile"],
+        ["Accuracy metric", "|pred − actual| ≤ 2.0 for each hour"],
+    ], col_widths=[4 * cm, 11 * cm]))
+    elems.append(sp(0.4))
+
+    # Try to load final_summary.csv
+    summary_csv = os.path.join(PATHS["final_validation"], "final_summary.csv")
+    import pandas as pd
+    if os.path.exists(summary_csv):
+        df = pd.read_csv(summary_csv)
+        rows = []
+        for _, r in df.iterrows():
+            short_name = str(r["device"])[:18] + "…" if len(str(r["device"])) > 20 else str(r["device"])
+            rows.append([short_name,
+                         f"{r['mean_accuracy_%']:.2f}%",
+                         f"{r['mean_mae']:.5f}",
+                         f"{r['mean_rmse']:.5f}"])
+        if rows:
+            overall = df["mean_accuracy_%"].mean()
+            rows.append(["OVERALL MEAN", f"{overall:.2f}%", "—", "—"])
+            elems.append(results_table(
+                ["Device", "Mean Accuracy", "Mean MAE", "Mean RMSE"], rows))
+            elems.append(sp(0.3))
+    else:
+        elems.append(body(
+            "[Final summary CSV not found — run battery_final_validation.py "
+            "to generate results/xgboost/final_validation/final_summary.csv]"
+        ))
+
+    # Insert one final validation plot
+    fv_plots = glob_all(os.path.join(PATHS["final_validation"], "*plot*.png"))
+    if fv_plots:
+        elems += insert_image(
+            fv_plots[0], width_cm=15,
+            caption_text="Figure: Final validation — daily accuracy, MAE, and actual vs predicted dSocdt"
+        )
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 9 — FEATURE IMPORTANCE
+# ─────────────────────────────────────────────────────────────
+
+def section_feature_importance():
+    elems = []
+    elems += section_header("9.  Step 7 — Feature Importance Analysis", "h1")
+    elems.append(body(
+        "After finalising the model, XGBoost's built-in feature importance "
+        "scores (gain, weight, cover) were extracted and visualised using "
+        "<b>battery_feature_import.py</b>. This identifies which hours and "
+        "which types of features (dSocdt vs Soc vs date) contribute most "
+        "to prediction accuracy."
+    ))
+    fi_plots = glob_all(os.path.join(PATHS["feature_importance"], "*.png"))
+    for i, fp in enumerate(fi_plots[:3]):   # include up to 3 plots
+        elems += insert_image(
+            fp, width_cm=14,
+            caption_text=f"Figure: Feature importance — {os.path.basename(fp)}"
+        )
+    if not fi_plots:
+        elems += insert_image(
+            None,
+            caption_text="Feature importance plots (run battery_feature_import.py)"
+        )
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 10 — RESULTS SUMMARY
+# ─────────────────────────────────────────────────────────────
+
+def section_results():
+    elems = []
+    elems += section_header(
+        "10.  Results Summary & Comparison with SOM Baseline", "h1")
+    elems.append(body(
+        "The table below compares the SOM-based approach from the reference "
+        "paper against the XGBoost daily rolling-window approach developed "
+        "in this project."
+    ))
+    elems.append(results_table(
+        ["Aspect", "SOM (Reference)", "XGBoost (This Project)"],
+        [
+            ["Prediction unit",   "1-week block",       "1 day"],
+            ["Training window",   "2 weeks (fixed)",    "2 weeks (rolling daily)"],
+            ["Model type",        "Unsupervised cluster","Supervised regression"],
+            ["Temporal ordering", "Not preserved",      "Fully preserved"],
+            ["Long-range memory", "Not modelled",       "Captured via 14-day feature window"],
+            ["Accuracy range",    "32%–64% per week",   "See final_summary.csv"],
+            ["Best weekly acc.",  "64.1% (days 22–28)", "TBD from final validation"],
+        ]
+    ))
+    elems.append(sp(0.5))
+    elems.append(body(
+        "<b>Key insight:</b> The XGBoost approach directly benefits from the "
+        "confirmed long-range dependence (H &gt; 0.7) in most device files. "
+        "By encoding 14 days of actual discharge history into the feature "
+        "vector, the model can exploit the weekly periodicity and user-specific "
+        "daily routines that SOM clustering ignores."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 11 — NEXT STEPS
+# ─────────────────────────────────────────────────────────────
+
+def section_next_steps():
+    elems = []
+    elems += section_header("11.  Next Steps", "h1")
+    next_items = [
+        "LSTM / Bidirectional LSTM model — compare against XGBoost using same daily rolling-window setup.",
+        "Cross-user generalisation — train on pooled data from multiple devices, test on held-out devices.",
+        "Threshold sensitivity analysis — evaluate how accuracy changes as ACC_THRESHOLD varies (1.0, 1.5, 2.0, 2.5).",
+        "Cosine similarity analysis — already partially generated; complete interpretation and include in report.",
+        "Final report write-up — formal academic-style documentation with literature comparison.",
+    ]
+    for item in next_items:
+        elems.append(bullet(item))
+    elems.append(sp(1))
+    elems.append(hr())
+    elems.append(Paragraph(
+        "<i>This report was auto-generated by generate_report.py. "
+        "Re-run at any time to refresh with the latest plots and results.</i>",
+        S["caption"]
+    ))
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# BUILD PDF
+# ─────────────────────────────────────────────────────────────
+
+def build_pdf():
+    doc = SimpleDocTemplate(
+        OUTPUT_PDF, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=MARGIN,
+        title="Battery Management Project Report",
+        author="Project Team",
+    )
+
+    story = []
+    story += cover_page()
+    story += toc()
+    story += section_overview()
+    story += section_dataset()
+    story += section_preprocessing()
+    story += section_statistical()
+    story += section_wide_format()
+    story += section_model()
+    story += section_hyperparam()
+    story += section_final_validation()
+    story += section_feature_importance()
+    story += section_results()
+    story += section_next_steps()
+
+    doc.build(story)
+    print(f"\nReport generated:  {OUTPUT_PDF}")
+
+
+if __name__ == "__main__":
+    import pandas   # ensure available
+    build_pdf()
