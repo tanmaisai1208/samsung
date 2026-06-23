@@ -1,23 +1,637 @@
-  ── Tree 11 ──────────────────────────────────
-    if  dSocdt_h23_day_minus1  <  -7.646000  :
-        if  Soc_h22_day_minus1  <  42.726898  :
-            →  predict  -0.003122
-        else  ( Soc_h22_day_minus1  >=  42.726898 ) :
-            →  predict  -0.224260
-    else  ( dSocdt_h23_day_minus1  >=  -7.646000 ) :
-        if  dSocdt_h23_day_minus3  <  -10.564000  :
-            →  predict  -0.162825
-        else  ( dSocdt_h23_day_minus3  >=  -10.564000 ) :
-            →  predict  0.043602
+"""
+Battery Management - SHAP Analysis
+======================================================================================
+Trains XGBoost with best hyperparameters on pooled device data, then runs
+SHAP (SHapley Additive exPlanations) analysis to explain model predictions.
 
-  ── Tree 12 ──────────────────────────────────
-    if  dSocdt_h23_day_minus1  <  -5.259800  :
-        if  Soc_h22_day_minus1  <  26.118200  :
-            →  predict  0.096387
-        else  ( Soc_h22_day_minus1  >=  26.118200 ) :
-            →  predict  -0.115617
-    else  ( dSocdt_h23_day_minus1  >=  -5.259800 ) :
-        if  dSocdt_h21_day_minus1  <  -8.853200  :
-            →  predict  -0.134530
-        else  ( dSocdt_h21_day_minus1  >=  -8.853200 ) :
-            →  predict  0.058903
+SHAP answers:
+  - Which features push a specific prediction higher or lower?
+  - Which features are most impactful globally across all predictions?
+  - How does a feature's value relate to its impact direction?
+  - Are there interactions between features?
+
+Outputs (all inside results/shap/):
+  shap_summary_bar.png          — mean |SHAP| per feature (global importance)
+  shap_summary_beeswarm.png     — SHAP value vs feature value (direction + magnitude)
+  shap_by_type.png              — total SHAP impact grouped by feature type
+  shap_by_recency.png           — how SHAP impact varies with days-back
+  shap_dependence_top4.png      — dependence plots for top 4 features
+                                   (shows interactions automatically)
+  shap_waterfall_samples.png    — waterfall plots for 6 individual predictions
+                                   (explains one prediction at a time like your example)
+  shap_hour_heatmap.png         — which features matter most per output hour
+  shap_values.csv               — raw SHAP values for all samples x features x hours
+  shap_feature_summary.csv      — per-feature mean |SHAP| averaged across all hours
+"""
+
+import os
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import shap
+from xgboost import XGBRegressor
+from sklearn.multioutput import MultiOutputRegressor
+
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────────────────────
+# BEST HYPERPARAMETERS
+# ─────────────────────────────────────────────────────────────
+BEST_PARAMS = {
+    "n_estimators"    : 150,
+    "max_depth"       : 3,
+    "learning_rate"   : 0.02,
+    "subsample"       : 1.0,
+    "colsample_bytree": 0.8,
+    "random_state"    : 42,
+    "verbosity"       : 0,
+}
+
+# ─────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+WIDE_CSV_FOLDER = "results/wide_csv"
+OUTPUT_FOLDER   = "results/shap"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+TRAIN_DAYS = 14
+HOURS      = list(range(24))
+
+# Number of background samples for SHAP TreeExplainer
+# (use all training data — TreeExplainer is exact for tree models, very fast)
+# Number of samples to explain (explaining all is slow; 200 is representative)
+N_EXPLAIN = 200
+
+# ─────────────────────────────────────────────────────────────
+# COLUMN DEFINITIONS
+# ─────────────────────────────────────────────────────────────
+DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
+SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
+DATE_FEAT_COUNT = 4
+FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
+
+# ─────────────────────────────────────────────────────────────
+# FEATURE NAMES
+# ─────────────────────────────────────────────────────────────
+feature_names = []
+for day_pos in range(TRAIN_DAYS):
+    days_back = TRAIN_DAYS - day_pos
+    day_label = f"day_minus{days_back}"
+    for h in HOURS:
+        feature_names.append(f"dSocdt_h{h}_{day_label}")
+    for h in HOURS:
+        feature_names.append(f"Soc_h{h}_{day_label}")
+    feature_names.append(f"dayofweek_{day_label}")
+    feature_names.append(f"day_{day_label}")
+    feature_names.append(f"month_{day_label}")
+    feature_names.append(f"year_{day_label}")
+
+assert len(feature_names) == TRAIN_DAYS * FEATS_PER_DAY
+feat_arr = np.array(feature_names)
+
+
+# ─────────────────────────────────────────────────────────────
+# FEATURE TYPE TAGS
+# ─────────────────────────────────────────────────────────────
+def feat_type(name):
+    if name.startswith("dSocdt"): return "dSocdt"
+    if name.startswith("Soc"):    return "Soc"
+    return "Date"
+
+def feat_days_back(name):
+    if "day_minus" in name:
+        return int(name.split("day_minus")[-1])
+    return None
+
+feat_types     = np.array([feat_type(f)      for f in feature_names])
+feat_days_back_arr = np.array([feat_days_back(f) for f in feature_names])
+
+
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+def date_feats(date_str):
+    ts = pd.Timestamp(date_str)
+    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
+
+def build_padded_feature_row(wide, context_start, context_end, pad_days):
+    feats = [0.0] * (pad_days * FEATS_PER_DAY)
+    for i in range(context_start, context_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return feats
+
+
+# ─────────────────────────────────────────────────────────────
+# LOAD DATA & TRAIN
+# ─────────────────────────────────────────────────────────────
+def load_and_train():
+    all_X, all_y = [], []
+    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
+    if not wide_files:
+        raise FileNotFoundError(f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'.")
+
+    for wf in wide_files:
+        print(f"  Loading: {os.path.basename(wf)}")
+        wide = pd.read_csv(wf, index_col="Date")
+        wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
+        if len(wide) <= TRAIN_DAYS:
+            continue
+        for predict_day_idx in range(TRAIN_DAYS, len(wide)):
+            train_start = predict_day_idx - TRAIN_DAYS
+            for k in range(1, TRAIN_DAYS):
+                pad_days = TRAIN_DAYS - k
+                feats  = build_padded_feature_row(
+                    wide, train_start, train_start + k, pad_days)
+                target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
+                all_X.append(feats)
+                all_y.append(target)
+
+    X = np.array(all_X, dtype=float)
+    y = np.array(all_y, dtype=float)
+    print(f"\n  Samples: {len(X)}  |  Features: {X.shape[1]}")
+    print("  Training XGBoost...")
+    model = MultiOutputRegressor(XGBRegressor(**BEST_PARAMS), n_jobs=-1)
+    model.fit(X, y)
+    print("  Done.\n")
+    return model, X, y
+
+
+# ─────────────────────────────────────────────────────────────
+# SHAP ANALYSIS  (per-hour estimator)
+# ─────────────────────────────────────────────────────────────
+def compute_shap_for_hour(estimator, X_explain):
+    """
+    Use SHAP TreeExplainer — exact and fast for XGBoost tree models.
+    Returns shap_values array of shape (n_samples, n_features)
+    and the base value (expected model output).
+    """
+    explainer   = shap.TreeExplainer(estimator)
+    shap_values = explainer.shap_values(X_explain)   # (n_samples, n_features)
+    base_value  = explainer.expected_value
+    return shap_values, base_value
+
+
+# ─────────────────────────────────────────────────────────────
+# PLOT 1 — Summary bar (mean |SHAP| global importance)
+# ─────────────────────────────────────────────────────────────
+def plot_summary_bar(mean_abs_shap, top_n=30):
+    """
+    Mean absolute SHAP value per feature averaged across all 24 output hours.
+    This is the SHAP equivalent of feature importance —
+    but measured in prediction units (dSocdt units) not arbitrary gain scores.
+    """
+    df = pd.DataFrame({
+        "feature"     : feature_names,
+        "mean_abs_shap": mean_abs_shap,
+        "type"        : feat_types,
+    }).sort_values("mean_abs_shap", ascending=False).head(top_n)
+
+    color_map  = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
+    bar_colors = [color_map[t] for t in df["type"]]
+
+    fig, ax = plt.subplots(figsize=(12, 9))
+    ax.barh(range(len(df)), df["mean_abs_shap"].values,
+            color=bar_colors, edgecolor="white", linewidth=0.4)
+    ax.set_yticks(range(len(df)))
+    ax.set_yticklabels(df["feature"].values, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Mean |SHAP value|  (avg over all samples & output hours)\n"
+                  "= average impact on predicted dSocdt in dSocdt units", fontsize=10)
+    ax.set_title(f"SHAP Global Feature Importance — Top {top_n} Features\n"
+                 "(higher = feature shifts predictions more on average)",
+                 fontsize=12, fontweight="bold")
+
+    from matplotlib.patches import Patch
+    ax.legend(handles=[
+        Patch(facecolor="steelblue",  label="dSocdt features"),
+        Patch(facecolor="darkorange", label="Soc features"),
+        Patch(facecolor="seagreen",   label="Date features"),
+    ], fontsize=9, loc="lower right")
+    ax.grid(axis="x", linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    path = os.path.join(OUTPUT_FOLDER, "shap_summary_bar.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# PLOT 2 — Beeswarm (SHAP value vs feature value — shows direction)
+# ─────────────────────────────────────────────────────────────
+def plot_beeswarm(shap_matrix, X_explain, top_n=20):
+    """
+    For the top N features by mean |SHAP|:
+      X-axis = SHAP value (negative = pushes prediction more negative/discharge)
+      Y-axis = feature rank
+      Color  = actual feature value (blue=low, red=high)
+
+    This directly shows: "does high SoC push prediction up or down?"
+    """
+    mean_abs = np.abs(shap_matrix).mean(axis=0)
+    top_idx  = np.argsort(mean_abs)[::-1][:top_n]
+
+    fig, ax = plt.subplots(figsize=(13, 9))
+
+    y_positions = list(range(top_n))
+    for yi, fi in enumerate(top_idx):
+        sv  = shap_matrix[:, fi]           # SHAP values for this feature
+        fv  = X_explain[:, fi]             # actual feature values
+        # Normalize feature values to [0,1] for coloring
+        fv_norm = (fv - fv.min()) / (fv.ptp() + 1e-9)
+        # Jitter y slightly so points don't overlap
+        jitter = np.random.uniform(-0.3, 0.3, size=len(sv))
+        sc = ax.scatter(sv, yi + jitter, c=fv_norm,
+                        cmap="RdBu_r", alpha=0.5, s=8, linewidths=0)
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels([feature_names[i] for i in top_idx], fontsize=8)
+    ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("SHAP value\n"
+                  "(negative = pushes prediction toward more discharge  |  "
+                  "positive = pushes toward less discharge / charging)",
+                  fontsize=10)
+    ax.set_title(f"SHAP Beeswarm Plot — Top {top_n} Features\n"
+                 "Color: blue = low feature value,  red = high feature value",
+                 fontsize=12, fontweight="bold")
+
+    cbar = plt.colorbar(sc, ax=ax, pad=0.01)
+    cbar.set_label("Feature value\n(relative: blue=low, red=high)", fontsize=8)
+    ax.grid(axis="x", linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(OUTPUT_FOLDER, "shap_summary_beeswarm.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# PLOT 3 — SHAP impact grouped by feature type
+# ─────────────────────────────────────────────────────────────
+def plot_by_type(mean_abs_shap):
+    type_totals = {}
+    for ftype in ["dSocdt", "Soc", "Date"]:
+        mask = feat_types == ftype
+        type_totals[ftype] = mean_abs_shap[mask].sum()
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    colors = ["steelblue", "darkorange", "seagreen"]
+    bars   = ax.bar(list(type_totals.keys()), list(type_totals.values()),
+                    color=colors, edgecolor="white", width=0.5)
+    for bar, val in zip(bars, type_totals.values()):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.001, f"{val:.4f}",
+                ha="center", va="bottom", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Total mean |SHAP| across all features of that type", fontsize=10)
+    ax.set_title("SHAP Impact by Feature Category\n"
+                 "(which type of input drives predictions most)",
+                 fontsize=12, fontweight="bold")
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    path = os.path.join(OUTPUT_FOLDER, "shap_by_type.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# PLOT 4 — SHAP impact by recency (days back)
+# ─────────────────────────────────────────────────────────────
+def plot_by_recency(mean_abs_shap):
+    """
+    Shows whether the model relies more on recent days or older days.
+    Separate lines for dSocdt and Soc feature types.
+    """
+    records = []
+    for i, (name, mabs) in enumerate(zip(feature_names, mean_abs_shap)):
+        db = feat_days_back_arr[i]
+        if db is not None:
+            records.append({
+                "days_back"   : db,
+                "mean_abs_shap": mabs,
+                "feature_type": feat_types[i],
+            })
+    df = pd.DataFrame(records)
+    day_type = df.groupby(["days_back", "feature_type"])["mean_abs_shap"].sum().reset_index()
+    pivot    = day_type.pivot(index="days_back", columns="feature_type",
+                               values="mean_abs_shap").fillna(0)
+    pivot    = pivot.sort_index(ascending=False)   # most recent on left
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    color_map = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
+    for col in pivot.columns:
+        ax.plot(range(len(pivot)), pivot[col].values,
+                marker="o", linewidth=2, color=color_map.get(col, "gray"), label=col)
+
+    ax.set_xticks(range(len(pivot)))
+    ax.set_xticklabels([f"day-{d}" for d in pivot.index],
+                       rotation=45, ha="right", fontsize=9)
+    ax.set_xlabel("Days back from prediction day  (day-1 = yesterday)", fontsize=11)
+    ax.set_ylabel("Total mean |SHAP|  (summed over all features of that type)",
+                  fontsize=10)
+    ax.set_title("SHAP Impact by Recency\n"
+                 "Does the model rely more on recent days or older history?",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    path = os.path.join(OUTPUT_FOLDER, "shap_by_recency.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# PLOT 5 — Dependence plots for top 4 features
+# (shows feature interaction automatically via coloring)
+# ─────────────────────────────────────────────────────────────
+def plot_dependence(shap_matrix, X_explain, mean_abs_shap):
+    """
+    For each of the top 4 features:
+      X-axis  = actual feature value
+      Y-axis  = SHAP value for that feature
+      Color   = value of the most-interacting feature (found automatically)
+
+    This reveals:
+      - Direction: does high SoC push prediction up or down?
+      - Non-linearity: is the relationship step-like or gradual?
+      - Interaction: does the color pattern reveal conditional effects?
+    """
+    top4_idx = np.argsort(mean_abs_shap)[::-1][:4]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.flatten()
+
+    for plot_i, fi in enumerate(top4_idx):
+        ax       = axes[plot_i]
+        feat_sv  = shap_matrix[:, fi]
+        feat_fv  = X_explain[:, fi]
+
+        # Find most-interacting feature: highest correlation between
+        # residual SHAP (after removing main effect) and other feature values
+        interaction_fi = fi
+        best_corr      = -1
+        for candidate in range(shap_matrix.shape[1]):
+            if candidate == fi:
+                continue
+            try:
+                corr = abs(np.corrcoef(feat_sv, X_explain[:, candidate])[0, 1])
+                if corr > best_corr:
+                    best_corr      = corr
+                    interaction_fi = candidate
+            except Exception:
+                continue
+
+        color_fv   = X_explain[:, interaction_fi]
+        color_norm = (color_fv - color_fv.min()) / (color_fv.ptp() + 1e-9)
+        sc = ax.scatter(feat_fv, feat_sv, c=color_norm, cmap="RdBu_r",
+                        alpha=0.5, s=10, linewidths=0)
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.set_xlabel(f"{feature_names[fi]}", fontsize=8)
+        ax.set_ylabel("SHAP value", fontsize=9)
+        ax.set_title(
+            f"Dependence: {feature_names[fi]}\n"
+            f"Color = {feature_names[interaction_fi]}  "
+            f"(interaction, corr={best_corr:.2f})",
+            fontsize=8.5, fontweight="bold"
+        )
+        plt.colorbar(sc, ax=ax, label="Color feature\n(blue=low, red=high)",
+                     pad=0.01).ax.tick_params(labelsize=7)
+        ax.grid(linestyle="--", alpha=0.3)
+
+    fig.suptitle("SHAP Dependence Plots — Top 4 Features\n"
+                 "X-axis: feature value  |  Y-axis: SHAP impact  |  "
+                 "Color: most interacting feature",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    path = os.path.join(OUTPUT_FOLDER, "shap_dependence_top4.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# PLOT 6 — Waterfall plots for individual predictions
+# (exactly like your ChatGPT example — explains one prediction at a time)
+# ─────────────────────────────────────────────────────────────
+def plot_waterfall_samples(all_hour_shap, all_hour_base,
+                           X_explain, y_explain, n_samples=6):
+    """
+    For n_samples randomly chosen prediction days, show a waterfall plot
+    for hour 18 (or the hour with most variance — representative hour).
+
+    Waterfall: base_value + sum of top feature contributions = final prediction.
+    Each bar shows how much one feature pushes prediction up or down.
+    """
+    # Use the hour with highest mean |SHAP| as the representative hour
+    hour_importance = [np.abs(sv).mean() for sv in all_hour_shap]
+    rep_hour        = int(np.argmax(hour_importance))
+
+    shap_h   = all_hour_shap[rep_hour]    # (n_samples, n_features)
+    base_h   = all_hour_base[rep_hour]
+    y_pred_h = base_h + shap_h.sum(axis=1)   # approximate final prediction
+
+    sample_indices = np.random.choice(len(X_explain), size=n_samples, replace=False)
+    sample_indices = sorted(sample_indices)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    axes = axes.flatten()
+
+    for plot_i, si in enumerate(sample_indices):
+        ax       = axes[plot_i]
+        sv_i     = shap_h[si]               # (n_features,) for this sample
+        actual   = y_explain[si, rep_hour]
+        pred     = float(y_pred_h[si])
+
+        # Show top 10 contributing features for clarity
+        top_n    = 10
+        top_idx  = np.argsort(np.abs(sv_i))[::-1][:top_n]
+        top_sv   = sv_i[top_idx]
+        top_names= [feature_names[j] for j in top_idx]
+
+        # Build waterfall: cumulative sum from base
+        cumvals  = np.concatenate([[base_h], base_h + np.cumsum(top_sv)])
+        bar_starts  = cumvals[:-1]
+        bar_heights = top_sv
+
+        colors = ["crimson" if v < 0 else "steelblue" for v in bar_heights]
+
+        ax.barh(range(top_n), bar_heights, left=bar_starts,
+                color=colors, edgecolor="white", linewidth=0.5, height=0.6)
+        ax.axvline(base_h, color="gray",   linewidth=1.2, linestyle=":",
+                   label=f"Base: {base_h:.3f}")
+        ax.axvline(pred,   color="navy",   linewidth=1.5, linestyle="--",
+                   label=f"Pred: {pred:.3f}")
+        ax.axvline(actual, color="green",  linewidth=1.5, linestyle="-",
+                   label=f"Actual: {actual:.3f}")
+
+        ax.set_yticks(range(top_n))
+        ax.set_yticklabels(top_names, fontsize=7)
+        ax.set_xlabel("dSocdt prediction value", fontsize=8)
+        ax.set_title(f"Sample {si}  |  Hour {rep_hour:02d}:00\n"
+                     f"Actual={actual:.3f}  Pred={pred:.3f}",
+                     fontsize=8.5, fontweight="bold")
+        ax.legend(fontsize=7, loc="lower right")
+        ax.grid(axis="x", linestyle="--", alpha=0.3)
+
+        # Annotation: red = pushes more discharge, blue = pushes less
+        ax.text(0.01, 0.01,
+                "Red bars: push toward more discharge\n"
+                "Blue bars: push toward less discharge",
+                transform=ax.transAxes, fontsize=6.5,
+                color="gray", verticalalignment="bottom")
+
+    fig.suptitle(f"SHAP Waterfall Plots — {n_samples} Individual Predictions\n"
+                 f"Output Hour: {rep_hour:02d}:00  "
+                 f"(most impactful hour by mean |SHAP|)\n"
+                 "Each bar = one feature's contribution to the final prediction",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    path = os.path.join(OUTPUT_FOLDER, "shap_waterfall_samples.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# PLOT 7 — Heatmap: which features matter most per output hour
+# ─────────────────────────────────────────────────────────────
+def plot_hour_heatmap(all_hour_shap, top_n=20):
+    """
+    Rows = top N features (by overall mean |SHAP|)
+    Cols = output hours 0–23
+    Cell = mean |SHAP| of that feature for that hour
+
+    Reveals: does dSocdt_h14 matter more for predicting midnight or noon?
+    """
+    # Build matrix: (n_features, 24)
+    hour_feat_matrix = np.stack(
+        [np.abs(sv).mean(axis=0) for sv in all_hour_shap], axis=1
+    )  # (n_features, 24)
+
+    overall_importance = hour_feat_matrix.mean(axis=1)
+    top_idx  = np.argsort(overall_importance)[::-1][:top_n]
+    matrix   = hour_feat_matrix[top_idx, :]      # (top_n, 24)
+    ylabels  = [feature_names[i] for i in top_idx]
+
+    fig, ax = plt.subplots(figsize=(16, 8))
+    im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
+
+    ax.set_xticks(range(24))
+    ax.set_xticklabels([f"{h:02d}:00" for h in HOURS], rotation=45,
+                       ha="right", fontsize=8)
+    ax.set_yticks(range(top_n))
+    ax.set_yticklabels(ylabels, fontsize=8)
+    ax.set_xlabel("Output hour being predicted", fontsize=11)
+    ax.set_title(f"SHAP Feature Importance Heatmap\n"
+                 f"Top {top_n} features × all 24 output hours\n"
+                 "(darker = feature has more impact on that hour's prediction)",
+                 fontsize=12, fontweight="bold")
+    plt.colorbar(im, ax=ax, label="Mean |SHAP value|", pad=0.01)
+    fig.tight_layout()
+    path = os.path.join(OUTPUT_FOLDER, "shap_hour_heatmap.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# SAVE CSV
+# ─────────────────────────────────────────────────────────────
+def save_csvs(mean_abs_shap_all_hours, all_hour_shap, X_explain):
+    # Feature summary CSV
+    summary = pd.DataFrame({
+        "feature"         : feature_names,
+        "mean_abs_shap"   : mean_abs_shap_all_hours,
+        "feature_type"    : feat_types,
+        "days_back"       : feat_days_back_arr,
+    }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+    path1 = os.path.join(OUTPUT_FOLDER, "shap_feature_summary.csv")
+    summary.to_csv(path1, index=False)
+    print(f"  Saved: {path1}")
+
+    # Per-hour mean |SHAP| CSV
+    hour_rows = []
+    for h, sv in enumerate(all_hour_shap):
+        mean_abs = np.abs(sv).mean(axis=0)
+        for fi, val in enumerate(mean_abs):
+            hour_rows.append({
+                "hour"        : h,
+                "feature"     : feature_names[fi],
+                "mean_abs_shap": round(float(val), 8),
+                "feature_type": feat_types[fi],
+                "days_back"   : feat_days_back_arr[fi],
+            })
+    path2 = os.path.join(OUTPUT_FOLDER, "shap_values_by_hour.csv")
+    pd.DataFrame(hour_rows).to_csv(path2, index=False)
+    print(f"  Saved: {path2}")
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+
+    np.random.seed(42)
+
+    print("=" * 65)
+    print("SHAP ANALYSIS")
+    print("=" * 65 + "\n")
+
+    # 1. Train model
+    model, X_all, y_all = load_and_train()
+
+    # 2. Select subset to explain
+    total = len(X_all)
+    n_exp = min(N_EXPLAIN, total)
+    idx   = np.random.choice(total, size=n_exp, replace=False)
+    idx   = np.sort(idx)
+    X_exp = X_all[idx]
+    y_exp = y_all[idx]
+    print(f"Computing SHAP for {n_exp} samples across 24 output hours...\n")
+
+    # 3. Compute SHAP per hour
+    all_hour_shap = []
+    all_hour_base = []
+    for h, estimator in enumerate(model.estimators_):
+        print(f"  Hour {h:02d}:00 ...", end="  ", flush=True)
+        sv, bv = compute_shap_for_hour(estimator, X_exp)
+        all_hour_shap.append(sv)
+        all_hour_base.append(bv)
+        print(f"base={bv:.4f}  mean|SHAP|={np.abs(sv).mean():.5f}")
+
+    # 4. Aggregate across hours
+    # Stack: (24, n_samples, n_features) → mean over hours
+    shap_stack        = np.stack(all_hour_shap, axis=0)   # (24, n, f)
+    shap_mean_hours   = shap_stack.mean(axis=0)            # (n, f)
+    mean_abs_shap_all = np.abs(shap_stack).mean(axis=(0, 1))  # (f,)
+
+    print(f"\nTop 10 features by mean |SHAP| across all hours:")
+    top10 = np.argsort(mean_abs_shap_all)[::-1][:10]
+    for rank, fi in enumerate(top10):
+        print(f"  {rank+1:2d}. {feature_names[fi]:50s}  {mean_abs_shap_all[fi]:.6f}")
+
+    # 5. Generate all plots
+    print("\nGenerating plots...")
+    plot_summary_bar(mean_abs_shap_all)
+    plot_beeswarm(shap_mean_hours, X_exp)
+    plot_by_type(mean_abs_shap_all)
+    plot_by_recency(mean_abs_shap_all)
+    plot_dependence(shap_mean_hours, X_exp, mean_abs_shap_all)
+    plot_waterfall_samples(all_hour_shap, all_hour_base, X_exp, y_exp)
+    plot_hour_heatmap(all_hour_shap)
+
+    # 6. Save CSVs
+    print("\nSaving CSVs...")
+    save_csvs(mean_abs_shap_all, all_hour_shap, X_exp)
+
+    print("\n" + "=" * 65)
+    print("SHAP analysis complete.")
+    print(f"  Output folder : {OUTPUT_FOLDER}/")
+    print("=" * 65)
