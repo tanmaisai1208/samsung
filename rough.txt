@@ -244,7 +244,7 @@ def plot_beeswarm(shap_matrix, X_explain, top_n=20):
         sv  = shap_matrix[:, fi]           # SHAP values for this feature
         fv  = X_explain[:, fi]             # actual feature values
         # Normalize feature values to [0,1] for coloring
-        fv_norm = (fv - fv.min()) / (fv.ptp() + 1e-9)
+        fv_norm = (fv - fv.min()) / ((fv.max() - fv.min()) + 1e-9)
         # Jitter y slightly so points don't overlap
         jitter = np.random.uniform(-0.3, 0.3, size=len(sv))
         sc = ax.scatter(sv, yi + jitter, c=fv_norm,
@@ -389,7 +389,7 @@ def plot_dependence(shap_matrix, X_explain, mean_abs_shap):
                 continue
 
         color_fv   = X_explain[:, interaction_fi]
-        color_norm = (color_fv - color_fv.min()) / (color_fv.ptp() + 1e-9)
+        color_norm = (color_fv - color_fv.min()) / ((color_fv.max() - color_fv.min()) + 1e-9)
         sc = ax.scatter(feat_fv, feat_sv, c=color_norm, cmap="RdBu_r",
                         alpha=0.5, s=10, linewidths=0)
         ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
