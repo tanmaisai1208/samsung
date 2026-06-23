@@ -1,0 +1,406 @@
+"""
+Battery Management - Tree Rule Extraction
+======================================================================================
+Trains XGBoost with the best hyperparameters on pooled data from all devices,
+then extracts the actual decision tree rules (split conditions and leaf predictions)
+from each estimator (one per output hour).
+
+For each output hour (0–23), XGBoost trains n_estimators trees.
+This script extracts rules from all trees of all hour-estimators and saves them.
+
+Outputs (all inside results/tree_rules/):
+  tree_rules_hour_<h>.txt      — human-readable rules for all trees of hour h
+  tree_rules_all.txt           — single file with rules for all 24 hours combined
+  tree_rules_summary.csv       — one row per split node: feature, threshold, hour, tree
+  tree_rules_top_features.png  — which features appear most as split conditions
+  tree_rules_threshold_dist.png— distribution of threshold values per feature type
+"""
+
+import os
+import glob
+import json
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from xgboost import XGBRegressor
+from sklearn.multioutput import MultiOutputRegressor
+
+# ─────────────────────────────────────────────────────────────
+# BEST HYPERPARAMETERS
+# ─────────────────────────────────────────────────────────────
+BEST_PARAMS = {
+    "n_estimators"    : 25,
+    "max_depth"       : 2,
+    "learning_rate"   : 0.05,
+    "subsample"       : 0.95,
+    "colsample_bytree": 0.8,
+    "random_state"    : 42,
+    "verbosity"       : 0,
+}
+
+# ─────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+WIDE_CSV_FOLDER = "results/wide_csv"
+OUTPUT_FOLDER   = "results/xgboost/tree_rules"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+TRAIN_DAYS = 14
+HOURS      = list(range(24))
+
+# How many trees to extract rules from per hour estimator
+# (XGBoost trains n_estimators trees per output; extracting all 150 × 24 = 600
+MAX_TREES_PER_HOUR = 25   # change to BEST_PARAMS["n_estimators"] for full extraction
+
+# ─────────────────────────────────────────────────────────────
+# COLUMN DEFINITIONS
+# ─────────────────────────────────────────────────────────────
+DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
+SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
+DATE_FEAT_COUNT = 4
+FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
+
+# ─────────────────────────────────────────────────────────────
+# FEATURE NAMES  (must match battery_feature_import.py exactly)
+# ─────────────────────────────────────────────────────────────
+feature_names = []
+for day_pos in range(TRAIN_DAYS):
+    days_back = TRAIN_DAYS - day_pos        # 14 = oldest, 1 = most recent
+    day_label = f"day_minus{days_back}"
+    for h in HOURS:
+        feature_names.append(f"dSocdt_h{h}_{day_label}")
+    for h in HOURS:
+        feature_names.append(f"Soc_h{h}_{day_label}")
+    feature_names.append(f"dayofweek_{day_label}")
+    feature_names.append(f"day_{day_label}")
+    feature_names.append(f"month_{day_label}")
+    feature_names.append(f"year_{day_label}")
+
+assert len(feature_names) == TRAIN_DAYS * FEATS_PER_DAY
+
+
+# ─────────────────────────────────────────────────────────────
+# HELPERS — feature building  (same as other scripts)
+# ─────────────────────────────────────────────────────────────
+
+def date_feats(date_str):
+    ts = pd.Timestamp(date_str)
+    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
+
+
+def build_padded_feature_row(wide, context_start, context_end, pad_days):
+    feats = [0.0] * (pad_days * FEATS_PER_DAY)
+    for i in range(context_start, context_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return feats
+
+
+# ─────────────────────────────────────────────────────────────
+# LOAD DATA & TRAIN
+# ─────────────────────────────────────────────────────────────
+
+def load_and_train():
+    all_X, all_y = [], []
+    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
+    if not wide_files:
+        raise FileNotFoundError(f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'.")
+
+    for wf in wide_files:
+        print(f"  Loading: {os.path.basename(wf)}")
+        wide = pd.read_csv(wf, index_col="Date")
+        wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
+        if len(wide) <= TRAIN_DAYS:
+            continue
+        for predict_day_idx in range(TRAIN_DAYS, len(wide)):
+            train_start = predict_day_idx - TRAIN_DAYS
+            for k in range(1, TRAIN_DAYS):
+                pad_days = TRAIN_DAYS - k
+                feats  = build_padded_feature_row(
+                    wide, train_start, train_start + k, pad_days)
+                target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
+                all_X.append(feats)
+                all_y.append(target)
+
+    X = np.array(all_X, dtype=float)
+    y = np.array(all_y, dtype=float)
+    print(f"\n  Training samples : {len(X)}  |  Features : {X.shape[1]}")
+
+    print("  Training XGBoost...")
+    model = MultiOutputRegressor(
+        XGBRegressor(**BEST_PARAMS), n_jobs=-1
+    )
+    model.fit(X, y)
+    print("  Training complete.\n")
+    return model
+
+
+# ─────────────────────────────────────────────────────────────
+# TREE RULE EXTRACTION
+# ─────────────────────────────────────────────────────────────
+
+def parse_node(node, feature_names, indent=0):
+    """
+    Recursively convert one node of the XGBoost tree dump into
+    human-readable rule text.
+
+    XGBoost dump format (JSON):
+      Internal node: {"nodeid", "depth", "split", "split_condition",
+                       "yes", "no", "missing", "children"}
+      Leaf node:     {"nodeid", "depth", "leaf"}
+    """
+    pad = "    " * indent
+    lines = []
+
+    if "leaf" in node:
+        lines.append(f"{pad}→  predict  {node['leaf']:.6f}")
+    else:
+        feat_idx   = int(node["split"].replace("f", ""))
+        feat_name  = (feature_names[feat_idx]
+                      if feat_idx < len(feature_names)
+                      else f"feature_{feat_idx}")
+        threshold  = node["split_condition"]
+        yes_child  = node["yes"]    # node id taken when condition is TRUE
+        no_child   = node["no"]     # node id taken when condition is FALSE
+
+        # Find child nodes by nodeid
+        children   = {c["nodeid"]: c for c in node.get("children", [])}
+        yes_node   = children.get(yes_child)
+        no_node    = children.get(no_child)
+
+        lines.append(f"{pad}if  {feat_name}  <  {threshold:.6f}  :")
+        if yes_node:
+            lines += parse_node(yes_node, feature_names, indent + 1)
+        lines.append(f"{pad}else  ( {feat_name}  >=  {threshold:.6f} ) :")
+        if no_node:
+            lines += parse_node(no_node, feature_names, indent + 1)
+
+    return lines
+
+
+def extract_rules_from_estimator(xgb_estimator, hour, max_trees, feature_names):
+    """
+    Dump all trees of one XGBRegressor (= one output hour) as JSON,
+    then parse each tree into human-readable rules.
+
+    Returns:
+      rule_text (str)         — formatted rule text for this hour
+      split_records (list)    — list of dicts for the summary CSV
+    """
+    # get_booster().get_dump() returns list of tree strings; use json format
+    booster    = xgb_estimator.get_booster()
+    tree_dumps = booster.get_dump(dump_format="json")
+
+    rule_text    = []
+    split_records = []
+    n_trees       = min(max_trees, len(tree_dumps))
+
+    rule_text.append(f"{'═'*70}")
+    rule_text.append(f"  OUTPUT HOUR : {hour:02d}:00  "
+                     f"(showing {n_trees} of {len(tree_dumps)} trees)")
+    rule_text.append(f"{'═'*70}\n")
+
+    for tree_idx in range(n_trees):
+        tree_json = json.loads(tree_dumps[tree_idx])
+
+        rule_text.append(f"  ── Tree {tree_idx + 1} ──────────────────────────────────")
+
+        # Flatten all nodes to find splits for the summary CSV
+        def collect_splits(node):
+            if "leaf" not in node:
+                feat_idx  = int(node["split"].replace("f", ""))
+                feat_name = (feature_names[feat_idx]
+                             if feat_idx < len(feature_names)
+                             else f"feature_{feat_idx}")
+                split_records.append({
+                    "hour"         : hour,
+                    "tree_index"   : tree_idx,
+                    "node_id"      : node["nodeid"],
+                    "depth"        : node.get("depth", "?"),
+                    "feature"      : feat_name,
+                    "feature_index": feat_idx,
+                    "threshold"    : node["split_condition"],
+                    "feature_type" : ("dSocdt" if feat_name.startswith("dSocdt")
+                                      else ("Soc" if feat_name.startswith("Soc")
+                                            else "Date")),
+                    "days_back"    : (int(feat_name.split("day_minus")[-1])
+                                      if "day_minus" in feat_name else None),
+                })
+                for child in node.get("children", []):
+                    collect_splits(child)
+
+        collect_splits(tree_json)
+        rule_text += parse_node(tree_json, feature_names, indent=1)
+        rule_text.append("")
+
+    return "\n".join(rule_text), split_records
+
+
+# ─────────────────────────────────────────────────────────────
+# PLOTS
+# ─────────────────────────────────────────────────────────────
+
+def plot_top_split_features(summary_df, plot_path, top_n=30):
+    """Bar chart: which features appear most often as split conditions."""
+    feat_counts = (summary_df.groupby(["feature", "feature_type"])
+                             .size().reset_index(name="split_count")
+                             .sort_values("split_count", ascending=False)
+                             .head(top_n))
+
+    color_map = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
+    bar_colors = [color_map.get(t, "gray") for t in feat_counts["feature_type"]]
+
+    fig, ax = plt.subplots(figsize=(12, 9))
+    ax.barh(range(len(feat_counts)), feat_counts["split_count"].values,
+            color=bar_colors, edgecolor="white", linewidth=0.4)
+    ax.set_yticks(range(len(feat_counts)))
+    ax.set_yticklabels(feat_counts["feature"].values, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Number of times used as a split condition across all trees & hours",
+                  fontsize=10)
+    ax.set_title(f"Top {top_n} Most-Used Split Features in XGBoost Trees\n"
+                 "(frequency of appearance as a decision node split)",
+                 fontsize=12, fontweight="bold")
+
+    from matplotlib.patches import Patch
+    ax.legend(handles=[
+        Patch(facecolor="steelblue",  label="dSocdt features"),
+        Patch(facecolor="darkorange", label="Soc features"),
+        Patch(facecolor="seagreen",   label="Date features"),
+    ], fontsize=9, loc="lower right")
+    ax.grid(axis="x", linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot saved  →  {plot_path}")
+
+
+def plot_threshold_distribution(summary_df, plot_path):
+    """
+    For each feature type, show the distribution of threshold values
+    used in split conditions — tells us what ranges the model cares about.
+    """
+    types = ["dSocdt", "Soc", "Date"]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    colors = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
+
+    for ax, ftype in zip(axes, types):
+        subset = summary_df[summary_df["feature_type"] == ftype]["threshold"]
+        if subset.empty:
+            ax.set_title(f"{ftype}\n(no splits found)")
+            continue
+        ax.hist(subset, bins=40, color=colors[ftype],
+                edgecolor="white", linewidth=0.4, alpha=0.85)
+        ax.axvline(subset.median(), color="crimson", linestyle="--",
+                   linewidth=1.5, label=f"Median: {subset.median():.3f}")
+        ax.set_title(f"{ftype} features\nThreshold distribution",
+                     fontsize=11, fontweight="bold")
+        ax.set_xlabel("Split threshold value", fontsize=10)
+        ax.set_ylabel("Count", fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+    fig.suptitle("Distribution of Split Thresholds by Feature Type\n"
+                 "(what values the model uses to make decisions)",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot saved  →  {plot_path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    print("=" * 65)
+    print("TREE RULE EXTRACTION")
+    print(f"Max trees shown per hour : {MAX_TREES_PER_HOUR} "
+          f"(of {BEST_PARAMS['n_estimators']} total)")
+    print("=" * 65 + "\n")
+
+    # 1. Train model
+    model = load_and_train()
+
+    # 2. Extract rules from each hour estimator
+    all_split_records = []
+    all_rules_text    = []
+
+    all_rules_path = os.path.join(OUTPUT_FOLDER, "tree_rules_all.txt")
+    all_rules_file = open(all_rules_path, "w", encoding="utf-8")
+
+    for hour_idx, estimator in enumerate(model.estimators_):
+        print(f"  Extracting rules for hour {hour_idx:02d}:00 ...")
+
+        rule_text, split_records = extract_rules_from_estimator(
+            estimator, hour_idx, MAX_TREES_PER_HOUR, feature_names
+        )
+
+        # Write per-hour file
+        hour_path = os.path.join(OUTPUT_FOLDER, f"tree_rules_hour_{hour_idx:02d}.txt")
+        with open(hour_path, "w", encoding="utf-8") as f:
+            f.write(rule_text)
+
+        # Accumulate for combined file
+        all_rules_file.write(rule_text + "\n\n")
+        all_split_records.extend(split_records)
+
+    all_rules_file.close()
+    print(f"\n  All rules (combined)  →  {all_rules_path}")
+    print(f"  Per-hour rule files   →  {OUTPUT_FOLDER}/tree_rules_hour_XX.txt")
+
+    # 3. Save summary CSV
+    summary_df = pd.DataFrame(all_split_records)
+    summary_csv = os.path.join(OUTPUT_FOLDER, "tree_rules_summary.csv")
+    summary_df.to_csv(summary_csv, index=False)
+    print(f"  Summary CSV           →  {summary_csv}")
+
+    # 4. Print quick stats
+    print(f"\n  Total split nodes extracted : {len(summary_df)}")
+    print(f"  Unique features used as splits:")
+    type_counts = summary_df.groupby("feature_type")["feature"].nunique()
+    for ftype, cnt in type_counts.items():
+        print(f"    {ftype:10s} : {cnt} unique features")
+
+    top5 = (summary_df.groupby("feature")
+                       .size().sort_values(ascending=False).head(5))
+    print(f"\n  Top 5 most-used split features:")
+    for feat, count in top5.items():
+        print(f"    {feat:50s}  used {count:4d} times")
+
+    # 5. Plots
+    print("\n  Generating plots...")
+    plot_top_split_features(
+        summary_df,
+        os.path.join(OUTPUT_FOLDER, "tree_rules_top_features.png")
+    )
+    plot_threshold_distribution(
+        summary_df,
+        os.path.join(OUTPUT_FOLDER, "tree_rules_threshold_dist.png")
+    )
+
+    # 6. Print a sample rule (first tree of hour 0) for quick verification
+    sample_path = os.path.join(OUTPUT_FOLDER, "tree_rules_hour_00.txt")
+    print("\n" + "=" * 65)
+    print("SAMPLE — First tree of hour 00:00")
+    print("=" * 65)
+    with open(sample_path, encoding="utf-8") as f:
+        lines = f.readlines()
+    # Print first tree only (up to first blank line after rules start)
+    in_tree = False
+    for line in lines:
+        print(line, end="")
+        if "── Tree 1 ──" in line:
+            in_tree = True
+        if in_tree and line.strip() == "" and "predict" in "".join(lines[:20]):
+            break
+
+    print("\n" + "=" * 65)
+    print("Tree rule extraction complete.")
+    print(f"  Output folder : {OUTPUT_FOLDER}/")
+    print("=" * 65)

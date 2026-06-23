@@ -1,0 +1,427 @@
+"""
+Battery Management - Sequential Hyperparameter Tuning (One Parameter at a Time)
+======================================================================================
+Tunes ONE hyperparameter at a time while keeping all others fixed.
+Change TUNING_PARAM and FIXED_PARAMS at the top each time you run this.
+
+Tuning order:
+  Step 1: TUNING_PARAM = "n_estimators"    ✓ DONE  → best = 25
+  Step 2: TUNING_PARAM = "max_depth"       ✓ DONE  → best = 2
+  Step 3: TUNING_PARAM = "learning_rate"   ✓ DONE  → best = 0.05
+  Step 4: TUNING_PARAM = "subsample"       ✓ DONE  → best = 0.95
+
+After all steps, run one final validation with all best values combined.
+
+Outputs (per tuning run, all namespaced by TUNING_PARAM):
+  results/xgboost/hypersearch/
+    checkpoint_<param>.json
+    results_<param>.csv
+    best_<param>.json
+    validation_curves/val_curve_<param>.png
+"""
+
+import os
+import glob
+import json
+import warnings
+import time
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.multioutput import MultiOutputRegressor
+import joblib
+
+warnings.filterwarnings("ignore")
+
+# ═════════════════════════════════════════════════════════════
+# ▶▶ CHANGE THESE TWO BLOCKS EACH TIME YOU RUN ◀◀
+# ═════════════════════════════════════════════════════════════
+
+# Step 4: tuning subsample
+TUNING_PARAM = "subsample"
+TUNING_VALUES = [0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.00]
+
+# n_estimators now fixed to 25 (best from step 1)
+# max_depth now fixed to 2 (best from step 2)
+# learning_rate now fixed to 0.05 (best from step 3)
+
+FIXED_PARAMS = {
+    "n_estimators"   : 25,    # ✓ best from step 1
+    "max_depth"      : 2.0,   # ✓ best from step 2
+    "learning_rate"  : 0.05,  # ✓ best from step 3
+    "subsample"      : 0.95,  # ✓ best from step 4
+    "colsample_bytree": 0.8,  # kept fixed throughout
+}
+
+# ═════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────────
+WIDE_CSV_FOLDER  = "results/wide_csv"
+OUTPUT_FOLDER    = "results/xgboost/hypersearch"
+VAL_CURVE_FOLDER = os.path.join(OUTPUT_FOLDER, "validation_curves")
+
+CHECKPOINT_FILE = os.path.join(OUTPUT_FOLDER, f"checkpoint_{TUNING_PARAM}.json")
+RESULTS_CSV     = os.path.join(OUTPUT_FOLDER, f"results_{TUNING_PARAM}.csv")
+BEST_JSON       = os.path.join(OUTPUT_FOLDER, f"best_{TUNING_PARAM}.json")
+
+os.makedirs(OUTPUT_FOLDER,    exist_ok=True)
+os.makedirs(VAL_CURVE_FOLDER, exist_ok=True)
+
+TRAIN_DAYS         = 14
+ACC_THRESHOLD      = 2
+HOURS              = list(range(24))
+FIXED_RANDOM_STATE = 42
+
+# ─────────────────────────────────────────────────────────────
+# COLUMN DEFINITIONS
+# ─────────────────────────────────────────────────────────────
+DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
+SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
+DATE_FEAT_COUNT = 4
+FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
+TOTAL_FEATURES  = TRAIN_DAYS * FEATS_PER_DAY                           # 728
+
+
+# ─────────────────────────────────────────────────────────────
+# FEATURE HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def date_feats(date_str):
+    ts = pd.Timestamp(date_str)
+    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
+
+
+def build_feature_row(wide, train_start, train_end):
+    feats = []
+    for i in range(train_start, train_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return np.array(feats, dtype=float)
+
+
+def build_padded_feature_row(wide, context_start, context_end, pad_days):
+    feats = [0.0] * (pad_days * FEATS_PER_DAY)
+    for i in range(context_start, context_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return feats
+
+
+def accuracy_threshold(actual, predicted, threshold=ACC_THRESHOLD):
+    return float(np.mean(np.abs(actual - predicted) <= threshold)) * 100.0
+
+
+# ─────────────────────────────────────────────────────────────
+# PRE-COMPUTE FEATURES  (done once, reused across all values)
+# ─────────────────────────────────────────────────────────────
+
+def precompute_features(wide):
+    n_days   = len(wide)
+    day_data = []
+    for predict_day_idx in range(TRAIN_DAYS, n_days):
+        train_start = predict_day_idx - TRAIN_DAYS
+        train_end   = predict_day_idx
+
+        X_train_rows, y_train_rows = [], []
+        for k in range(1, TRAIN_DAYS):
+            pad_days = TRAIN_DAYS - k
+            feats  = build_padded_feature_row(wide, train_start,
+                                               train_start + k, pad_days)
+            target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
+            X_train_rows.append(feats)
+            y_train_rows.append(target)
+
+        X_pred   = build_feature_row(wide, train_start, train_end).reshape(1, -1)
+        y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
+
+        day_data.append({
+            "predict_date": wide.index[predict_day_idx],
+            "train_start" : wide.index[train_start],
+            "train_end"   : wide.index[train_end - 1],
+            "X_train"     : np.array(X_train_rows, dtype=float),
+            "y_train"     : np.array(y_train_rows, dtype=float),
+            "X_pred"      : X_pred,
+            "y_actual"    : y_actual,
+        })
+    return day_data
+
+
+# ─────────────────────────────────────────────────────────────
+# RUN ONE PARAM VALUE ON ONE DEVICE
+# ─────────────────────────────────────────────────────────────
+
+def run_value_on_device(param_value, day_data, device_name):
+    params = dict(FIXED_PARAMS)
+    params[TUNING_PARAM] = param_value
+
+    xgb_base = XGBRegressor(
+        n_estimators     = int(params["n_estimators"]),
+        max_depth        = int(params["max_depth"]),
+        learning_rate    = float(params["learning_rate"]),
+        subsample        = float(params["subsample"]),
+        colsample_bytree = float(params["colsample_bytree"]),
+        random_state     = FIXED_RANDOM_STATE,
+        verbosity        = 0,
+    )
+    model = MultiOutputRegressor(xgb_base, n_jobs=1)
+
+    accs, maes, rmses = [], [], []
+    for d in day_data:
+        model.fit(d["X_train"], d["y_train"])
+        y_pred = model.predict(d["X_pred"])[0]
+        y_pred = np.clip(y_pred, a_min=None, a_max=0.0)
+        accs.append(accuracy_threshold(d["y_actual"], y_pred))
+        maes.append(mean_absolute_error(d["y_actual"], y_pred))
+        rmses.append(np.sqrt(mean_squared_error(d["y_actual"], y_pred)))
+
+    row = {
+        "tuning_param"  : TUNING_PARAM,
+        "param_value"   : param_value,
+        "device"        : device_name,
+        "mean_accuracy" : round(float(np.mean(accs)),  4),
+        "mean_mae"      : round(float(np.mean(maes)),  6),
+        "mean_rmse"     : round(float(np.mean(rmses)), 6),
+    }
+    for k, v in FIXED_PARAMS.items():
+        if k != TUNING_PARAM:
+            row[f"fixed_{k}"] = v
+    return row
+
+
+# ─────────────────────────────────────────────────────────────
+# CHECKPOINT HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def load_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_checkpoint(done_set):
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(list(done_set), f)
+
+
+def append_result_row(row):
+    df_row = pd.DataFrame([row])
+    write_header = not os.path.exists(RESULTS_CSV)
+    df_row.to_csv(RESULTS_CSV, mode="a", header=write_header, index=False)
+
+
+# ─────────────────────────────────────────────────────────────
+# WORKER  (called by joblib per param value)
+# ─────────────────────────────────────────────────────────────
+
+def process_value(param_value, all_device_data, done_set):
+    results = []
+    for device_name, day_data in all_device_data.items():
+        ck_key = f"{TUNING_PARAM}_{param_value}_{device_name}"
+        if ck_key in done_set:
+            continue
+        print(f"  Running {TUNING_PARAM}={param_value} on [{device_name}]...")
+        row = run_value_on_device(param_value, day_data, device_name)
+        results.append((ck_key, row))
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
+# VALIDATION CURVE PLOT
+# ─────────────────────────────────────────────────────────────
+
+def plot_validation_curve(results_df):
+    devices      = results_df["device"].unique()
+    param_values = sorted(results_df["param_value"].unique())
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+
+    all_device_means = []
+    for device in devices:
+        dev_df = results_df[results_df["device"] == device]
+        means  = [dev_df[dev_df["param_value"] == v]["mean_accuracy"].mean()
+                  for v in param_values]
+        ax.plot(param_values, means, marker="o", linewidth=1.2,
+                alpha=0.45, label=device)
+        all_device_means.append(means)
+
+    overall  = np.mean(all_device_means, axis=0)
+    best_idx = int(np.argmax(overall))
+    best_val = param_values[best_idx]
+
+    ax.plot(param_values, overall, marker="D", linewidth=2.5,
+            color="black", label=f"Overall mean (best={best_val})", zorder=5)
+    ax.axvline(best_val, color="crimson", linestyle="--", linewidth=1.8,
+               label=f"Best {TUNING_PARAM} = {best_val}  "
+                     f"(acc={overall[best_idx]:.2f}%)")
+    ax.annotate(f"  {overall[best_idx]:.2f}%",
+                xy=(best_val, overall[best_idx]),
+                fontsize=10, color="crimson", fontweight="bold")
+
+    ax.set_xlabel(TUNING_PARAM, fontsize=12)
+    ax.set_ylabel("Mean Accuracy (%)", fontsize=12)
+    ax.set_title(
+        f"Validation Curve  —  {TUNING_PARAM}\n"
+        f"(fixed: {', '.join(f'{k}={v}' for k, v in FIXED_PARAMS.items() if k != TUNING_PARAM)})",
+        fontsize=12, fontweight="bold")
+    ax.legend(fontsize=8, ncol=3, loc="lower right")
+    ax.grid(linestyle="--", alpha=0.4)
+
+    info = "\n".join([f"{k} = {v}" for k, v in FIXED_PARAMS.items()
+                      if k != TUNING_PARAM])
+    ax.text(0.02, 0.97, f"Fixed params:\n{info}",
+            transform=ax.transAxes, fontsize=8, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+
+    plot_path = os.path.join(VAL_CURVE_FOLDER, f"val_curve_{TUNING_PARAM}.png")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n  Validation curve saved  →  {plot_path}")
+    return best_val, overall[best_idx]
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    print("=" * 65)
+    print(f"Tuning parameter : {TUNING_PARAM}")
+    print(f"Values to try    : {TUNING_VALUES}")
+    print(f"Fixed params     : {FIXED_PARAMS}")
+    print(f"Total runs       : {len(TUNING_VALUES)} values x N devices")
+    print("=" * 65)
+
+    # 1. Load wide CSVs and pre-compute features
+    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
+    if not wide_files:
+        raise FileNotFoundError(
+            f"No *_wide.csv files found in '{WIDE_CSV_FOLDER}'. "
+            "Run battery_xgboost.py first."
+        )
+
+    print(f"\nFound {len(wide_files)} device(s). Pre-computing features...")
+    all_device_data = {}
+    for wf in wide_files:
+        device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
+        wide = pd.read_csv(wf, index_col="Date")
+        wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
+        if len(wide) <= TRAIN_DAYS:
+            print(f"  Skipping {device_name}: not enough days.")
+            continue
+        print(f"  {device_name}: {len(wide)} days  →  "
+              f"{len(wide) - TRAIN_DAYS} prediction days each run")
+        all_device_data[device_name] = precompute_features(wide)
+
+    print(f"\nDevices: {list(all_device_data.keys())}")
+    print(f"Total model runs : {len(TUNING_VALUES) * len(all_device_data)}  "
+          f"({len(TUNING_VALUES)} values × {len(all_device_data)} devices)\n")
+
+    # 2. Checkpoint
+    done_set  = load_checkpoint()
+    remaining = [v for v in TUNING_VALUES
+                 if not all(f"{TUNING_PARAM}_{v}_{d}" in done_set
+                            for d in all_device_data)]
+
+    print(f"Values: {len(TUNING_VALUES)} total | "
+          f"{len(TUNING_VALUES) - len(remaining)} done | "
+          f"{len(remaining)} remaining\n")
+
+    if remaining:
+        print("Starting tuning run (joblib parallel)...\n")
+        t0        = time.time()
+        completed = len(TUNING_VALUES) - len(remaining)
+
+        BATCH_SIZE = 1
+        for batch_start in range(0, len(remaining), BATCH_SIZE):
+            batch = remaining[batch_start : batch_start + BATCH_SIZE]
+
+            batch_results = joblib.Parallel(n_jobs=-1, prefer="threads")(
+                joblib.delayed(process_value)(v, all_device_data, done_set)
+                for v in batch
+            )
+
+            for value_results in batch_results:
+                for ck_key, row in value_results:
+                    append_result_row(row)
+                    done_set.add(ck_key)
+
+            save_checkpoint(done_set)
+            completed += len(batch)
+            elapsed = time.time() - t0
+            rate    = completed / elapsed if elapsed > 0 else 1
+            eta_s   = (len(TUNING_VALUES) - completed) / rate if rate > 0 else 0
+
+            print(f"  Progress: {completed}/{len(TUNING_VALUES)} values | "
+                  f"Elapsed: {elapsed/60:.1f} min | "
+                  f"ETA: {eta_s/60:.1f} min")
+
+        print(f"\nAll values done in {(time.time()-t0)/60:.1f} minutes.")
+    else:
+        print("All values already completed. Regenerating plots and summary.")
+
+    # 3. Load results and plot
+    if not os.path.exists(RESULTS_CSV):
+        print("No results CSV found. Exiting.")
+        raise SystemExit
+
+    results_df = pd.read_csv(RESULTS_CSV)
+    print(f"\nLoaded {len(results_df)} result rows.")
+
+    # Per-device best
+    print(f"\n{'─'*55}")
+    print(f"Results for tuning: {TUNING_PARAM}")
+    print(f"{'─'*55}")
+    for device, grp in results_df.groupby("device"):
+        best = grp.loc[grp["mean_accuracy"].idxmax()]
+        print(f"  {device:30s}  best {TUNING_PARAM}={best['param_value']}  "
+              f"acc={best['mean_accuracy']:.2f}%  mae={best['mean_mae']:.5f}")
+
+    # Overall best (averaged across all devices)
+    overall_by_value = (results_df.groupby("param_value")["mean_accuracy"]
+                                  .mean().reset_index())
+    best_row      = overall_by_value.loc[overall_by_value["mean_accuracy"].idxmax()]
+    best_value    = best_row["param_value"]
+    best_accuracy = best_row["mean_accuracy"]
+
+    print(f"\n  ► Best {TUNING_PARAM} overall = {best_value}  "
+          f"(avg accuracy across all devices: {best_accuracy:.2f}%)")
+
+    # 4. Save best_<param>.json
+    best_summary = {
+        "tuning_param"           : TUNING_PARAM,
+        "best_value"             : best_value,
+        "best_avg_accuracy_%"    : round(float(best_accuracy), 4),
+        "fixed_params_used"      : {k: v for k, v in FIXED_PARAMS.items()
+                                    if k != TUNING_PARAM},
+        "all_values_tried"       : TUNING_VALUES,
+        "avg_accuracy_per_value" : dict(zip(
+            overall_by_value["param_value"].tolist(),
+            overall_by_value["mean_accuracy"].round(4).tolist()
+        )),
+    }
+    with open(BEST_JSON, "w") as f:
+        json.dump(best_summary, f, indent=2)
+    print(f"\n  Best value summary  →  {BEST_JSON}")
+
+    # 5. Validation curve plot
+    plot_validation_curve(results_df)
+
+    print("\n" + "=" * 65)
+    print(f"Tuning of '{TUNING_PARAM}' complete.")
+    print(f"  Results CSV : {RESULTS_CSV}")
+    print(f"  Best value  : {TUNING_PARAM} = {best_value}")
+    print(f"  Best JSON   : {BEST_JSON}")
+    print(f"  Curve plot  : validation_curves/val_curve_{TUNING_PARAM}.png")
+    print(f"and update FIXED_PARAMS['{TUNING_PARAM}'] = {best_value}")
+    print("=" * 65)
