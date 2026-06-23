@@ -1,0 +1,35 @@
+{
+  "tuning_param": "n_estimators",
+  "best_value": 25.0,
+  "best_avg_accuracy_%": 58.9444,
+  "fixed_params_used": {
+    "max_depth": 4.0,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8
+  },
+  "all_values_tried": [
+    10,
+    25,
+    50,
+    100,
+    150,
+    200,
+    250,
+    300,
+    350
+  ],
+  "avg_accuracy_per_value": {
+    "10": 58.7322,
+    "25": 58.9444,
+    "50": 58.3937,
+    "75": 57.8314,
+    "100": 57.343,
+    "125": 57.1671,
+    "150": 56.8308,
+    "200": 56.7075,
+    "250": 56.7069,
+    "300": 56.7508,
+    "350": 56.7331
+  }
+}

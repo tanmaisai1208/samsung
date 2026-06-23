@@ -1,0 +1,23 @@
+{
+  "tuning_param": "max_depth",
+  "best_value": 2.0,
+  "best_avg_accuracy_%": 59.1041,
+  "fixed_params_used": {
+    "n_estimators": 25,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8
+  },
+  "all_values_tried": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "avg_accuracy_per_value": {
+    "2": 59.1041,
+    "3": 58.9094,
+    "4": 58.9444,
+    "5": 58.9444
+  }
+}

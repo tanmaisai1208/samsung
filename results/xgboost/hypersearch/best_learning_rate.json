@@ -1,0 +1,29 @@
+{
+  "tuning_param": "learning_rate",
+  "best_value": 0.05,
+  "best_avg_accuracy_%": 59.1041,
+  "fixed_params_used": {
+    "n_estimators": 25,
+    "max_depth": 2.0,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8
+  },
+  "all_values_tried": [
+    0.01,
+    0.02,
+    0.05,
+    0.08,
+    0.15,
+    0.21,
+    0.24
+  ],
+  "avg_accuracy_per_value": {
+    "0.01": 58.1849,
+    "0.02": 58.7339,
+    "0.05": 59.1041,
+    "0.08": 58.838,
+    "0.15": 58.4254,
+    "0.21": 57.8223,
+    "0.24": 57.6095
+  }
+}

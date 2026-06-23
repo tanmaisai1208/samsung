@@ -1,0 +1,3 @@
+ID,TimeStamp,ChargingStatus,Soc,DischargeLevel,DateTime,Date,dayofweek,dayname,month,monthname,dSocdt
+e739552e3205add21c31124e89aa4e64b17787769eed4f788b451fcce5b996a2,1717524,0,100.0,3491.0,2024-06-04 18:00:00,2024-06-04,1,Tuesday,6,June,0.0
+e739552e3205add21c31124e89aa4e64b17787769eed4f788b451fcce5b996a2,1717527,0,100.0,3491.0,2024-06-04 19:00:00,2024-06-04,1,Tuesday,6,June,0.0

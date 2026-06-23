@@ -1,0 +1,303 @@
+══════════════════════════════════════════════════════════════════════
+  OUTPUT HOUR : 13:00  (showing 25 of 25 trees)
+══════════════════════════════════════════════════════════════════════
+
+  ── Tree 1 ──────────────────────────────────
+    if  dSocdt_h19_day_minus1  <  -1.386500  :
+        if  dSocdt_h17_day_minus1  <  -10.531800  :
+            →  predict  -0.223102
+        else  ( dSocdt_h17_day_minus1  >=  -10.531800 ) :
+            →  predict  -0.044785
+    else  ( dSocdt_h19_day_minus1  >=  -1.386500 ) :
+        if  dSocdt_h3_day_minus1  <  -0.410300  :
+            →  predict  -0.011015
+        else  ( dSocdt_h3_day_minus1  >=  -0.410300 ) :
+            →  predict  0.121439
+
+  ── Tree 2 ──────────────────────────────────
+    if  dSocdt_h19_day_minus1  <  -1.386500  :
+        if  dSocdt_h17_day_minus1  <  -10.531800  :
+            →  predict  -0.214301
+        else  ( dSocdt_h17_day_minus1  >=  -10.531800 ) :
+            →  predict  -0.043521
+    else  ( dSocdt_h19_day_minus1  >=  -1.386500 ) :
+        if  dSocdt_h4_day_minus1  <  -0.184000  :
+            →  predict  -0.010885
+        else  ( dSocdt_h4_day_minus1  >=  -0.184000 ) :
+            →  predict  0.116734
+
+  ── Tree 3 ──────────────────────────────────
+    if  dSocdt_h12_day_minus1  <  -1.878800  :
+        if  dSocdt_h15_day_minus2  <  -9.540400  :
+            →  predict  -0.198510
+        else  ( dSocdt_h15_day_minus2  >=  -9.540400 ) :
+            →  predict  -0.046466
+    else  ( dSocdt_h12_day_minus1  >=  -1.878800 ) :
+        if  dSocdt_h16_day_minus1  <  -1.106700  :
+            →  predict  -0.020855
+        else  ( dSocdt_h16_day_minus1  >=  -1.106700 ) :
+            →  predict  0.099418
+
+  ── Tree 4 ──────────────────────────────────
+    if  dSocdt_h12_day_minus1  <  -1.878800  :
+        if  dSocdt_h17_day_minus1  <  -6.351800  :
+            →  predict  -0.132995
+        else  ( dSocdt_h17_day_minus1  >=  -6.351800 ) :
+            →  predict  -0.037689
+    else  ( dSocdt_h12_day_minus1  >=  -1.878800 ) :
+        if  dSocdt_h16_day_minus1  <  -0.921200  :
+            →  predict  -0.016231
+        else  ( dSocdt_h16_day_minus1  >=  -0.921200 ) :
+            →  predict  0.096146
+
+  ── Tree 5 ──────────────────────────────────
+    if  dSocdt_h19_day_minus1  <  -2.407800  :
+        if  dSocdt_h17_day_minus1  <  -13.680400  :
+            →  predict  -0.304666
+        else  ( dSocdt_h17_day_minus1  >=  -13.680400 ) :
+            →  predict  -0.047235
+    else  ( dSocdt_h19_day_minus1  >=  -2.407800 ) :
+        if  dSocdt_h17_day_minus2  <  -3.494900  :
+            →  predict  -0.050061
+        else  ( dSocdt_h17_day_minus2  >=  -3.494900 ) :
+            →  predict  0.075895
+
+  ── Tree 6 ──────────────────────────────────
+    if  dSocdt_h15_day_minus1  <  -1.734600  :
+        if  dSocdt_h15_day_minus1  <  -6.503700  :
+            →  predict  -0.097466
+        else  ( dSocdt_h15_day_minus1  >=  -6.503700 ) :
+            →  predict  -0.027304
+    else  ( dSocdt_h15_day_minus1  >=  -1.734600 ) :
+        if  dSocdt_h19_day_minus2  <  -9.124500  :
+            →  predict  -0.274965
+        else  ( dSocdt_h19_day_minus2  >=  -9.124500 ) :
+            →  predict  0.064293
+
+  ── Tree 7 ──────────────────────────────────
+    if  dSocdt_h12_day_minus1  <  -1.878800  :
+        if  dSocdt_h17_day_minus1  <  -7.285800  :
+            →  predict  -0.135268
+        else  ( dSocdt_h17_day_minus1  >=  -7.285800 ) :
+            →  predict  -0.035047
+    else  ( dSocdt_h12_day_minus1  >=  -1.878800 ) :
+        if  dSocdt_h20_day_minus1  <  -1.725500  :
+            →  predict  -0.019451
+        else  ( dSocdt_h20_day_minus1  >=  -1.725500 ) :
+            →  predict  0.082248
+
+  ── Tree 8 ──────────────────────────────────
+    if  dSocdt_h19_day_minus1  <  -2.893700  :
+        if  dSocdt_h20_day_minus1  <  -15.225100  :
+            →  predict  -0.195429
+        else  ( dSocdt_h20_day_minus1  >=  -15.225100 ) :
+            →  predict  -0.043963
+    else  ( dSocdt_h19_day_minus1  >=  -2.893700 ) :
+        if  dSocdt_h4_day_minus1  <  -0.184000  :
+            →  predict  -0.004905
+        else  ( dSocdt_h4_day_minus1  >=  -0.184000 ) :
+            →  predict  0.083435
+
+  ── Tree 9 ──────────────────────────────────
+    if  dSocdt_h12_day_minus1  <  -2.371000  :
+        if  dSocdt_h23_day_minus1  <  -20.251600  :
+            →  predict  -0.379631
+        else  ( dSocdt_h23_day_minus1  >=  -20.251600 ) :
+            →  predict  -0.045402
+    else  ( dSocdt_h12_day_minus1  >=  -2.371000 ) :
+        if  dSocdt_h16_day_minus1  <  -2.560200  :
+            →  predict  -0.033251
+        else  ( dSocdt_h16_day_minus1  >=  -2.560200 ) :
+            →  predict  0.068298
+
+  ── Tree 10 ──────────────────────────────────
+    if  dSocdt_h19_day_minus1  <  -2.893700  :
+        if  dSocdt_h18_day_minus2  <  -13.096000  :
+            →  predict  -0.256623
+        else  ( dSocdt_h18_day_minus2  >=  -13.096000 ) :
+            →  predict  -0.041990
+    else  ( dSocdt_h19_day_minus1  >=  -2.893700 ) :
+        if  dSocdt_h15_day_minus1  <  -4.819600  :
+            →  predict  -0.070290
+        else  ( dSocdt_h15_day_minus1  >=  -4.819600 ) :
+            →  predict  0.055944
+
+  ── Tree 11 ──────────────────────────────────
+    if  dSocdt_h15_day_minus1  <  -1.907200  :
+        if  dSocdt_h15_day_minus1  <  -6.492100  :
+            →  predict  -0.084060
+        else  ( dSocdt_h15_day_minus1  >=  -6.492100 ) :
+            →  predict  -0.020894
+    else  ( dSocdt_h15_day_minus1  >=  -1.907200 ) :
+        if  dSocdt_h12_day_minus1  <  -3.765200  :
+            →  predict  -0.060368
+        else  ( dSocdt_h12_day_minus1  >=  -3.765200 ) :
+            →  predict  0.064470
+
+  ── Tree 12 ──────────────────────────────────
+    if  dSocdt_h20_day_minus1  <  -2.472600  :
+        if  dSocdt_h20_day_minus4  <  -13.900300  :
+            →  predict  -0.195876
+        else  ( dSocdt_h20_day_minus4  >=  -13.900300 ) :
+            →  predict  -0.033009
+    else  ( dSocdt_h20_day_minus1  >=  -2.472600 ) :
+        if  dSocdt_h17_day_minus1  <  -0.184000  :
+            →  predict  -0.005268
+        else  ( dSocdt_h17_day_minus1  >=  -0.184000 ) :
+            →  predict  0.073848
+
+  ── Tree 13 ──────────────────────────────────
+    if  dSocdt_h20_day_minus1  <  -5.017400  :
+        if  dSocdt_h23_day_minus2  <  -5.732100  :
+            →  predict  -0.108680
+        else  ( dSocdt_h23_day_minus2  >=  -5.732100 ) :
+            →  predict  -0.019901
+    else  ( dSocdt_h20_day_minus1  >=  -5.017400 ) :
+        if  dSocdt_h18_day_minus1  <  -0.636800  :
+            →  predict  -0.011041
+        else  ( dSocdt_h18_day_minus1  >=  -0.636800 ) :
+            →  predict  0.063634
+
+  ── Tree 14 ──────────────────────────────────
+    if  dSocdt_h12_day_minus1  <  -2.371000  :
+        if  dSocdt_h23_day_minus1  <  -20.251600  :
+            →  predict  -0.352733
+        else  ( dSocdt_h23_day_minus1  >=  -20.251600 ) :
+            →  predict  -0.036827
+    else  ( dSocdt_h12_day_minus1  >=  -2.371000 ) :
+        if  dSocdt_h20_day_minus1  <  -4.158600  :
+            →  predict  -0.031470
+        else  ( dSocdt_h20_day_minus1  >=  -4.158600 ) :
+            →  predict  0.053690
+
+  ── Tree 15 ──────────────────────────────────
+    if  dSocdt_h19_day_minus1  <  -2.893700  :
+        if  dSocdt_h15_day_minus2  <  -9.931800  :
+            →  predict  -0.161006
+        else  ( dSocdt_h15_day_minus2  >=  -9.931800 ) :
+            →  predict  -0.029449
+    else  ( dSocdt_h19_day_minus1  >=  -2.893700 ) :
+        if  dSocdt_h13_day_minus2  <  -3.383600  :
+            →  predict  -0.040019
+        else  ( dSocdt_h13_day_minus2  >=  -3.383600 ) :
+            →  predict  0.049628
+
+  ── Tree 16 ──────────────────────────────────
+    if  dSocdt_h12_day_minus1  <  -1.878800  :
+        if  dSocdt_h15_day_minus2  <  -9.540400  :
+            →  predict  -0.157402
+        else  ( dSocdt_h15_day_minus2  >=  -9.540400 ) :
+            →  predict  -0.025919
+    else  ( dSocdt_h12_day_minus1  >=  -1.878800 ) :
+        if  month_day_minus1  <  6.000000  :
+            →  predict  -0.030322
+        else  ( month_day_minus1  >=  6.000000 ) :
+            →  predict  0.054733
+
+  ── Tree 17 ──────────────────────────────────
+    if  dSocdt_h15_day_minus1  <  -1.907200  :
+        if  dSocdt_h13_day_minus2  <  -7.879300  :
+            →  predict  -0.106541
+        else  ( dSocdt_h13_day_minus2  >=  -7.879300 ) :
+            →  predict  -0.022877
+    else  ( dSocdt_h15_day_minus1  >=  -1.907200 ) :
+        if  dSocdt_h19_day_minus2  <  -9.124500  :
+            →  predict  -0.216793
+        else  ( dSocdt_h19_day_minus2  >=  -9.124500 ) :
+            →  predict  0.042918
+
+  ── Tree 18 ──────────────────────────────────
+    if  dSocdt_h12_day_minus1  <  -3.122500  :
+        if  Soc_h16_day_minus1  <  15.787700  :
+            →  predict  -0.187617
+        else  ( Soc_h16_day_minus1  >=  15.787700 ) :
+            →  predict  -0.035158
+    else  ( dSocdt_h12_day_minus1  >=  -3.122500 ) :
+        if  dSocdt_h16_day_minus2  <  -0.562200  :
+            →  predict  -0.009169
+        else  ( dSocdt_h16_day_minus2  >=  -0.562200 ) :
+            →  predict  0.054101
+
+  ── Tree 19 ──────────────────────────────────
+    if  dSocdt_h20_day_minus1  <  -5.017400  :
+        if  dSocdt_h22_day_minus2  <  -10.596700  :
+            →  predict  -0.152040
+        else  ( dSocdt_h22_day_minus2  >=  -10.596700 ) :
+            →  predict  -0.032196
+    else  ( dSocdt_h20_day_minus1  >=  -5.017400 ) :
+        if  dSocdt_h15_day_minus3  <  -2.561600  :
+            →  predict  -0.025952
+        else  ( dSocdt_h15_day_minus3  >=  -2.561600 ) :
+            →  predict  0.040463
+
+  ── Tree 20 ──────────────────────────────────
+    if  dSocdt_h13_day_minus2  <  -3.375100  :
+        if  Soc_h16_day_minus1  <  16.748199  :
+            →  predict  -0.222720
+        else  ( Soc_h16_day_minus1  >=  16.748199 ) :
+            →  predict  -0.035213
+    else  ( dSocdt_h13_day_minus2  >=  -3.375100 ) :
+        if  dSocdt_h15_day_minus1  <  -3.968900  :
+            →  predict  -0.038650
+        else  ( dSocdt_h15_day_minus1  >=  -3.968900 ) :
+            →  predict  0.041092
+
+  ── Tree 21 ──────────────────────────────────
+    if  month_day_minus1  <  6.000000  :
+        if  Soc_h2_day_minus2  <  97.887299  :
+            →  predict  -0.032412
+        else  ( Soc_h2_day_minus2  >=  97.887299 ) :
+            →  predict  -0.213505
+    else  ( month_day_minus1  >=  6.000000 ) :
+        if  dSocdt_h18_day_minus1  <  -3.748300  :
+            →  predict  -0.034985
+        else  ( dSocdt_h18_day_minus1  >=  -3.748300 ) :
+            →  predict  0.041989
+
+  ── Tree 22 ──────────────────────────────────
+    if  dSocdt_h20_day_minus1  <  -5.017400  :
+        if  dSocdt_h22_day_minus2  <  -10.596700  :
+            →  predict  -0.145838
+        else  ( dSocdt_h22_day_minus2  >=  -10.596700 ) :
+            →  predict  -0.027808
+    else  ( dSocdt_h20_day_minus1  >=  -5.017400 ) :
+        if  dSocdt_h17_day_minus1  <  -5.551400  :
+            →  predict  -0.056324
+        else  ( dSocdt_h17_day_minus1  >=  -5.551400 ) :
+            →  predict  0.029108
+
+  ── Tree 23 ──────────────────────────────────
+    if  month_day_minus1  <  6.000000  :
+        if  Soc_h2_day_minus2  <  97.887299  :
+            →  predict  -0.030600
+        else  ( Soc_h2_day_minus2  >=  97.887299 ) :
+            →  predict  -0.194545
+    else  ( month_day_minus1  >=  6.000000 ) :
+        if  dSocdt_h18_day_minus1  <  -3.748300  :
+            →  predict  -0.032584
+        else  ( dSocdt_h18_day_minus1  >=  -3.748300 ) :
+            →  predict  0.040072
+
+  ── Tree 24 ──────────────────────────────────
+    if  dSocdt_h15_day_minus1  <  -3.968900  :
+        if  dSocdt_h13_day_minus7  <  -8.971500  :
+            →  predict  -0.159644
+        else  ( dSocdt_h13_day_minus7  >=  -8.971500 ) :
+            →  predict  -0.032269
+    else  ( dSocdt_h15_day_minus1  >=  -3.968900 ) :
+        if  dSocdt_h13_day_minus2  <  -3.383600  :
+            →  predict  -0.034408
+        else  ( dSocdt_h13_day_minus2  >=  -3.383600 ) :
+            →  predict  0.036357
+
+  ── Tree 25 ──────────────────────────────────
+    if  month_day_minus1  <  6.000000  :
+        if  Soc_h2_day_minus2  <  97.887299  :
+            →  predict  -0.028147
+        else  ( Soc_h2_day_minus2  >=  97.887299 ) :
+            →  predict  -0.191287
+    else  ( month_day_minus1  >=  6.000000 ) :
+        if  dSocdt_h18_day_minus1  <  -3.748300  :
+            →  predict  -0.029088
+        else  ( dSocdt_h18_day_minus1  >=  -3.748300 ) :
+            →  predict  0.036461
