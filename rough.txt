@@ -1,637 +1,791 @@
 """
-Battery Management - SHAP Analysis
-======================================================================================
-Trains XGBoost with best hyperparameters on pooled device data, then runs
-SHAP (SHapley Additive exPlanations) analysis to explain model predictions.
+generate_report.py
+==================
+Run this script from inside your SOC-folder to generate a PDF progress report.
 
-SHAP answers:
-  - Which features push a specific prediction higher or lower?
-  - Which features are most impactful globally across all predictions?
-  - How does a feature's value relate to its impact direction?
-  - Are there interactions between features?
+    cd path/to/SOC-folder
+    python generate_report.py
 
-Outputs (all inside results/shap/):
-  shap_summary_bar.png          — mean |SHAP| per feature (global importance)
-  shap_summary_beeswarm.png     — SHAP value vs feature value (direction + magnitude)
-  shap_by_type.png              — total SHAP impact grouped by feature type
-  shap_by_recency.png           — how SHAP impact varies with days-back
-  shap_dependence_top4.png      — dependence plots for top 4 features
-                                   (shows interactions automatically)
-  shap_waterfall_samples.png    — waterfall plots for 6 individual predictions
-                                   (explains one prediction at a time like your example)
-  shap_hour_heatmap.png         — which features matter most per output hour
-  shap_values.csv               — raw SHAP values for all samples x features x hours
-  shap_feature_summary.csv      — per-feature mean |SHAP| averaged across all hours
+It reads plots from your existing results/ folder structure and compiles
+everything into:  results/project_report.pdf
+
+Requirements:  pip install reportlab
 """
 
 import os
 import glob
-import warnings
-import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import shap
-from xgboost import XGBRegressor
-from sklearn.multioutput import MultiOutputRegressor
-
-warnings.filterwarnings("ignore")
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, PageBreak,
+    Table, TableStyle, HRFlowable, Image, KeepTogether
+)
+from reportlab.platypus.flowables import Flowable
 
 # ─────────────────────────────────────────────────────────────
-# BEST HYPERPARAMETERS
+# PATHS  — adjust ROOT if you run from a different directory
 # ─────────────────────────────────────────────────────────────
-BEST_PARAMS = {
-    "n_estimators"    : 150,
-    "max_depth"       : 3,
-    "learning_rate"   : 0.02,
-    "subsample"       : 1.0,
-    "colsample_bytree": 0.8,
-    "random_state"    : 42,
-    "verbosity"       : 0,
+ROOT        = "."                          # run from inside SOC-folder
+RESULTS     = os.path.join(ROOT, "results")
+OUTPUT_PDF  = os.path.join(RESULTS, "project_report.pdf")
+
+PATHS = {
+    "ac_hc_plots"       : os.path.join(RESULTS, "ac_hc_plots"),
+    "wide_csv"          : os.path.join(RESULTS, "wide_csv"),
+    "resampled_csv"     : os.path.join(RESULTS, "resampled_csv"),
+    "feature_importance": os.path.join(RESULTS, "xgboost", "feature_importance"),
+    "final_validation"  : os.path.join(RESULTS, "xgboost", "final_validation"),
+    "hypersearch"       : os.path.join(RESULTS, "xgboost", "hypersearch"),
+    "val_curves"        : os.path.join(RESULTS, "xgboost", "hypersearch", "validation_curves"),
 }
 
-# ─────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────
-WIDE_CSV_FOLDER = "results/wide_csv"
-OUTPUT_FOLDER   = "results/shap"
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-TRAIN_DAYS = 14
-HOURS      = list(range(24))
-
-# Number of background samples for SHAP TreeExplainer
-# (use all training data — TreeExplainer is exact for tree models, very fast)
-# Number of samples to explain (explaining all is slow; 200 is representative)
-N_EXPLAIN = 200
-
-# ─────────────────────────────────────────────────────────────
-# COLUMN DEFINITIONS
-# ─────────────────────────────────────────────────────────────
-DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
-SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
-DATE_FEAT_COUNT = 4
-FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
-
-# ─────────────────────────────────────────────────────────────
-# FEATURE NAMES
-# ─────────────────────────────────────────────────────────────
-feature_names = []
-for day_pos in range(TRAIN_DAYS):
-    days_back = TRAIN_DAYS - day_pos
-    day_label = f"day_minus{days_back}"
-    for h in HOURS:
-        feature_names.append(f"dSocdt_h{h}_{day_label}")
-    for h in HOURS:
-        feature_names.append(f"Soc_h{h}_{day_label}")
-    feature_names.append(f"dayofweek_{day_label}")
-    feature_names.append(f"day_{day_label}")
-    feature_names.append(f"month_{day_label}")
-    feature_names.append(f"year_{day_label}")
-
-assert len(feature_names) == TRAIN_DAYS * FEATS_PER_DAY
-feat_arr = np.array(feature_names)
+PAGE_W, PAGE_H = A4
+MARGIN = 2.2 * cm
 
 
 # ─────────────────────────────────────────────────────────────
-# FEATURE TYPE TAGS
+# STYLES
 # ─────────────────────────────────────────────────────────────
-def feat_type(name):
-    if name.startswith("dSocdt"): return "dSocdt"
-    if name.startswith("Soc"):    return "Soc"
-    return "Date"
+base_styles = getSampleStyleSheet()
 
-def feat_days_back(name):
-    if "day_minus" in name:
-        return int(name.split("day_minus")[-1])
-    return None
+def make_styles():
+    s = {}
+    s["title"] = ParagraphStyle(
+        "ReportTitle", parent=base_styles["Title"],
+        fontSize=22, textColor=colors.HexColor("#1a2e4a"),
+        spaceAfter=6, alignment=TA_CENTER, fontName="Helvetica-Bold"
+    )
+    s["subtitle"] = ParagraphStyle(
+        "Subtitle", parent=base_styles["Normal"],
+        fontSize=12, textColor=colors.HexColor("#4a6fa5"),
+        spaceAfter=4, alignment=TA_CENTER, fontName="Helvetica"
+    )
+    s["h1"] = ParagraphStyle(
+        "H1", parent=base_styles["Heading1"],
+        fontSize=15, textColor=colors.HexColor("#1a2e4a"),
+        spaceBefore=18, spaceAfter=6,
+        borderPad=4, fontName="Helvetica-Bold",
+        borderWidth=0, leading=18
+    )
+    s["h2"] = ParagraphStyle(
+        "H2", parent=base_styles["Heading2"],
+        fontSize=12, textColor=colors.HexColor("#2c5282"),
+        spaceBefore=12, spaceAfter=4, fontName="Helvetica-Bold"
+    )
+    s["h3"] = ParagraphStyle(
+        "H3", parent=base_styles["Heading3"],
+        fontSize=10.5, textColor=colors.HexColor("#2d3748"),
+        spaceBefore=8, spaceAfter=3, fontName="Helvetica-BoldOblique"
+    )
+    s["body"] = ParagraphStyle(
+        "Body", parent=base_styles["Normal"],
+        fontSize=10, leading=15, spaceAfter=6,
+        alignment=TA_JUSTIFY, fontName="Helvetica"
+    )
+    s["bullet"] = ParagraphStyle(
+        "Bullet", parent=base_styles["Normal"],
+        fontSize=10, leading=14, spaceAfter=3,
+        leftIndent=16, firstLineIndent=-10,
+        fontName="Helvetica"
+    )
+    s["code"] = ParagraphStyle(
+        "Code", parent=base_styles["Code"],
+        fontSize=8.5, leading=12, spaceAfter=4,
+        backColor=colors.HexColor("#f7fafc"),
+        borderColor=colors.HexColor("#cbd5e0"),
+        borderWidth=0.5, borderPad=6,
+        fontName="Courier"
+    )
+    s["caption"] = ParagraphStyle(
+        "Caption", parent=base_styles["Normal"],
+        fontSize=8.5, textColor=colors.HexColor("#718096"),
+        alignment=TA_CENTER, spaceAfter=8, fontName="Helvetica-Oblique"
+    )
+    s["toc"] = ParagraphStyle(
+        "TOC", parent=base_styles["Normal"],
+        fontSize=10.5, leading=18, fontName="Helvetica",
+        textColor=colors.HexColor("#2d3748")
+    )
+    return s
 
-feat_types     = np.array([feat_type(f)      for f in feature_names])
-feat_days_back_arr = np.array([feat_days_back(f) for f in feature_names])
+S = make_styles()
 
 
 # ─────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────
-def date_feats(date_str):
-    ts = pd.Timestamp(date_str)
-    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
 
-def build_padded_feature_row(wide, context_start, context_end, pad_days):
-    feats = [0.0] * (pad_days * FEATS_PER_DAY)
-    for i in range(context_start, context_end):
-        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
-        feats.extend(wide.iloc[i][SOC_COLS].tolist())
-        feats.extend(date_feats(wide.index[i]))
-    return feats
+def hr(color="#cbd5e0", thickness=0.5):
+    return HRFlowable(width="100%", thickness=thickness,
+                      color=colors.HexColor(color), spaceAfter=6, spaceBefore=2)
 
 
-# ─────────────────────────────────────────────────────────────
-# LOAD DATA & TRAIN
-# ─────────────────────────────────────────────────────────────
-def load_and_train():
-    all_X, all_y = [], []
-    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
-    if not wide_files:
-        raise FileNotFoundError(f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'.")
-
-    for wf in wide_files:
-        print(f"  Loading: {os.path.basename(wf)}")
-        wide = pd.read_csv(wf, index_col="Date")
-        wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
-        if len(wide) <= TRAIN_DAYS:
-            continue
-        for predict_day_idx in range(TRAIN_DAYS, len(wide)):
-            train_start = predict_day_idx - TRAIN_DAYS
-            for k in range(1, TRAIN_DAYS):
-                pad_days = TRAIN_DAYS - k
-                feats  = build_padded_feature_row(
-                    wide, train_start, train_start + k, pad_days)
-                target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
-                all_X.append(feats)
-                all_y.append(target)
-
-    X = np.array(all_X, dtype=float)
-    y = np.array(all_y, dtype=float)
-    print(f"\n  Samples: {len(X)}  |  Features: {X.shape[1]}")
-    print("  Training XGBoost...")
-    model = MultiOutputRegressor(XGBRegressor(**BEST_PARAMS), n_jobs=-1)
-    model.fit(X, y)
-    print("  Done.\n")
-    return model, X, y
+def section_header(text, level="h1"):
+    return [hr("#2c5282" if level == "h1" else "#a0aec0",
+               thickness=1.5 if level == "h1" else 0.5),
+            Paragraph(text, S[level]),
+            Spacer(1, 0.2 * cm)]
 
 
-# ─────────────────────────────────────────────────────────────
-# SHAP ANALYSIS  (per-hour estimator)
-# ─────────────────────────────────────────────────────────────
-def compute_shap_for_hour(estimator, X_explain):
-    """
-    Use SHAP TreeExplainer — exact and fast for XGBoost tree models.
-    Returns shap_values array of shape (n_samples, n_features)
-    and the base value (expected model output).
-    """
-    explainer   = shap.TreeExplainer(estimator)
-    shap_values = explainer.shap_values(X_explain)   # (n_samples, n_features)
-    base_value  = explainer.expected_value
-    return shap_values, base_value
+def body(text):
+    return Paragraph(text, S["body"])
 
 
-# ─────────────────────────────────────────────────────────────
-# PLOT 1 — Summary bar (mean |SHAP| global importance)
-# ─────────────────────────────────────────────────────────────
-def plot_summary_bar(mean_abs_shap, top_n=30):
-    """
-    Mean absolute SHAP value per feature averaged across all 24 output hours.
-    This is the SHAP equivalent of feature importance —
-    but measured in prediction units (dSocdt units) not arbitrary gain scores.
-    """
-    df = pd.DataFrame({
-        "feature"     : feature_names,
-        "mean_abs_shap": mean_abs_shap,
-        "type"        : feat_types,
-    }).sort_values("mean_abs_shap", ascending=False).head(top_n)
-
-    color_map  = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
-    bar_colors = [color_map[t] for t in df["type"]]
-
-    fig, ax = plt.subplots(figsize=(12, 9))
-    ax.barh(range(len(df)), df["mean_abs_shap"].values,
-            color=bar_colors, edgecolor="white", linewidth=0.4)
-    ax.set_yticks(range(len(df)))
-    ax.set_yticklabels(df["feature"].values, fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlabel("Mean |SHAP value|  (avg over all samples & output hours)\n"
-                  "= average impact on predicted dSocdt in dSocdt units", fontsize=10)
-    ax.set_title(f"SHAP Global Feature Importance — Top {top_n} Features\n"
-                 "(higher = feature shifts predictions more on average)",
-                 fontsize=12, fontweight="bold")
-
-    from matplotlib.patches import Patch
-    ax.legend(handles=[
-        Patch(facecolor="steelblue",  label="dSocdt features"),
-        Patch(facecolor="darkorange", label="Soc features"),
-        Patch(facecolor="seagreen",   label="Date features"),
-    ], fontsize=9, loc="lower right")
-    ax.grid(axis="x", linestyle="--", alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_FOLDER, "shap_summary_bar.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
+def bullet(text, symbol="•"):
+    return Paragraph(f"{symbol}  {text}", S["bullet"])
 
 
-# ─────────────────────────────────────────────────────────────
-# PLOT 2 — Beeswarm (SHAP value vs feature value — shows direction)
-# ─────────────────────────────────────────────────────────────
-def plot_beeswarm(shap_matrix, X_explain, top_n=20):
-    """
-    For the top N features by mean |SHAP|:
-      X-axis = SHAP value (negative = pushes prediction more negative/discharge)
-      Y-axis = feature rank
-      Color  = actual feature value (blue=low, red=high)
+def caption(text):
+    return Paragraph(text, S["caption"])
 
-    This directly shows: "does high SoC push prediction up or down?"
-    """
-    mean_abs = np.abs(shap_matrix).mean(axis=0)
-    top_idx  = np.argsort(mean_abs)[::-1][:top_n]
 
-    fig, ax = plt.subplots(figsize=(13, 9))
+def sp(h=0.3):
+    return Spacer(1, h * cm)
 
-    y_positions = list(range(top_n))
-    for yi, fi in enumerate(top_idx):
-        sv  = shap_matrix[:, fi]           # SHAP values for this feature
-        fv  = X_explain[:, fi]             # actual feature values
-        # Normalize feature values to [0,1] for coloring
-        fv_norm = (fv - fv.min()) / ((fv.max() - fv.min()) + 1e-9)
-        # Jitter y slightly so points don't overlap
-        jitter = np.random.uniform(-0.3, 0.3, size=len(sv))
-        sc = ax.scatter(sv, yi + jitter, c=fv_norm,
-                        cmap="RdBu_r", alpha=0.5, s=8, linewidths=0)
 
-    ax.set_yticks(y_positions)
-    ax.set_yticklabels([feature_names[i] for i in top_idx], fontsize=8)
-    ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
-    ax.set_xlabel("SHAP value\n"
-                  "(negative = pushes prediction toward more discharge  |  "
-                  "positive = pushes toward less discharge / charging)",
-                  fontsize=10)
-    ax.set_title(f"SHAP Beeswarm Plot — Top {top_n} Features\n"
-                 "Color: blue = low feature value,  red = high feature value",
-                 fontsize=12, fontweight="bold")
+def insert_image(path, width_cm=14, caption_text=None, max_height_cm=10):
+    """Insert image if file exists, otherwise insert a placeholder note."""
+    elems = []
+    if path and os.path.exists(path):
+        img_w = width_cm * cm
+        img_h = min(max_height_cm * cm, img_w * 0.6)
+        try:
+            elems.append(Image(path, width=img_w, height=img_h,
+                               kind="proportional"))
+        except Exception:
+            elems.append(body(f"[Image could not be loaded: {os.path.basename(path)}]"))
+    else:
+        name = os.path.basename(path) if path else "image"
+        elems.append(Paragraph(
+            f'<font color="#a0aec0"><i>[Plot not found: {name} — '
+            f'run the corresponding script to generate it]</i></font>',
+            S["body"]
+        ))
+    if caption_text:
+        elems.append(caption(caption_text))
+    elems.append(sp(0.3))
+    return elems
 
-    cbar = plt.colorbar(sc, ax=ax, pad=0.01)
-    cbar.set_label("Feature value\n(relative: blue=low, red=high)", fontsize=8)
-    ax.grid(axis="x", linestyle="--", alpha=0.3)
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_FOLDER, "shap_summary_beeswarm.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
+
+def glob_first(pattern):
+    """Return first file matching glob pattern, or None."""
+    matches = sorted(glob.glob(pattern))
+    return matches[0] if matches else None
+
+
+def glob_all(pattern):
+    return sorted(glob.glob(pattern))
+
+
+def kv_table(rows, col_widths=None):
+    """Two-column key-value table."""
+    if col_widths is None:
+        col_widths = [5 * cm, 10 * cm]
+    t = Table(rows, colWidths=col_widths)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#edf2f7")),
+        ("TEXTCOLOR",  (0, 0), (0, -1), colors.HexColor("#2d3748")),
+        ("FONTNAME",   (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME",   (1, 0), (1, -1), "Helvetica"),
+        ("FONTSIZE",   (0, 0), (-1, -1), 9.5),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1),
+         [colors.white, colors.HexColor("#f7fafc")]),
+        ("GRID",       (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e0")),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+    ]))
+    return t
+
+
+def results_table(header, rows):
+    """General styled table with header row."""
+    data = [header] + rows
+    col_w = (PAGE_W - 2 * MARGIN) / len(header)
+    t = Table(data, colWidths=[col_w] * len(header))
+    t.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#2c5282")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME",    (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE",    (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.white, colors.HexColor("#ebf4ff")]),
+        ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#bee3f8")),
+        ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",  (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    return t
 
 
 # ─────────────────────────────────────────────────────────────
-# PLOT 3 — SHAP impact grouped by feature type
+# COVER PAGE
 # ─────────────────────────────────────────────────────────────
-def plot_by_type(mean_abs_shap):
-    type_totals = {}
-    for ftype in ["dSocdt", "Soc", "Date"]:
-        mask = feat_types == ftype
-        type_totals[ftype] = mean_abs_shap[mask].sum()
 
-    fig, ax = plt.subplots(figsize=(7, 5))
-    colors = ["steelblue", "darkorange", "seagreen"]
-    bars   = ax.bar(list(type_totals.keys()), list(type_totals.values()),
-                    color=colors, edgecolor="white", width=0.5)
-    for bar, val in zip(bars, type_totals.values()):
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.001, f"{val:.4f}",
-                ha="center", va="bottom", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Total mean |SHAP| across all features of that type", fontsize=10)
-    ax.set_title("SHAP Impact by Feature Category\n"
-                 "(which type of input drives predictions most)",
-                 fontsize=12, fontweight="bold")
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_FOLDER, "shap_by_type.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
+def cover_page():
+    elems = []
+    elems.append(sp(3))
+    elems.append(Paragraph(
+        "Predictive Battery Management", S["title"]))
+    elems.append(Paragraph(
+        "Through Usage Pattern Recognition", S["title"]))
+    elems.append(sp(0.5))
+    elems.append(hr("#4a6fa5", thickness=2))
+    elems.append(sp(0.4))
+    elems.append(Paragraph("Project Progress Report", S["subtitle"]))
+    elems.append(sp(3))
 
-
-# ─────────────────────────────────────────────────────────────
-# PLOT 4 — SHAP impact by recency (days back)
-# ─────────────────────────────────────────────────────────────
-def plot_by_recency(mean_abs_shap):
-    """
-    Shows whether the model relies more on recent days or older days.
-    Separate lines for dSocdt and Soc feature types.
-    """
-    records = []
-    for i, (name, mabs) in enumerate(zip(feature_names, mean_abs_shap)):
-        db = feat_days_back_arr[i]
-        if db is not None:
-            records.append({
-                "days_back"   : db,
-                "mean_abs_shap": mabs,
-                "feature_type": feat_types[i],
-            })
-    df = pd.DataFrame(records)
-    day_type = df.groupby(["days_back", "feature_type"])["mean_abs_shap"].sum().reset_index()
-    pivot    = day_type.pivot(index="days_back", columns="feature_type",
-                               values="mean_abs_shap").fillna(0)
-    pivot    = pivot.sort_index(ascending=False)   # most recent on left
-
-    fig, ax = plt.subplots(figsize=(14, 6))
-    color_map = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
-    for col in pivot.columns:
-        ax.plot(range(len(pivot)), pivot[col].values,
-                marker="o", linewidth=2, color=color_map.get(col, "gray"), label=col)
-
-    ax.set_xticks(range(len(pivot)))
-    ax.set_xticklabels([f"day-{d}" for d in pivot.index],
-                       rotation=45, ha="right", fontsize=9)
-    ax.set_xlabel("Days back from prediction day  (day-1 = yesterday)", fontsize=11)
-    ax.set_ylabel("Total mean |SHAP|  (summed over all features of that type)",
-                  fontsize=10)
-    ax.set_title("SHAP Impact by Recency\n"
-                 "Does the model rely more on recent days or older history?",
-                 fontsize=12, fontweight="bold")
-    ax.legend(fontsize=10)
-    ax.grid(linestyle="--", alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_FOLDER, "shap_by_recency.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
+    meta = [
+        ["Project"  , "Predictive Battery Management Through Usage Pattern Recognition"],
+        ["Model"    , "XGBoost (Daily Rolling-Window, Sequential Hyperparameter Tuning)"],
+        ["Status"   , "In Progress"],
+        ["Scope"    , "Data Preprocessing  |  Statistical Analysis  |  Model Training & Evaluation"],
+    ]
+    elems.append(kv_table(meta, col_widths=[3.5 * cm, 11.5 * cm]))
+    elems.append(sp(1))
+    elems.append(Paragraph(
+        "This document summarises all work completed so far on the battery "
+        "management project. It covers raw data preprocessing, hourly resampling, "
+        "long-range dependence analysis (autocorrelation and Hurst exponent), "
+        "XGBoost model training using a daily rolling window, hyperparameter tuning "
+        "via sequential coordinate-wise search, and final validation results. "
+        "The report will continue to be updated as further work is completed.",
+        S["body"]
+    ))
+    elems.append(PageBreak())
+    return elems
 
 
 # ─────────────────────────────────────────────────────────────
-# PLOT 5 — Dependence plots for top 4 features
-# (shows feature interaction automatically via coloring)
+# TABLE OF CONTENTS
 # ─────────────────────────────────────────────────────────────
-def plot_dependence(shap_matrix, X_explain, mean_abs_shap):
-    """
-    For each of the top 4 features:
-      X-axis  = actual feature value
-      Y-axis  = SHAP value for that feature
-      Color   = value of the most-interacting feature (found automatically)
 
-    This reveals:
-      - Direction: does high SoC push prediction up or down?
-      - Non-linearity: is the relationship step-like or gradual?
-      - Interaction: does the color pattern reveal conditional effects?
-    """
-    top4_idx = np.argsort(mean_abs_shap)[::-1][:4]
+def toc():
+    elems = []
+    elems += section_header("Table of Contents", "h1")
+    sections = [
+        ("1", "Project Overview & Problem Statement"),
+        ("2", "Dataset Description & File Structure"),
+        ("3", "Step 1 — Data Preprocessing & Hourly Resampling"),
+        ("4", "Step 2 — Statistical Analysis  (Autocorrelation & Hurst Exponent)"),
+        ("5", "Step 3 — Data Format Transformation  (Wide Daily Format)"),
+        ("6", "Step 4 — XGBoost Model  (Daily Rolling-Window Training)"),
+        ("6.1", "  Feature Engineering"),
+        ("6.2", "  Training Strategy"),
+        ("6.3", "  Accuracy Metric"),
+        ("7", "Step 5 — Hyperparameter Tuning  (Sequential Coordinate Search)"),
+        ("7.1", "  n_estimators"),
+        ("7.2", "  max_depth"),
+        ("7.3", "  learning_rate"),
+        ("7.4", "  subsample"),
+        ("8", "Step 6 — Final Combined Validation"),
+        ("9", "Step 7 — Feature Importance Analysis"),
+        ("10", "Next Steps"),
+    ]
+    for num, title in sections:
+        dot_leader = "." * max(1, 60 - len(num) - len(title))
+        elems.append(Paragraph(
+            f'<font name="Helvetica-Bold">{num}</font>  {title}',
+            S["toc"]
+        ))
+    elems.append(PageBreak())
+    return elems
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    axes = axes.flatten()
 
-    for plot_i, fi in enumerate(top4_idx):
-        ax       = axes[plot_i]
-        feat_sv  = shap_matrix[:, fi]
-        feat_fv  = X_explain[:, fi]
+# ─────────────────────────────────────────────────────────────
+# SECTION 1 — PROJECT OVERVIEW
+# ─────────────────────────────────────────────────────────────
 
-        # Find most-interacting feature: highest correlation between
-        # residual SHAP (after removing main effect) and other feature values
-        interaction_fi = fi
-        best_corr      = -1
-        for candidate in range(shap_matrix.shape[1]):
-            if candidate == fi:
-                continue
-            try:
-                corr = abs(np.corrcoef(feat_sv, X_explain[:, candidate])[0, 1])
-                if corr > best_corr:
-                    best_corr      = corr
-                    interaction_fi = candidate
-            except Exception:
-                continue
+def section_overview():
+    elems = []
+    elems += section_header("1.  Project Overview & Problem Statement", "h1")
+    elems.append(body(
+        "The goal of this project is to predict future battery usage patterns "
+        "of mobile devices by learning from historical State-of-Charge (SoC) "
+        "time-series data. Accurate prediction of discharge behaviour enables "
+        "intelligent suggestions to users — such as optimal charging times, "
+        "expected battery life, and anomaly detection for degraded cells."
+    ))
+    elems.append(sp(0.5))
+    return elems
 
-        color_fv   = X_explain[:, interaction_fi]
-        color_norm = (color_fv - color_fv.min()) / ((color_fv.max() - color_fv.min()) + 1e-9)
-        sc = ax.scatter(feat_fv, feat_sv, c=color_norm, cmap="RdBu_r",
-                        alpha=0.5, s=10, linewidths=0)
-        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
-        ax.set_xlabel(f"{feature_names[fi]}", fontsize=8)
-        ax.set_ylabel("SHAP value", fontsize=9)
-        ax.set_title(
-            f"Dependence: {feature_names[fi]}\n"
-            f"Color = {feature_names[interaction_fi]}  "
-            f"(interaction, corr={best_corr:.2f})",
-            fontsize=8.5, fontweight="bold"
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 2 — DATASET & FILE STRUCTURE
+# ─────────────────────────────────────────────────────────────
+
+def section_dataset():
+    elems = []
+    elems += section_header("2.  Dataset Description & File Structure", "h1")
+    elems.append(body(
+        "Multiple CSV files are provided, each corresponding to one device/user. "
+        "Each file contains raw time-stamped SoC readings collected at irregular "
+        "intervals (median gap ~15 minutes, max gap up to 18 days in some files). "
+        "The data spans approximately 70 days per device."
+    ))
+    elems += section_header("Raw Data Columns", "h2")
+    col_rows = [
+        ["ID",             "Device identifier (ignored in modelling)"],
+        ["TimeStamp",      "Unix timestamp (ignored in modelling)"],
+        ["ChargingStatus", "0 = discharging, 1 = charging"],
+        ["Soc",            "State of Charge — current battery percentage (0–100)"],
+        ["DischargeLevel", "Raw discharge counter (used in resampling only)"],
+        ["DateTime",       "Human-readable timestamp (yyyy-mm-dd HH:MM:SS)"],
+        ["dSocdt",         "Rate of change of SoC from previous sample (+ve = charging, -ve = discharging, 0 = idle)"],
+    ]
+    elems.append(kv_table(col_rows, col_widths=[3.8 * cm, 11.2 * cm]))
+    elems.append(sp(0.4))
+
+    elems += section_header("Project File Structure", "h2")
+    elems.append(Paragraph(
+        '<font name="Courier" size="8.5">'
+        'SOC-folder/<br/>'
+        '&nbsp;&nbsp;results/<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;ac_hc_plots/&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Autocorrelation &amp; Hurst exponent plots<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;resampled_csv/&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Hourly-resampled CSVs (one per device)<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;wide_csv/&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Pivoted daily-wide CSVs<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;xgboost/<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;feature_importance/&nbsp;&nbsp;← Feature importance plots<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;final_validation/&nbsp;&nbsp;&nbsp;&nbsp;← Final predictions &amp; accuracy plots<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;hypersearch/<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;validation_curves/&nbsp;&nbsp;&nbsp;← Val curve plots per hyperparameter<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;best_*.json&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Best value per hyperparameter<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;checkpoint_*.json&nbsp;&nbsp;&nbsp;&nbsp;← Resume checkpoints<br/>'
+        '&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;results_*.csv&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Raw tuning results<br/>'
+        '&nbsp;&nbsp;battery_analysis.py&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← Resampling + AC/HC analysis<br/>'
+        '&nbsp;&nbsp;battery_xgboost.py&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← XGBoost daily rolling window<br/>'
+        '&nbsp;&nbsp;battery_hypersearch.py&nbsp;&nbsp;&nbsp;&nbsp;← Sequential hyperparameter tuning<br/>'
+        '&nbsp;&nbsp;battery_final_validation.py← Final combined validation<br/>'
+        '&nbsp;&nbsp;battery_feature_import.py&nbsp;&nbsp;← Feature importance analysis<br/>'
+        '&nbsp;&nbsp;generate_report.py&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;← This script<br/>'
+        '</font>', S["body"]
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 3 — PREPROCESSING
+# ─────────────────────────────────────────────────────────────
+
+def section_preprocessing():
+    elems = []
+    elems += section_header("3.  Step 1 — Data Preprocessing & Hourly Resampling", "h1")
+    elems.append(body(
+        "The raw CSV files contain samples at irregular intervals. The project "
+        "requires uniformly-spaced hourly data for consistent model training. "
+        "The following preprocessing pipeline is applied to every raw CSV file "
+        "via <b>battery_analysis.py</b>:"
+    ))
+    steps = [
+        "Parse DateTime column with mixed-format UTC timestamps; convert to IST (Asia/Kolkata) and strip timezone.",
+        "Sort by timestamp and set as index.",
+        "Create a clean hourly DatetimeIndex spanning start to end of data.",
+        "Apply time-based linear interpolation on Soc and DischargeLevel columns to fill gaps.",
+        "Re-derive dSocdt as the hourly difference of interpolated Soc.",
+        "Re-derive all categorical columns (dayofweek, dayname, month, monthname) from the timestamp.",
+        "Re-derive ChargingStatus from sign of interpolated dSocdt (+ve → 1, else → 0).",
+        "Save resampled output to results/resampled_csv/<device>_hourly.csv.",
+    ]
+    for s in steps:
+        elems.append(bullet(s))
+    elems.append(sp(0.3))
+
+    elems.append(kv_table([
+        ["Input"      , "Raw CSVs with irregular timestamps (median gap ~15 min)"],
+        ["Output"     , "Hourly CSVs — one row per hour, every hour, start to end"],
+        ["Method"     , "pandas interpolate(method='time') — time-weighted linear"],
+        ["Columns interpolated", "Soc, DischargeLevel, dSocdt"],
+        ["Columns re-derived"  , "ChargingStatus, dayofweek, dayname, month, monthname"],
+    ], col_widths=[4.5 * cm, 10.5 * cm]))
+    elems.append(sp(0.5))
+
+    elems += section_header("Charging vs Discharging", "h2")
+    elems.append(body(
+        "A core principle of this project is to model only device <i>usage</i> "
+        "patterns, not charging behaviour. Therefore, all samples where "
+        "<b>dSocdt &gt; 0</b> (charging) are excluded from statistical analysis "
+        "and their dSocdt values are zeroed out before model training. "
+        "Samples where dSocdt = 0 are also treated as neutral and ignored."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 4 — AC & HURST
+# ─────────────────────────────────────────────────────────────
+
+def section_statistical():
+    elems = []
+    elems += section_header(
+        "4.  Step 2 — Statistical Analysis (Autocorrelation & Hurst Exponent)", "h1")
+    elems.append(body(
+        "Before training any predictive model, a key research question was "
+        "investigated: <i>does the discharge behaviour of a user exhibit "
+        "long-range temporal dependence?</i> If past patterns genuinely "
+        "influence future patterns over weeks, then sequence-aware models "
+        "should outperform pattern-clustering approaches like SOM."
+    ))
+
+    elems += section_header("4.1  Autocorrelation Analysis", "h2")
+    elems.append(body(
+        "Pearson autocorrelation of the dSocdt discharge series was computed "
+        "at lags 0 to 504 hours (3 weeks) for each device. Only discharge "
+        "samples (dSocdt &lt; 0) were used. The 95% confidence bounds "
+        "(Bartlett approximation: ±1.96/√n) are overlaid. Vertical markers "
+        "indicate daily (24h) and weekly (168h) periods."
+    ))
+
+    # Insert first AC plot found
+    ac_plots = glob_all(os.path.join(PATHS["ac_hc_plots"], "*autocorr*.png"))
+    if ac_plots:
+        elems += insert_image(ac_plots[0], width_cm=15,
+                              caption_text="Figure 1: Autocorrelation of dSocdt (discharge only) — lags 0 to 504 hours")
+    else:
+        elems += insert_image(None, caption_text="Figure 1: Autocorrelation plot (run battery_analysis.py to generate)")
+
+    elems += section_header("4.2  Hurst Exponent (R/S Analysis)", "h2")
+    elems.append(body(
+        "The Hurst exponent H is estimated via Rescaled Range (R/S) analysis "
+        "over log-spaced window sizes from 24 to 504 hours. H is the slope of "
+        "the fitted line on the log(R/S) vs log(n) plot:"
+    ))
+    elems.append(bullet("H &gt; 0.5 → Persistent (long-range dependence) — past behaviour predicts future"))
+    elems.append(bullet("H ≈ 0.5 → Random walk — no exploitable pattern"))
+    elems.append(bullet("H &lt; 0.5 → Anti-persistent — mean-reverting series"))
+    elems.append(sp(0.2))
+
+    hc_plots = glob_all(os.path.join(PATHS["ac_hc_plots"], "*hurst*.png"))
+    if hc_plots:
+        elems += insert_image(hc_plots[0], width_cm=13,
+                              caption_text="Figure 2: Hurst exponent R/S analysis — slope = H")
+    else:
+        elems += insert_image(None, caption_text="Figure 2: Hurst exponent plot")
+
+    elems += section_header("4.3  Results Across All Devices", "h2")
+    elems.append(body(
+        "After running battery_analysis.py on all device files, the following "
+        "distribution of Hurst exponents was observed:"
+    ))
+    h_rows = [
+        ["H &gt; 0.7 (Strong persistence)",   "Majority of devices", "Strong long-range dependence — highly predictable patterns"],
+        ["H = 0.5–0.6 (Mild persistence)",     "Few devices",         "Some structure but weaker signal"],
+        ["H = 0.4–0.5 (Near random / anti)",   "Rare",                "Limited predictability for these users"],
+    ]
+    elems.append(results_table(
+        ["Hurst Range", "Frequency", "Interpretation"], h_rows))
+    elems.append(sp(0.3))
+    elems.append(body(
+        "<b>Conclusion:</b> The majority of devices show strong long-range "
+        "dependence (H &gt; 0.7), confirming that sequence-aware models such as "
+        "XGBoost with temporal feature engineering should outperform SOM-based "
+        "clustering. This finding directly motivates the model choice."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 5 — WIDE FORMAT
+# ─────────────────────────────────────────────────────────────
+
+def section_wide_format():
+    elems = []
+    elems += section_header(
+        "5.  Step 3 — Data Format Transformation (Wide Daily Format)", "h1")
+    elems.append(body(
+        "XGBoost requires a tabular feature matrix. To convert the hourly "
+        "time-series into a form suitable for daily prediction, the resampled "
+        "CSVs are pivoted into a <b>wide daily format</b> via <b>battery_xgboost.py</b>:"
+    ))
+    elems.append(kv_table([
+        ["Rows"   , "One row per calendar date"],
+        ["Columns", "dSocdt_h0 … dSocdt_h23  |  Soc_h0 … Soc_h23  (48 columns)"],
+        ["dSocdt" , "+ve values clipped to 0 (charging effect removed)"],
+        ["Soc"    , "Forward/backward filled within each day for any missing hours"],
+        ["Saved to", "results/wide_csv/<device>_wide.csv"],
+    ], col_widths=[3.5 * cm, 11.5 * cm]))
+    elems.append(sp(0.3))
+    elems.append(body(
+        "This wide format means each row represents a full day's 24-hour "
+        "discharge profile, which becomes both the training target and "
+        "part of the feature context for adjacent rows."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 6 — XGBOOST MODEL
+# ─────────────────────────────────────────────────────────────
+
+def section_model():
+    elems = []
+    elems += section_header(
+        "6.  Step 4 — XGBoost Model (Daily Rolling-Window Training)", "h1")
+    elems.append(body(
+        "The core prediction model uses XGBoost with a MultiOutputRegressor "
+        "wrapper (one tree per output hour) trained in a daily rolling-window "
+        "fashion. The prediction target is the 24-hour dSocdt profile of the "
+        "next day."
+    ))
+
+    elems += section_header("6.1  Feature Engineering", "h2")
+    elems.append(body(
+        "For each prediction day, the full 14-day training window is flattened "
+        "into a single feature vector. Per training day, the following features "
+        "are included:"
+    ))
+    elems.append(bullet("24 dSocdt values  (hourly discharge rates, charging zeroed out)"))
+    elems.append(bullet("24 Soc values  (hourly state of charge)"))
+    elems.append(bullet("Day of week  (Monday=0 … Sunday=6)"))
+    elems.append(bullet("Day of month  (1–31)"))
+    elems.append(bullet("Month  (1–12)"))
+    elems.append(bullet("Year  (e.g. 2024)"))
+    elems.append(sp(0.2))
+    elems.append(kv_table([
+        ["Features per day"   , "24 + 24 + 4 = 52"],
+        ["Training window"    , "14 days"],
+        ["Total feature vector", "14 × 52 = 728 features"],
+        ["Output"             , "24 dSocdt values for the next day (h0 … h23)"],
+    ], col_widths=[4 * cm, 11 * cm]))
+
+    elems += section_header("6.2  Training Strategy", "h2")
+    elems.append(body(
+        "Because each prediction iteration has only 13 labelled training samples "
+        "(expanding sub-windows within the 14-day block), a zero-padded expanding "
+        "context strategy is used:"
+    ))
+    elems.append(bullet(
+        "Sample k: use days [train_start … train_start+k-1] as context, "
+        "padded with zeros at front, to predict day train_start+k (k = 1 … 13)"))
+    elems.append(bullet(
+        "This generates 13 training samples per prediction — sufficient for XGBoost "
+        "without data leakage from the unseen test day."))
+    elems.append(bullet(
+        "The actual prediction uses the full real 14-day window as context → "
+        "predicts the immediately next unseen day."))
+    elems.append(bullet(
+        "Predictions are clipped to ≤ 0 (discharge can never be positive)."))
+    elems.append(bullet(
+        "Always uses ACTUAL past values — no predicted values fed back."))
+
+    elems += section_header("6.3  Accuracy Metric", "h2")
+    elems.append(body(
+        "A prediction for a given hour is counted as <b>correct</b> if "
+        "|predicted dSocdt − actual dSocdt| ≤ threshold (set to 2.0 in this project). "
+        "Accuracy for a day = percentage of 24 hours that are correct. "
+        "Device accuracy = mean of all daily accuracies. "
+        "Overall accuracy = mean across all devices."
+    ))
+    elems.append(body(
+        "MAE and RMSE are also recorded per day and per device as secondary metrics."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# SECTION 7 — HYPERPARAMETER TUNING
+# ─────────────────────────────────────────────────────────────
+
+def section_hyperparam():
+    elems = []
+    elems += section_header(
+        "7.  Step 5 — Hyperparameter Tuning (Sequential Coordinate Search)", "h1")
+    elems.append(body(
+        "Full grid search over all hyperparameter combinations was infeasible "
+        "(each combination takes ~40 minutes across all devices). Instead, a "
+        "<b>sequential coordinate-wise search</b> was used: tune one parameter "
+        "at a time while fixing all others, then carry forward the best value "
+        "found to the next parameter. This is implemented in "
+        "<b>battery_hypersearch.py</b> with checkpoint-based resumability."
+    ))
+    elems.append(body(
+        "The script uses joblib parallelism across CPU cores and writes each "
+        "result to disk immediately, so interrupted runs resume from exactly "
+        "where they stopped."
+    ))
+    elems.append(sp(0.3))
+
+    param_order = [
+        ("7.1", "n_estimators", "[10,25,50,75,100,125,150,200,250,300,350]",
+         "25", "checkpoint_n_estimators.json", "val_curve_n_estimators.png"),
+        ("7.2", "max_depth",     "[2, 3, 4, 5]",
+         "2",   "checkpoint_max_depth.json",    "val_curve_max_depth.png"),
+        ("7.3", "learning_rate", "[0.01, 0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.21, 0.24]",
+         "0.05","checkpoint_learning_rate.json","val_curve_learning_rate.png"),
+        ("7.4", "subsample",     "[0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0]",
+         "0.95", "checkpoint_subsample.json",    "val_curve_subsample.png"),
+    ]
+
+    for num, pname, prange, pbest, ckfile, plotfile in param_order:
+        elems += section_header(f"{num}  {pname}", "h2")
+        elems.append(kv_table([
+            ["Values tested", prange],
+            ["Best value"   , pbest],
+            ["Checkpoint"   , ckfile],
+        ], col_widths=[3.5 * cm, 11.5 * cm]))
+        elems.append(sp(0.2))
+        plot_path = os.path.join(PATHS["val_curves"], plotfile)
+        elems += insert_image(
+            plot_path, width_cm=14,
+            caption_text=f"Figure: Validation curve for {pname} — accuracy vs parameter value across all devices"
         )
-        plt.colorbar(sc, ax=ax, label="Color feature\n(blue=low, red=high)",
-                     pad=0.01).ax.tick_params(labelsize=7)
-        ax.grid(linestyle="--", alpha=0.3)
 
-    fig.suptitle("SHAP Dependence Plots — Top 4 Features\n"
-                 "X-axis: feature value  |  Y-axis: SHAP impact  |  "
-                 "Color: most interacting feature",
-                 fontsize=12, fontweight="bold")
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_FOLDER, "shap_dependence_top4.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# PLOT 6 — Waterfall plots for individual predictions
-# (exactly like your ChatGPT example — explains one prediction at a time)
-# ─────────────────────────────────────────────────────────────
-def plot_waterfall_samples(all_hour_shap, all_hour_base,
-                           X_explain, y_explain, n_samples=6):
-    """
-    For n_samples randomly chosen prediction days, show a waterfall plot
-    for hour 18 (or the hour with most variance — representative hour).
-
-    Waterfall: base_value + sum of top feature contributions = final prediction.
-    Each bar shows how much one feature pushes prediction up or down.
-    """
-    # Use the hour with highest mean |SHAP| as the representative hour
-    hour_importance = [np.abs(sv).mean() for sv in all_hour_shap]
-    rep_hour        = int(np.argmax(hour_importance))
-
-    shap_h   = all_hour_shap[rep_hour]    # (n_samples, n_features)
-    base_h   = all_hour_base[rep_hour]
-    y_pred_h = base_h + shap_h.sum(axis=1)   # approximate final prediction
-
-    sample_indices = np.random.choice(len(X_explain), size=n_samples, replace=False)
-    sample_indices = sorted(sample_indices)
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    axes = axes.flatten()
-
-    for plot_i, si in enumerate(sample_indices):
-        ax       = axes[plot_i]
-        sv_i     = shap_h[si]               # (n_features,) for this sample
-        actual   = y_explain[si, rep_hour]
-        pred     = float(y_pred_h[si])
-
-        # Show top 10 contributing features for clarity
-        top_n    = 10
-        top_idx  = np.argsort(np.abs(sv_i))[::-1][:top_n]
-        top_sv   = sv_i[top_idx]
-        top_names= [feature_names[j] for j in top_idx]
-
-        # Build waterfall: cumulative sum from base
-        cumvals  = np.concatenate([[base_h], base_h + np.cumsum(top_sv)])
-        bar_starts  = cumvals[:-1]
-        bar_heights = top_sv
-
-        colors = ["crimson" if v < 0 else "steelblue" for v in bar_heights]
-
-        ax.barh(range(top_n), bar_heights, left=bar_starts,
-                color=colors, edgecolor="white", linewidth=0.5, height=0.6)
-        ax.axvline(base_h, color="gray",   linewidth=1.2, linestyle=":",
-                   label=f"Base: {base_h:.3f}")
-        ax.axvline(pred,   color="navy",   linewidth=1.5, linestyle="--",
-                   label=f"Pred: {pred:.3f}")
-        ax.axvline(actual, color="green",  linewidth=1.5, linestyle="-",
-                   label=f"Actual: {actual:.3f}")
-
-        ax.set_yticks(range(top_n))
-        ax.set_yticklabels(top_names, fontsize=7)
-        ax.set_xlabel("dSocdt prediction value", fontsize=8)
-        ax.set_title(f"Sample {si}  |  Hour {rep_hour:02d}:00\n"
-                     f"Actual={actual:.3f}  Pred={pred:.3f}",
-                     fontsize=8.5, fontweight="bold")
-        ax.legend(fontsize=7, loc="lower right")
-        ax.grid(axis="x", linestyle="--", alpha=0.3)
-
-        # Annotation: red = pushes more discharge, blue = pushes less
-        ax.text(0.01, 0.01,
-                "Red bars: push toward more discharge\n"
-                "Blue bars: push toward less discharge",
-                transform=ax.transAxes, fontsize=6.5,
-                color="gray", verticalalignment="bottom")
-
-    fig.suptitle(f"SHAP Waterfall Plots — {n_samples} Individual Predictions\n"
-                 f"Output Hour: {rep_hour:02d}:00  "
-                 f"(most impactful hour by mean |SHAP|)\n"
-                 "Each bar = one feature's contribution to the final prediction",
-                 fontsize=12, fontweight="bold")
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_FOLDER, "shap_waterfall_samples.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
+    elems += section_header("Final Selected Hyperparameters", "h2")
+    elems.append(results_table(
+        ["Parameter", "Values Tried", "Best Value", "Fixed In Next Steps"],
+        [
+            ["n_estimators",    "10–350", "25",  "Steps 2, 3, 4"],
+            ["max_depth",       "2, 3, 4, 5",           "2",    "Steps 3, 4"],
+            ["learning_rate",   "0.01–0.24",         "0.05", "Step 4"],
+            ["subsample",       "0.7–1.0",           "0.95",  "—"],
+            ["colsample_bytree","fixed",              "0.8",  "All steps"],
+        ]
+    ))
+    elems.append(sp(0.3))
+    elems.append(body(
+        "<b>Note on sequential tuning:</b> The best value of each parameter "
+        "is found conditional on the fixed values of previously tuned parameters. "
+        "This is an approximation of global optimisation but is practical given "
+        "runtime constraints. A final combined validation (Section 8) confirms "
+        "that the selected combination achieves the best overall accuracy."
+    ))
+    elems.append(PageBreak())
+    return elems
 
 
 # ─────────────────────────────────────────────────────────────
-# PLOT 7 — Heatmap: which features matter most per output hour
+# SECTION 8 — FINAL VALIDATION
 # ─────────────────────────────────────────────────────────────
-def plot_hour_heatmap(all_hour_shap, top_n=20):
-    """
-    Rows = top N features (by overall mean |SHAP|)
-    Cols = output hours 0–23
-    Cell = mean |SHAP| of that feature for that hour
 
-    Reveals: does dSocdt_h14 matter more for predicting midnight or noon?
-    """
-    # Build matrix: (n_features, 24)
-    hour_feat_matrix = np.stack(
-        [np.abs(sv).mean(axis=0) for sv in all_hour_shap], axis=1
-    )  # (n_features, 24)
+def section_final_validation():
+    elems = []
+    elems += section_header(
+        "8.  Step 6 — Final Combined Validation", "h1")
+    elems.append(body(
+        "After completing all four tuning steps, a final run of "
+        "<b>battery_final_validation.py</b> was executed with all best "
+        "hyperparameter values combined. This is the definitive accuracy "
+        "result used for comparison against the SOM baseline."
+    ))
+    elems.append(kv_table([
+        ["n_estimators",    "25"],
+        ["max_depth",       "2"],
+        ["learning_rate",   "0.05"],
+        ["subsample",       "0.95"],
+        ["colsample_bytree","0.8"],
+        ["Training window", "14 days (daily rolling, shift = 1 day)"],
+        ["Prediction",      "Next single day's 24-hour dSocdt profile"],
+        ["Accuracy metric", "|pred − actual| ≤ 2.0 for each hour"],
+    ], col_widths=[4 * cm, 11 * cm]))
+    elems.append(sp(0.4))
 
-    overall_importance = hour_feat_matrix.mean(axis=1)
-    top_idx  = np.argsort(overall_importance)[::-1][:top_n]
-    matrix   = hour_feat_matrix[top_idx, :]      # (top_n, 24)
-    ylabels  = [feature_names[i] for i in top_idx]
-
-    fig, ax = plt.subplots(figsize=(16, 8))
-    im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
-
-    ax.set_xticks(range(24))
-    ax.set_xticklabels([f"{h:02d}:00" for h in HOURS], rotation=45,
-                       ha="right", fontsize=8)
-    ax.set_yticks(range(top_n))
-    ax.set_yticklabels(ylabels, fontsize=8)
-    ax.set_xlabel("Output hour being predicted", fontsize=11)
-    ax.set_title(f"SHAP Feature Importance Heatmap\n"
-                 f"Top {top_n} features × all 24 output hours\n"
-                 "(darker = feature has more impact on that hour's prediction)",
-                 fontsize=12, fontweight="bold")
-    plt.colorbar(im, ax=ax, label="Mean |SHAP value|", pad=0.01)
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_FOLDER, "shap_hour_heatmap.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
+    # Insert one final validation plot
+    fv_plots = glob_all(os.path.join(PATHS["final_validation"], "*plot*.png"))
+    if fv_plots:
+        elems += insert_image(
+            fv_plots[0], width_cm=15,
+            caption_text="Figure: Final validation — daily accuracy, MAE, and actual vs predicted dSocdt"
+        )
+    elems.append(PageBreak())
+    return elems
 
 
 # ─────────────────────────────────────────────────────────────
-# SAVE CSV
+# SECTION 9 — FEATURE IMPORTANCE
 # ─────────────────────────────────────────────────────────────
-def save_csvs(mean_abs_shap_all_hours, all_hour_shap, X_explain):
-    # Feature summary CSV
-    summary = pd.DataFrame({
-        "feature"         : feature_names,
-        "mean_abs_shap"   : mean_abs_shap_all_hours,
-        "feature_type"    : feat_types,
-        "days_back"       : feat_days_back_arr,
-    }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
-    path1 = os.path.join(OUTPUT_FOLDER, "shap_feature_summary.csv")
-    summary.to_csv(path1, index=False)
-    print(f"  Saved: {path1}")
 
-    # Per-hour mean |SHAP| CSV
-    hour_rows = []
-    for h, sv in enumerate(all_hour_shap):
-        mean_abs = np.abs(sv).mean(axis=0)
-        for fi, val in enumerate(mean_abs):
-            hour_rows.append({
-                "hour"        : h,
-                "feature"     : feature_names[fi],
-                "mean_abs_shap": round(float(val), 8),
-                "feature_type": feat_types[fi],
-                "days_back"   : feat_days_back_arr[fi],
-            })
-    path2 = os.path.join(OUTPUT_FOLDER, "shap_values_by_hour.csv")
-    pd.DataFrame(hour_rows).to_csv(path2, index=False)
-    print(f"  Saved: {path2}")
+def section_feature_importance():
+    elems = []
+    elems += section_header("9.  Step 7 — Feature Importance Analysis", "h1")
+    elems.append(body(
+        "After finalising the model, XGBoost's built-in feature importance "
+        "scores (gain, weight, cover) were extracted and visualised using "
+        "<b>battery_feature_import.py</b>. This identifies which hours and "
+        "which types of features (dSocdt vs Soc vs date) contribute most "
+        "to prediction accuracy."
+    ))
+    fi_plots = glob_all(os.path.join(PATHS["feature_importance"], "*.png"))
+    for i, fp in enumerate(fi_plots[:3]):   # include up to 3 plots
+        elems += insert_image(
+            fp, width_cm=14,
+            caption_text=f"Figure: Feature importance — {os.path.basename(fp)}"
+        )
+    if not fi_plots:
+        elems += insert_image(
+            None,
+            caption_text="Feature importance plots (run battery_feature_import.py)"
+        )
+    elems.append(PageBreak())
+    return elems
 
 
 # ─────────────────────────────────────────────────────────────
-# MAIN
+# SECTION 10 — NEXT STEPS
 # ─────────────────────────────────────────────────────────────
+
+def section_next_steps():
+    elems = []
+    elems += section_header("10.  Next Steps", "h1")
+    next_items = [
+        "LSTM / Bidirectional LSTM model — compare against XGBoost using same daily rolling-window setup.",
+        "Cross-user generalisation — train on pooled data from multiple devices, test on held-out devices.",
+        "Threshold sensitivity analysis — evaluate how accuracy changes as ACC_THRESHOLD varies (1.0, 1.5, 2.0, 2.5).",
+        "Cosine similarity analysis — already partially generated; complete interpretation and include in report.",
+        "Final report write-up — formal academic-style documentation with literature comparison.",
+    ]
+    for item in next_items:
+        elems.append(bullet(item))
+    elems.append(sp(1))
+    elems.append(hr())
+    elems.append(Paragraph(
+        "<i>This report was auto-generated by generate_report.py. "
+        "Re-run at any time to refresh with the latest plots and results.</i>",
+        S["caption"]
+    ))
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# BUILD PDF
+# ─────────────────────────────────────────────────────────────
+
+def build_pdf():
+    doc = SimpleDocTemplate(
+        OUTPUT_PDF, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=MARGIN,
+        title="Battery Management Project Report",
+        author="Project Team",
+    )
+
+    story = []
+    story += cover_page()
+    story += toc()
+    story += section_overview()
+    story += section_dataset()
+    story += section_preprocessing()
+    story += section_statistical()
+    story += section_wide_format()
+    story += section_model()
+    story += section_hyperparam()
+    story += section_final_validation()
+    story += section_feature_importance()
+    story += section_next_steps()
+
+    doc.build(story)
+    print(f"\nReport generated:  {OUTPUT_PDF}")
+
+
 if __name__ == "__main__":
-
-    np.random.seed(42)
-
-    print("=" * 65)
-    print("SHAP ANALYSIS")
-    print("=" * 65 + "\n")
-
-    # 1. Train model
-    model, X_all, y_all = load_and_train()
-
-    # 2. Select subset to explain
-    total = len(X_all)
-    n_exp = min(N_EXPLAIN, total)
-    idx   = np.random.choice(total, size=n_exp, replace=False)
-    idx   = np.sort(idx)
-    X_exp = X_all[idx]
-    y_exp = y_all[idx]
-    print(f"Computing SHAP for {n_exp} samples across 24 output hours...\n")
-
-    # 3. Compute SHAP per hour
-    all_hour_shap = []
-    all_hour_base = []
-    for h, estimator in enumerate(model.estimators_):
-        print(f"  Hour {h:02d}:00 ...", end="  ", flush=True)
-        sv, bv = compute_shap_for_hour(estimator, X_exp)
-        all_hour_shap.append(sv)
-        all_hour_base.append(bv)
-        print(f"base={bv:.4f}  mean|SHAP|={np.abs(sv).mean():.5f}")
-
-    # 4. Aggregate across hours
-    # Stack: (24, n_samples, n_features) → mean over hours
-    shap_stack        = np.stack(all_hour_shap, axis=0)   # (24, n, f)
-    shap_mean_hours   = shap_stack.mean(axis=0)            # (n, f)
-    mean_abs_shap_all = np.abs(shap_stack).mean(axis=(0, 1))  # (f,)
-
-    print(f"\nTop 10 features by mean |SHAP| across all hours:")
-    top10 = np.argsort(mean_abs_shap_all)[::-1][:10]
-    for rank, fi in enumerate(top10):
-        print(f"  {rank+1:2d}. {feature_names[fi]:50s}  {mean_abs_shap_all[fi]:.6f}")
-
-    # 5. Generate all plots
-    print("\nGenerating plots...")
-    plot_summary_bar(mean_abs_shap_all)
-    plot_beeswarm(shap_mean_hours, X_exp)
-    plot_by_type(mean_abs_shap_all)
-    plot_by_recency(mean_abs_shap_all)
-    plot_dependence(shap_mean_hours, X_exp, mean_abs_shap_all)
-    plot_waterfall_samples(all_hour_shap, all_hour_base, X_exp, y_exp)
-    plot_hour_heatmap(all_hour_shap)
-
-    # 6. Save CSVs
-    print("\nSaving CSVs...")
-    save_csvs(mean_abs_shap_all, all_hour_shap, X_exp)
-
-    print("\n" + "=" * 65)
-    print("SHAP analysis complete.")
-    print(f"  Output folder : {OUTPUT_FOLDER}/")
-    print("=" * 65)
+    import pandas   # ensure available
+    build_pdf()
