@@ -10,6 +10,12 @@ values found from sequential tuning in battery_hypersearch.py:
   subsample     = 0.95   (tuned in step 4)
   colsample_bytree = 0.8 (fixed throughout)
 
+Date/day/month/year features REMOVED — feature importance showed they
+contribute only 0.026% of total importance (effectively useless).
+
+Features per day : 24 dSocdt + 24 Soc = 48 values
+Total features   : 7 × 48 = 336
+
 Threshold sweep : ACC_THRESHOLD varied 1→10.
 Cosine similarity: computed per day between actual and predicted dSocdt vectors,
                    then averaged per device and across all devices.
@@ -59,44 +65,43 @@ WIDE_CSV_FOLDER = "results/wide_csv"
 OUTPUT_FOLDER   = "results/xgboost/final_validation"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-TRAIN_DAYS     = 14
+TRAIN_DAYS     = 7
 THRESHOLDS     = list(range(1, 11))   # 1, 2, 3, ... 10
-DEFAULT_PLOT_T = 2                    # threshold used for per-device plots
+DEFAULT_PLOT_T = 2
 HOURS          = list(range(24))
 
 # ─────────────────────────────────────────────────────────────
 # COLUMN DEFINITIONS
 # ─────────────────────────────────────────────────────────────
-DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
-SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
-DATE_FEAT_COUNT = 4
-FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
+DSOCDT_COLS = [f"dSocdt_h{h}" for h in HOURS]
+SOC_COLS    = [f"Soc_h{h}"    for h in HOURS]
+
+# Date features REMOVED (0.026% importance — negligible)
+# Features per day : 24 dSocdt + 24 Soc = 48
+# Total features   : 7 × 48 = 336
+FEATS_PER_DAY  = len(DSOCDT_COLS) + len(SOC_COLS)   # 48
+TOTAL_FEATURES = TRAIN_DAYS * FEATS_PER_DAY          # 336
 
 
 # ─────────────────────────────────────────────────────────────
 # FEATURE HELPERS
 # ─────────────────────────────────────────────────────────────
 
-def date_feats(date_str):
-    ts = pd.Timestamp(date_str)
-    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
-
-
 def build_feature_row(wide, train_start, train_end):
+    """Flatten 14-day window into feature vector — dSocdt + Soc only."""
     feats = []
     for i in range(train_start, train_end):
         feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
         feats.extend(wide.iloc[i][SOC_COLS].tolist())
-        feats.extend(date_feats(wide.index[i]))
-    return np.array(feats, dtype=float)
+    return np.array(feats, dtype=float)   # shape (336,)
 
 
 def build_padded_feature_row(wide, context_start, context_end, pad_days):
+    """Zero-padded partial window — dSocdt + Soc only."""
     feats = [0.0] * (pad_days * FEATS_PER_DAY)
     for i in range(context_start, context_end):
         feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
         feats.extend(wide.iloc[i][SOC_COLS].tolist())
-        feats.extend(date_feats(wide.index[i]))
     return feats
 
 
@@ -105,11 +110,6 @@ def accuracy_at_threshold(actual, predicted, threshold):
 
 
 def cosine_similarity(actual, predicted):
-    """
-    Cosine similarity between actual and predicted 24-hour dSocdt vectors.
-    Range: -1 (opposite) to +1 (identical direction).
-    Returns 0.0 if either vector is all-zeros (no discharge activity).
-    """
     norm_a = np.linalg.norm(actual)
     norm_p = np.linalg.norm(predicted)
     if norm_a == 0.0 or norm_p == 0.0:
@@ -118,14 +118,10 @@ def cosine_similarity(actual, predicted):
 
 
 # ─────────────────────────────────────────────────────────────
-# DAILY ROLLING PREDICTION  (runs once per device)
+# DAILY ROLLING PREDICTION
 # ─────────────────────────────────────────────────────────────
 
 def run_predictions(wide, device_name):
-    """
-    Returns list of per-day dicts with raw y_actual, y_pred, MAE, RMSE,
-    and cosine similarity. Accuracy is computed later per threshold.
-    """
     n_days  = len(wide)
     results = []
 
@@ -165,14 +161,14 @@ def run_predictions(wide, device_name):
         rmse    = round(np.sqrt(mean_squared_error(y_actual, y_pred)), 6)
 
         results.append({
-            "predict_date"   : predict_date,
-            "train_start"    : wide.index[train_start],
-            "train_end"      : wide.index[train_end - 1],
-            "y_actual"       : y_actual,
-            "y_pred"         : y_pred,
-            "mae"            : mae,
-            "rmse"           : rmse,
-            "cosine_sim"     : round(cos_sim, 6),
+            "predict_date": predict_date,
+            "train_start" : wide.index[train_start],
+            "train_end"   : wide.index[train_end - 1],
+            "y_actual"    : y_actual,
+            "y_pred"      : y_pred,
+            "mae"         : mae,
+            "rmse"        : rmse,
+            "cosine_sim"  : round(cos_sim, 6),
         })
 
         if (predict_day_idx - TRAIN_DAYS) % 10 == 0 or predict_day_idx == n_days - 1:
@@ -217,7 +213,8 @@ def plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T):
         f"max_depth={BEST_PARAMS['max_depth']}  "
         f"lr={BEST_PARAMS['learning_rate']}  "
         f"subsample={BEST_PARAMS['subsample']}  "
-        f"(accuracy shown at threshold={threshold})",
+        f"(accuracy shown at threshold={threshold})\n"
+        f"Features: dSocdt + Soc only  [{TOTAL_FEATURES} total]",
         fontsize=11, fontweight="bold"
     )
 
@@ -305,13 +302,8 @@ def plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T):
 # ─────────────────────────────────────────────────────────────
 
 def plot_cosine_summary(cosine_df):
-    """
-    Bar chart: mean cosine similarity per device + overall mean line.
-    """
-    devices  = cosine_df["device"].tolist()
-    means    = cosine_df["mean_cosine_sim"].tolist()
-    overall  = cosine_df[cosine_df["device"] == "OVERALL_MEAN"]["mean_cosine_sim"].values
     dev_data = cosine_df[cosine_df["device"] != "OVERALL_MEAN"]
+    overall  = cosine_df[cosine_df["device"] == "OVERALL_MEAN"]["mean_cosine_sim"].values
 
     fig, ax = plt.subplots(figsize=(max(10, len(dev_data) * 1.2), 6))
 
@@ -331,7 +323,6 @@ def plot_cosine_summary(cosine_df):
                 bar.get_height() + 0.01, f"{val:.3f}",
                 ha="center", va="bottom", fontsize=8, fontweight="bold")
 
-    # Shorten device names for x-axis labels (first 12 chars)
     short_names = [d[:12] + "…" if len(d) > 12 else d
                    for d in dev_data["device"]]
     ax.set_xticks(range(len(dev_data)))
@@ -390,8 +381,9 @@ def plot_threshold_curve(threshold_summary_df):
         f"(Best params: n_est={BEST_PARAMS['n_estimators']}, "
         f"depth={BEST_PARAMS['max_depth']}, "
         f"lr={BEST_PARAMS['learning_rate']}, "
-        f"subsample={BEST_PARAMS['subsample']})",
-        fontsize=12, fontweight="bold"
+        f"subsample={BEST_PARAMS['subsample']})\n"
+        f"Features: dSocdt + Soc only  [{TOTAL_FEATURES} total]",
+        fontsize=11, fontweight="bold"
     )
     ax.set_xticks(thresholds)
     ax.legend(fontsize=7, ncol=3, loc="lower right")
@@ -417,7 +409,10 @@ if __name__ == "__main__":
     for k, v in BEST_PARAMS.items():
         if k not in ("random_state", "verbosity"):
             print(f"  {k:20s} = {v}")
-    print(f"\n  Thresholds evaluated : {THRESHOLDS}")
+    print(f"\n  Features           : dSocdt + Soc only (date features removed)")
+    print(f"  Features per day   : {FEATS_PER_DAY}  (24 dSocdt + 24 Soc)")
+    print(f"  Total features     : {TOTAL_FEATURES}  ({TRAIN_DAYS} days × {FEATS_PER_DAY})")
+    print(f"  Thresholds         : {THRESHOLDS}")
     print("=" * 65 + "\n")
 
     wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
@@ -428,7 +423,7 @@ if __name__ == "__main__":
         )
 
     all_threshold_rows = []
-    cosine_rows        = []   # one row per device for cosine summary
+    cosine_rows        = []
 
     for wf in wide_files:
         device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
@@ -447,51 +442,49 @@ if __name__ == "__main__":
                 print(f"  Skipping: not enough days.\n")
                 continue
 
-            # Run model once — get raw predictions + cosine sim per day
             results = run_predictions(wide, device_name)
             if not results:
                 continue
 
-            # Save raw per-hour predictions CSV (includes cosine sim per day)
+            # Save raw per-hour predictions CSV
             pred_rows = []
             for r in results:
                 for h in HOURS:
                     pred_rows.append({
-                        "predict_date"  : r["predict_date"],
-                        "train_start"   : r["train_start"],
-                        "train_end"     : r["train_end"],
-                        "hour"          : h,
-                        "actual_dSocdt" : round(float(r["y_actual"][h]), 6),
-                        "pred_dSocdt"   : round(float(r["y_pred"][h]),   6),
-                        "abs_error"     : round(abs(float(r["y_actual"][h])
-                                                    - float(r["y_pred"][h])), 6),
-                        "daily_cosine_sim": r["cosine_sim"],  # same value for all 24 rows of that day
+                        "predict_date"    : r["predict_date"],
+                        "train_start"     : r["train_start"],
+                        "train_end"       : r["train_end"],
+                        "hour"            : h,
+                        "actual_dSocdt"   : round(float(r["y_actual"][h]), 6),
+                        "pred_dSocdt"     : round(float(r["y_pred"][h]),   6),
+                        "abs_error"       : round(abs(float(r["y_actual"][h])
+                                                      - float(r["y_pred"][h])), 6),
+                        "daily_cosine_sim": r["cosine_sim"],
                     })
             pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
             print(f"\n  Raw predictions CSV  →  {pred_path}")
 
-            # Per-device plot (4 panels now including cosine sim)
             plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T)
 
-            # Threshold sweep (accuracy/MAE/RMSE only — model output is fixed)
+            # Threshold sweep
             print(f"\n  Threshold sweep:")
             for T in THRESHOLDS:
                 m = metrics_at_threshold(results, T)
                 print(f"    T={T:2d}  →  acc={m['mean_accuracy_%']:.2f}%  "
                       f"mae={m['mean_mae']:.5f}  rmse={m['mean_rmse']:.5f}")
                 all_threshold_rows.append({
-                    "device"         : device_name,
-                    "threshold"      : T,
-                    "mean_accuracy_%": m["mean_accuracy_%"],
-                    "mean_mae"       : m["mean_mae"],
-                    "mean_rmse"      : m["mean_rmse"],
-                    "n_estimators"   : BEST_PARAMS["n_estimators"],
-                    "max_depth"      : BEST_PARAMS["max_depth"],
-                    "learning_rate"  : BEST_PARAMS["learning_rate"],
-                    "subsample"      : BEST_PARAMS["subsample"],
+                    "device"          : device_name,
+                    "threshold"       : T,
+                    "mean_accuracy_%" : m["mean_accuracy_%"],
+                    "mean_mae"        : m["mean_mae"],
+                    "mean_rmse"       : m["mean_rmse"],
+                    "n_estimators"    : BEST_PARAMS["n_estimators"],
+                    "max_depth"       : BEST_PARAMS["max_depth"],
+                    "learning_rate"   : BEST_PARAMS["learning_rate"],
+                    "subsample"       : BEST_PARAMS["subsample"],
                 })
 
-            # Cosine similarity summary for this device
+            # Cosine similarity
             mean_cos = round(float(np.mean([r["cosine_sim"] for r in results])), 6)
             min_cos  = round(float(np.min ([r["cosine_sim"] for r in results])), 6)
             max_cos  = round(float(np.max ([r["cosine_sim"] for r in results])), 6)
@@ -499,11 +492,11 @@ if __name__ == "__main__":
                   f"min: {min_cos:.4f}  max: {max_cos:.4f}")
 
             cosine_rows.append({
-                "device"          : device_name,
-                "mean_cosine_sim" : mean_cos,
-                "min_cosine_sim"  : min_cos,
-                "max_cosine_sim"  : max_cos,
-                "total_days"      : len(results),
+                "device"         : device_name,
+                "mean_cosine_sim": mean_cos,
+                "min_cosine_sim" : min_cos,
+                "max_cosine_sim" : max_cos,
+                "total_days"     : len(results),
             })
 
         except Exception as e:
@@ -513,25 +506,24 @@ if __name__ == "__main__":
 
         print()
 
-    # ── Save combined threshold summary CSV ──────────────────
-    threshold_df = pd.DataFrame(all_threshold_rows)
+    # Save threshold summary CSV
+    threshold_df    = pd.DataFrame(all_threshold_rows)
     all_thresh_path = os.path.join(OUTPUT_FOLDER, "final_summary_all_thresholds.csv")
     threshold_df.to_csv(all_thresh_path, index=False)
     print(f"All-threshold summary  →  {all_thresh_path}")
 
-    # ── Save cosine similarity summary CSV ───────────────────
+    # Save cosine similarity summary CSV
     cosine_df = pd.DataFrame(cosine_rows)
-    # Append overall mean row
     if not cosine_df.empty:
         overall_cos = round(float(cosine_df["mean_cosine_sim"].mean()), 6)
         cosine_df = pd.concat([
             cosine_df,
             pd.DataFrame([{
-                "device"          : "OVERALL_MEAN",
-                "mean_cosine_sim" : overall_cos,
-                "min_cosine_sim"  : round(float(cosine_df["min_cosine_sim"].min()), 6),
-                "max_cosine_sim"  : round(float(cosine_df["max_cosine_sim"].max()), 6),
-                "total_days"      : cosine_df["total_days"].sum(),
+                "device"         : "OVERALL_MEAN",
+                "mean_cosine_sim": overall_cos,
+                "min_cosine_sim" : round(float(cosine_df["min_cosine_sim"].min()), 6),
+                "max_cosine_sim" : round(float(cosine_df["max_cosine_sim"].max()), 6),
+                "total_days"     : cosine_df["total_days"].sum(),
             }])
         ], ignore_index=True)
 
@@ -539,11 +531,11 @@ if __name__ == "__main__":
     cosine_df.to_csv(cos_csv_path, index=False)
     print(f"Cosine similarity summary  →  {cos_csv_path}")
 
-    # ── Plots ─────────────────────────────────────────────────
+    # Plots
     plot_threshold_curve(threshold_df)
     plot_cosine_summary(cosine_df)
 
-    # ── Final console summary ─────────────────────────────────
+    # Final console summary
     print("\n" + "=" * 65)
     print("OVERALL MEAN ACCURACY PER THRESHOLD  (across all devices)")
     print("=" * 65)
