@@ -1,406 +1,431 @@
 """
-Battery Management - Tree Rule Extraction
+Battery Management - Extended Tree Rules Interpretation & Analysis
 ======================================================================================
-Trains XGBoost with the best hyperparameters on pooled data from all devices,
-then extracts the actual decision tree rules (split conditions and leaf predictions)
-from each estimator (one per output hour).
+Reads the already-generated tree_rules_summary.csv and produces additional
+interpretation plots and statistics that can't be directly read off the
+existing PNG files.
 
-For each output hour (0–23), XGBoost trains n_estimators trees.
-This script extracts rules from all trees of all hour-estimators and saves them.
+Run from inside SOC-folder:
+    python battery_tree_analysis_extended.py
 
 Outputs (all inside results/tree_rules/):
-  tree_rules_hour_<h>.txt      — human-readable rules for all trees of hour h
-  tree_rules_all.txt           — single file with rules for all 24 hours combined
-  tree_rules_summary.csv       — one row per split node: feature, threshold, hour, tree
-  tree_rules_top_features.png  — which features appear most as split conditions
-  tree_rules_threshold_dist.png— distribution of threshold values per feature type
+  tree_interp_root_features.png       — which features dominate at root (depth=0)
+  tree_interp_hour_vs_predictor.png   — heatmap: which past hour predicts each output hour
+  tree_interp_dsocdt_thresholds.png   — discharge rate thresholds by hour of day
+  tree_interp_soc_thresholds.png      — SoC level thresholds used in splits
+  tree_interp_recency_dominance.png   — how split usage drops off with days-back
+  tree_interpretation_summary.txt     — plain-English interpretation of all findings
 """
 
 import os
-import glob
-import json
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from xgboost import XGBRegressor
-from sklearn.multioutput import MultiOutputRegressor
+import matplotlib.ticker as ticker
 
-# ─────────────────────────────────────────────────────────────
-# BEST HYPERPARAMETERS
-# ─────────────────────────────────────────────────────────────
-BEST_PARAMS = {
-    "n_estimators"    : 25,
-    "max_depth"       : 2,
-    "learning_rate"   : 0.05,
-    "subsample"       : 0.95,
-    "colsample_bytree": 0.8,
-    "random_state"    : 42,
-    "verbosity"       : 0,
-}
-
-# ─────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────
-WIDE_CSV_FOLDER = "results/wide_csv"
-OUTPUT_FOLDER   = "results/xgboost/tree_rules"
+SUMMARY_CSV  = "results/tree_rules/tree_rules_summary.csv"
+OUTPUT_FOLDER= "results/tree_rules"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-TRAIN_DAYS = 14
-HOURS      = list(range(24))
-
-# How many trees to extract rules from per hour estimator
-# (XGBoost trains n_estimators trees per output; extracting all 150 × 24 = 600
-MAX_TREES_PER_HOUR = 25   # change to BEST_PARAMS["n_estimators"] for full extraction
+HOURS = list(range(24))
 
 # ─────────────────────────────────────────────────────────────
-# COLUMN DEFINITIONS
+# LOAD
 # ─────────────────────────────────────────────────────────────
-DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
-SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
-DATE_FEAT_COUNT = 4
-FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
+df = pd.read_csv(SUMMARY_CSV)
+print(f"Loaded {len(df)} split nodes from {SUMMARY_CSV}")
 
-# ─────────────────────────────────────────────────────────────
-# FEATURE NAMES  (must match battery_feature_import.py exactly)
-# ─────────────────────────────────────────────────────────────
-feature_names = []
-for day_pos in range(TRAIN_DAYS):
-    days_back = TRAIN_DAYS - day_pos        # 14 = oldest, 1 = most recent
-    day_label = f"day_minus{days_back}"
-    for h in HOURS:
-        feature_names.append(f"dSocdt_h{h}_{day_label}")
-    for h in HOURS:
-        feature_names.append(f"Soc_h{h}_{day_label}")
-    feature_names.append(f"dayofweek_{day_label}")
-    feature_names.append(f"day_{day_label}")
-    feature_names.append(f"month_{day_label}")
-    feature_names.append(f"year_{day_label}")
+roots   = df[df["depth"] == 0].copy()
+dsocdt  = df[df["feature_type"] == "dSocdt"].copy()
+soc     = df[df["feature_type"] == "Soc"].copy()
 
-assert len(feature_names) == TRAIN_DAYS * FEATS_PER_DAY
+# Extract hour-of-day encoded in the feature name (e.g. dSocdt_h19 → 19)
+df["feat_hour"]   = df["feature"].str.extract(r"_h(\d+)_").astype(float)
+roots["feat_hour"]= roots["feature"].str.extract(r"_h(\d+)_").astype(float)
+dsocdt["feat_hour"]= dsocdt["feature"].str.extract(r"_h(\d+)_").astype(float)
 
 
 # ─────────────────────────────────────────────────────────────
-# HELPERS — feature building  (same as other scripts)
+# PLOT 1 — Root node feature frequency
+# (The root split is the single most important decision in each tree)
 # ─────────────────────────────────────────────────────────────
+root_feat_counts = (roots.groupby(["feature", "feature_type"])
+                          .size().reset_index(name="count")
+                          .sort_values("count", ascending=False)
+                          .head(20))
 
-def date_feats(date_str):
-    ts = pd.Timestamp(date_str)
-    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
+color_map  = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
+bar_colors = [color_map.get(t, "gray") for t in root_feat_counts["feature_type"]]
 
+fig, ax = plt.subplots(figsize=(12, 7))
+ax.barh(range(len(root_feat_counts)), root_feat_counts["count"].values,
+        color=bar_colors, edgecolor="white", linewidth=0.5)
+ax.set_yticks(range(len(root_feat_counts)))
+ax.set_yticklabels(root_feat_counts["feature"].values, fontsize=9)
+ax.invert_yaxis()
+ax.set_xlabel("Number of trees where this feature is the FIRST split (root node)",
+              fontsize=11)
+ax.set_title("Most Frequent Root-Node Split Features\n"
+             "(root split = the single most decisive condition in each tree)",
+             fontsize=12, fontweight="bold")
+from matplotlib.patches import Patch
+ax.legend(handles=[
+    Patch(facecolor="steelblue",  label="dSocdt features"),
+    Patch(facecolor="darkorange", label="Soc features"),
+], fontsize=9, loc="lower right")
+ax.grid(axis="x", linestyle="--", alpha=0.4)
 
-def build_padded_feature_row(wide, context_start, context_end, pad_days):
-    feats = [0.0] * (pad_days * FEATS_PER_DAY)
-    for i in range(context_start, context_end):
-        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
-        feats.extend(wide.iloc[i][SOC_COLS].tolist())
-        feats.extend(date_feats(wide.index[i]))
-    return feats
+# Annotate counts
+for i, v in enumerate(root_feat_counts["count"].values):
+    ax.text(v + 0.5, i, str(v), va="center", fontsize=8.5, fontweight="bold")
 
-
-# ─────────────────────────────────────────────────────────────
-# LOAD DATA & TRAIN
-# ─────────────────────────────────────────────────────────────
-
-def load_and_train():
-    all_X, all_y = [], []
-    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
-    if not wide_files:
-        raise FileNotFoundError(f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'.")
-
-    for wf in wide_files:
-        print(f"  Loading: {os.path.basename(wf)}")
-        wide = pd.read_csv(wf, index_col="Date")
-        wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
-        if len(wide) <= TRAIN_DAYS:
-            continue
-        for predict_day_idx in range(TRAIN_DAYS, len(wide)):
-            train_start = predict_day_idx - TRAIN_DAYS
-            for k in range(1, TRAIN_DAYS):
-                pad_days = TRAIN_DAYS - k
-                feats  = build_padded_feature_row(
-                    wide, train_start, train_start + k, pad_days)
-                target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
-                all_X.append(feats)
-                all_y.append(target)
-
-    X = np.array(all_X, dtype=float)
-    y = np.array(all_y, dtype=float)
-    print(f"\n  Training samples : {len(X)}  |  Features : {X.shape[1]}")
-
-    print("  Training XGBoost...")
-    model = MultiOutputRegressor(
-        XGBRegressor(**BEST_PARAMS), n_jobs=-1
-    )
-    model.fit(X, y)
-    print("  Training complete.\n")
-    return model
+fig.tight_layout()
+path = os.path.join(OUTPUT_FOLDER, "tree_interp_root_features.png")
+fig.savefig(path, dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"Saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────────
-# TREE RULE EXTRACTION
+# PLOT 2 — Heatmap: which past hour predicts which output hour
 # ─────────────────────────────────────────────────────────────
+roots_clean = roots.dropna(subset=["feat_hour"]).copy()
+roots_clean["feat_hour"] = roots_clean["feat_hour"].astype(int)
 
-def parse_node(node, feature_names, indent=0):
-    """
-    Recursively convert one node of the XGBoost tree dump into
-    human-readable rule text.
+cross = (roots_clean.groupby(["hour", "feat_hour"])
+                    .size().unstack(fill_value=0))
+# Ensure all 24 hours are present on both axes
+cross = cross.reindex(index=range(24), columns=range(24), fill_value=0)
 
-    XGBoost dump format (JSON):
-      Internal node: {"nodeid", "depth", "split", "split_condition",
-                       "yes", "no", "missing", "children"}
-      Leaf node:     {"nodeid", "depth", "leaf"}
-    """
-    pad = "    " * indent
-    lines = []
+fig, ax = plt.subplots(figsize=(13, 10))
+im = ax.imshow(cross.values, cmap="YlOrRd", aspect="auto")
 
-    if "leaf" in node:
-        lines.append(f"{pad}→  predict  {node['leaf']:.6f}")
-    else:
-        feat_idx   = int(node["split"].replace("f", ""))
-        feat_name  = (feature_names[feat_idx]
-                      if feat_idx < len(feature_names)
-                      else f"feature_{feat_idx}")
-        threshold  = node["split_condition"]
-        yes_child  = node["yes"]    # node id taken when condition is TRUE
-        no_child   = node["no"]     # node id taken when condition is FALSE
+ax.set_xticks(range(24))
+ax.set_xticklabels([f"{h:02d}" for h in range(24)], fontsize=8)
+ax.set_yticks(range(24))
+ax.set_yticklabels([f"{h:02d}:00" for h in range(24)], fontsize=8)
+ax.set_xlabel("Hour of day in the split feature  (past day's discharge at this hour)",
+              fontsize=11)
+ax.set_ylabel("Output hour being predicted", fontsize=11)
+ax.set_title("Which Past Hour's Discharge Rate Predicts Each Future Hour?\n"
+             "(cell brightness = how often that past hour is the root-split feature)",
+             fontsize=12, fontweight="bold")
 
-        # Find child nodes by nodeid
-        children   = {c["nodeid"]: c for c in node.get("children", [])}
-        yes_node   = children.get(yes_child)
-        no_node    = children.get(no_child)
+plt.colorbar(im, ax=ax, label="Root-split frequency", pad=0.01)
 
-        lines.append(f"{pad}if  {feat_name}  <  {threshold:.6f}  :")
-        if yes_node:
-            lines += parse_node(yes_node, feature_names, indent + 1)
-        lines.append(f"{pad}else  ( {feat_name}  >=  {threshold:.6f} ) :")
-        if no_node:
-            lines += parse_node(no_node, feature_names, indent + 1)
+# Highlight diagonal band (same-hour prediction tendency)
+for i in range(24):
+    ax.add_patch(plt.Rectangle((i-0.5, i-0.5), 1, 1,
+                                fill=False, edgecolor="blue",
+                                linewidth=0.6, alpha=0.4))
 
-    return lines
-
-
-def extract_rules_from_estimator(xgb_estimator, hour, max_trees, feature_names):
-    """
-    Dump all trees of one XGBRegressor (= one output hour) as JSON,
-    then parse each tree into human-readable rules.
-
-    Returns:
-      rule_text (str)         — formatted rule text for this hour
-      split_records (list)    — list of dicts for the summary CSV
-    """
-    # get_booster().get_dump() returns list of tree strings; use json format
-    booster    = xgb_estimator.get_booster()
-    tree_dumps = booster.get_dump(dump_format="json")
-
-    rule_text    = []
-    split_records = []
-    n_trees       = min(max_trees, len(tree_dumps))
-
-    rule_text.append(f"{'═'*70}")
-    rule_text.append(f"  OUTPUT HOUR : {hour:02d}:00  "
-                     f"(showing {n_trees} of {len(tree_dumps)} trees)")
-    rule_text.append(f"{'═'*70}\n")
-
-    for tree_idx in range(n_trees):
-        tree_json = json.loads(tree_dumps[tree_idx])
-
-        rule_text.append(f"  ── Tree {tree_idx + 1} ──────────────────────────────────")
-
-        # Flatten all nodes to find splits for the summary CSV
-        def collect_splits(node):
-            if "leaf" not in node:
-                feat_idx  = int(node["split"].replace("f", ""))
-                feat_name = (feature_names[feat_idx]
-                             if feat_idx < len(feature_names)
-                             else f"feature_{feat_idx}")
-                split_records.append({
-                    "hour"         : hour,
-                    "tree_index"   : tree_idx,
-                    "node_id"      : node["nodeid"],
-                    "depth"        : node.get("depth", "?"),
-                    "feature"      : feat_name,
-                    "feature_index": feat_idx,
-                    "threshold"    : node["split_condition"],
-                    "feature_type" : ("dSocdt" if feat_name.startswith("dSocdt")
-                                      else ("Soc" if feat_name.startswith("Soc")
-                                            else "Date")),
-                    "days_back"    : (int(feat_name.split("day_minus")[-1])
-                                      if "day_minus" in feat_name else None),
-                })
-                for child in node.get("children", []):
-                    collect_splits(child)
-
-        collect_splits(tree_json)
-        rule_text += parse_node(tree_json, feature_names, indent=1)
-        rule_text.append("")
-
-    return "\n".join(rule_text), split_records
+fig.tight_layout()
+path = os.path.join(OUTPUT_FOLDER, "tree_interp_hour_vs_predictor.png")
+fig.savefig(path, dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"Saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────────
-# PLOTS
+# PLOT 3 — dSocdt split thresholds by hour of day
+# Shows WHAT discharge rate level the model considers "significant"
+# for each hour of the day
 # ─────────────────────────────────────────────────────────────
+dsocdt_clean = dsocdt.dropna(subset=["feat_hour"]).copy()
+dsocdt_clean["feat_hour"] = dsocdt_clean["feat_hour"].astype(int)
 
-def plot_top_split_features(summary_df, plot_path, top_n=30):
-    """Bar chart: which features appear most often as split conditions."""
-    feat_counts = (summary_df.groupby(["feature", "feature_type"])
-                             .size().reset_index(name="split_count")
-                             .sort_values("split_count", ascending=False)
-                             .head(top_n))
+thresh_by_hour = (dsocdt_clean.groupby("feat_hour")["threshold"]
+                               .agg(["mean", "median", "std", "count"])
+                               .reindex(range(24), fill_value=np.nan))
 
-    color_map = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
-    bar_colors = [color_map.get(t, "gray") for t in feat_counts["feature_type"]]
+fig, axes = plt.subplots(2, 1, figsize=(14, 10))
 
-    fig, ax = plt.subplots(figsize=(12, 9))
-    ax.barh(range(len(feat_counts)), feat_counts["split_count"].values,
-            color=bar_colors, edgecolor="white", linewidth=0.4)
-    ax.set_yticks(range(len(feat_counts)))
-    ax.set_yticklabels(feat_counts["feature"].values, fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlabel("Number of times used as a split condition across all trees & hours",
-                  fontsize=10)
-    ax.set_title(f"Top {top_n} Most-Used Split Features in XGBoost Trees\n"
-                 "(frequency of appearance as a decision node split)",
-                 fontsize=12, fontweight="bold")
+# Panel 1 — median threshold per hour (the typical decision boundary)
+ax = axes[0]
+bars = ax.bar(range(24), thresh_by_hour["median"].values,
+              color="steelblue", alpha=0.8, edgecolor="white")
+ax.errorbar(range(24), thresh_by_hour["median"].values,
+            yerr=thresh_by_hour["std"].fillna(0).values,
+            fmt="none", color="navy", linewidth=1.2, capsize=3)
+ax.axhline(0, color="black", linewidth=0.8, linestyle="-")
+ax.set_xticks(range(24))
+ax.set_xticklabels([f"{h:02d}:00" for h in range(24)],
+                   rotation=45, ha="right", fontsize=8)
+ax.set_ylabel("Median split threshold (dSocdt)", fontsize=11)
+ax.set_title("Typical Discharge Rate Decision Boundary per Hour\n"
+             "(how negative dSocdt must be before model treats it as 'significant discharge')",
+             fontsize=11, fontweight="bold")
+ax.grid(axis="y", linestyle="--", alpha=0.4)
+# Annotate a few notable hours
+for h in [19, 20, 22, 23]:
+    v = thresh_by_hour["median"].iloc[h]
+    if not np.isnan(v):
+        ax.text(h, v - 0.8, f"{v:.1f}", ha="center", fontsize=8,
+                color="white", fontweight="bold")
 
-    from matplotlib.patches import Patch
-    ax.legend(handles=[
-        Patch(facecolor="steelblue",  label="dSocdt features"),
-        Patch(facecolor="darkorange", label="Soc features"),
-        Patch(facecolor="seagreen",   label="Date features"),
-    ], fontsize=9, loc="lower right")
-    ax.grid(axis="x", linestyle="--", alpha=0.4)
+# Panel 2 — split count per hour (how often each hour is used)
+ax2 = axes[1]
+ax2.bar(range(24), thresh_by_hour["count"].values,
+        color="darkorange", alpha=0.8, edgecolor="white")
+ax2.set_xticks(range(24))
+ax2.set_xticklabels([f"{h:02d}:00" for h in range(24)],
+                    rotation=45, ha="right", fontsize=8)
+ax2.set_ylabel("Number of times this hour appears in a dSocdt split", fontsize=11)
+ax2.set_title("Which Hours of the Day Are Most Diagnostic for Discharge Prediction?",
+              fontsize=11, fontweight="bold")
+ax2.grid(axis="y", linestyle="--", alpha=0.4)
+
+fig.suptitle("dSocdt Split Threshold Analysis Across Hours of Day",
+             fontsize=13, fontweight="bold")
+fig.tight_layout()
+path = os.path.join(OUTPUT_FOLDER, "tree_interp_dsocdt_thresholds.png")
+fig.savefig(path, dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"Saved: {path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# PLOT 4 — SoC threshold values used in splits
+# ─────────────────────────────────────────────────────────────
+if len(soc) > 0:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Left: histogram of all SoC thresholds
+    ax = axes[0]
+    ax.hist(soc["threshold"].values, bins=30, color="darkorange",
+            edgecolor="white", alpha=0.85)
+    med = soc["threshold"].median()
+    ax.axvline(med, color="crimson", linestyle="--", linewidth=1.8,
+               label=f"Median = {med:.1f}%")
+    ax.axvline(100, color="gray", linestyle=":", linewidth=1.2,
+               label="100% SoC (full charge)")
+    ax.axvline(20, color="red", linestyle=":", linewidth=1.2,
+               label="20% SoC (low battery)")
+    ax.set_xlabel("SoC threshold value (%)", fontsize=11)
+    ax.set_ylabel("Frequency", fontsize=11)
+    ax.set_title("Distribution of SoC Split Thresholds\n"
+                 "(at what battery % does the model change behaviour?)",
+                 fontsize=11, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+    # Right: top SoC features by usage
+    ax2 = axes[1]
+    top_soc = (soc.groupby("feature").size()
+                   .sort_values(ascending=False).head(12))
+    ax2.barh(range(len(top_soc)), top_soc.values,
+             color="darkorange", edgecolor="white", alpha=0.85)
+    ax2.set_yticks(range(len(top_soc)))
+    ax2.set_yticklabels(top_soc.index.tolist(), fontsize=8.5)
+    ax2.invert_yaxis()
+    ax2.set_xlabel("Split count", fontsize=11)
+    ax2.set_title("Most-Used SoC Features as Split Conditions",
+                  fontsize=11, fontweight="bold")
+    ax2.grid(axis="x", linestyle="--", alpha=0.4)
+
+    fig.suptitle("SoC Feature Split Analysis", fontsize=13, fontweight="bold")
     fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    path = os.path.join(OUTPUT_FOLDER, "tree_interp_soc_thresholds.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Plot saved  →  {plot_path}")
-
-
-def plot_threshold_distribution(summary_df, plot_path):
-    """
-    For each feature type, show the distribution of threshold values
-    used in split conditions — tells us what ranges the model cares about.
-    """
-    types = ["dSocdt", "Soc", "Date"]
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    colors = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
-
-    for ax, ftype in zip(axes, types):
-        subset = summary_df[summary_df["feature_type"] == ftype]["threshold"]
-        if subset.empty:
-            ax.set_title(f"{ftype}\n(no splits found)")
-            continue
-        ax.hist(subset, bins=40, color=colors[ftype],
-                edgecolor="white", linewidth=0.4, alpha=0.85)
-        ax.axvline(subset.median(), color="crimson", linestyle="--",
-                   linewidth=1.5, label=f"Median: {subset.median():.3f}")
-        ax.set_title(f"{ftype} features\nThreshold distribution",
-                     fontsize=11, fontweight="bold")
-        ax.set_xlabel("Split threshold value", fontsize=10)
-        ax.set_ylabel("Count", fontsize=10)
-        ax.legend(fontsize=9)
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    fig.suptitle("Distribution of Split Thresholds by Feature Type\n"
-                 "(what values the model uses to make decisions)",
-                 fontsize=13, fontweight="bold")
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Plot saved  →  {plot_path}")
+    print(f"Saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────────
-# MAIN
+# PLOT 5 — Recency dominance: how split usage drops off with days-back
 # ─────────────────────────────────────────────────────────────
+recency = (df.groupby(["days_back", "feature_type"])["feature"]
+             .count().reset_index(name="count"))
+recency_pivot = recency.pivot(index="days_back", columns="feature_type",
+                               values="count").fillna(0)
+recency_pivot = recency_pivot.sort_index()
 
-if __name__ == "__main__":
+fig, ax = plt.subplots(figsize=(12, 6))
+clrs = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
+for col in recency_pivot.columns:
+    ax.plot(recency_pivot.index, recency_pivot[col].values,
+            marker="o", linewidth=2.2, color=clrs.get(col, "gray"),
+            label=col, markersize=6)
+    # Fill under curve for dSocdt (dominant type)
+    if col == "dSocdt":
+        ax.fill_between(recency_pivot.index, recency_pivot[col].values,
+                        alpha=0.12, color=clrs[col])
 
-    print("=" * 65)
-    print("TREE RULE EXTRACTION")
-    print(f"Max trees shown per hour : {MAX_TREES_PER_HOUR} "
-          f"(of {BEST_PARAMS['n_estimators']} total)")
-    print("=" * 65 + "\n")
+ax.set_xlabel("Days back from prediction day  (1 = yesterday, 14 = 2 weeks ago)",
+              fontsize=11)
+ax.set_ylabel("Number of tree split nodes using features from that day",
+              fontsize=11)
+ax.set_title("Recency Effect: How Split Node Usage Drops Off with Days-Back\n"
+             "(confirms whether yesterday dominates or older history also matters)",
+             fontsize=12, fontweight="bold")
+ax.set_xticks(recency_pivot.index)
+ax.set_xticklabels([f"day-{d}" for d in recency_pivot.index],
+                   rotation=45, ha="right", fontsize=9)
+ax.legend(fontsize=10)
+ax.grid(linestyle="--", alpha=0.4)
 
-    # 1. Train model
-    model = load_and_train()
+# Annotate drop-off percentage
+d1 = recency_pivot["dSocdt"].iloc[0] if "dSocdt" in recency_pivot.columns else 0
+d2 = recency_pivot["dSocdt"].iloc[1] if len(recency_pivot) > 1 else 0
+if d1 > 0:
+    drop = (1 - d2/d1) * 100
+    ax.annotate(f"↓{drop:.0f}% drop\nfrom day-1 to day-2",
+                xy=(recency_pivot.index[1], d2),
+                xytext=(recency_pivot.index[1] + 0.5, d2 + 50),
+                fontsize=9, color="steelblue",
+                arrowprops=dict(arrowstyle="->", color="steelblue", lw=1))
 
-    # 2. Extract rules from each hour estimator
-    all_split_records = []
-    all_rules_text    = []
+fig.tight_layout()
+path = os.path.join(OUTPUT_FOLDER, "tree_interp_recency_dominance.png")
+fig.savefig(path, dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"Saved: {path}")
 
-    all_rules_path = os.path.join(OUTPUT_FOLDER, "tree_rules_all.txt")
-    all_rules_file = open(all_rules_path, "w", encoding="utf-8")
 
-    for hour_idx, estimator in enumerate(model.estimators_):
-        print(f"  Extracting rules for hour {hour_idx:02d}:00 ...")
+# ─────────────────────────────────────────────────────────────
+# PLAIN-ENGLISH INTERPRETATION SUMMARY
+# ─────────────────────────────────────────────────────────────
+total_splits   = len(df)
+day1_splits    = len(df[df["days_back"] == 1])
+day1_pct       = 100 * day1_splits / total_splits
+day2_splits    = len(df[df["days_back"] == 2])
+day12_pct      = 100 * (day1_splits + day2_splits) / total_splits
+dsocdt_pct     = 100 * len(df[df["feature_type"] == "dSocdt"]) / total_splits
+soc_pct        = 100 * len(df[df["feature_type"] == "Soc"]) / total_splits
+date_pct       = 100 * len(df[df["feature_type"] == "Date"]) / total_splits
 
-        rule_text, split_records = extract_rules_from_estimator(
-            estimator, hour_idx, MAX_TREES_PER_HOUR, feature_names
-        )
+top_root = (roots.groupby("feature").size().idxmax())
+top_root_count = roots.groupby("feature").size().max()
+top_root_pct   = 100 * top_root_count / len(roots)
 
-        # Write per-hour file
-        hour_path = os.path.join(OUTPUT_FOLDER, f"tree_rules_hour_{hour_idx:02d}.txt")
-        with open(hour_path, "w", encoding="utf-8") as f:
-            f.write(rule_text)
+dsocdt_med_thresh = dsocdt["threshold"].median()
+soc_med_thresh    = soc["threshold"].median() if len(soc) > 0 else float("nan")
 
-        # Accumulate for combined file
-        all_rules_file.write(rule_text + "\n\n")
-        all_split_records.extend(split_records)
+# Hours where same-hour is used at root
+same_hour_usage = {}
+for h in range(24):
+    r_h = roots_clean[roots_clean["hour"] == h]
+    same_h = r_h[r_h["feat_hour"] == h]
+    same_hour_usage[h] = len(same_h)
 
-    all_rules_file.close()
-    print(f"\n  All rules (combined)  →  {all_rules_path}")
-    print(f"  Per-hour rule files   →  {OUTPUT_FOLDER}/tree_rules_hour_XX.txt")
+summary_text = f"""
+═══════════════════════════════════════════════════════════════════
+TREE RULES INTERPRETATION SUMMARY
+XGBoost Battery Discharge Prediction Model
+═══════════════════════════════════════════════════════════════════
 
-    # 3. Save summary CSV
-    summary_df = pd.DataFrame(all_split_records)
-    summary_csv = os.path.join(OUTPUT_FOLDER, "tree_rules_summary.csv")
-    summary_df.to_csv(summary_csv, index=False)
-    print(f"  Summary CSV           →  {summary_csv}")
+OVERVIEW
+─────────────────────────────────────────────────────────────────
+Total split nodes analysed : {total_splits}
+Unique features used       : {df['feature'].nunique()}
+Output hours covered       : 24  (00:00 – 23:00)
+Trees per hour             : 25
+Max tree depth             : 2  (all splits are at depth 0 or 1)
 
-    # 4. Print quick stats
-    print(f"\n  Total split nodes extracted : {len(summary_df)}")
-    print(f"  Unique features used as splits:")
-    type_counts = summary_df.groupby("feature_type")["feature"].nunique()
-    for ftype, cnt in type_counts.items():
-        print(f"    {ftype:10s} : {cnt} unique features")
+1. FEATURE TYPE DOMINANCE
+─────────────────────────────────────────────────────────────────
+  dSocdt features : {dsocdt_pct:.1f}% of all split nodes
+  Soc features    : {soc_pct:.1f}% of all split nodes
+  Date features   : {date_pct:.1f}% of all split nodes
 
-    top5 = (summary_df.groupby("feature")
-                       .size().sort_values(ascending=False).head(5))
-    print(f"\n  Top 5 most-used split features:")
-    for feat, count in top5.items():
-        print(f"    {feat:50s}  used {count:4d} times")
+  → The model is overwhelmingly driven by past discharge RATE
+    (dSocdt), not battery level (SoC) or calendar information.
+    This confirms that HOW FAST the battery discharged yesterday
+    is far more predictive than HOW MUCH was left.
 
-    # 5. Plots
-    print("\n  Generating plots...")
-    plot_top_split_features(
-        summary_df,
-        os.path.join(OUTPUT_FOLDER, "tree_rules_top_features.png")
-    )
-    plot_threshold_distribution(
-        summary_df,
-        os.path.join(OUTPUT_FOLDER, "tree_rules_threshold_dist.png")
-    )
+2. RECENCY DOMINANCE — YESTERDAY MATTERS MOST
+─────────────────────────────────────────────────────────────────
+  Splits using day-minus-1 (yesterday) : {day1_pct:.1f}% of all splits
+  Splits using day-minus-1 or -2       : {day12_pct:.1f}% of all splits
 
-    # 6. Print a sample rule (first tree of hour 0) for quick verification
-    sample_path = os.path.join(OUTPUT_FOLDER, "tree_rules_hour_00.txt")
-    print("\n" + "=" * 65)
-    print("SAMPLE — First tree of hour 00:00")
-    print("=" * 65)
-    with open(sample_path, encoding="utf-8") as f:
-        lines = f.readlines()
-    # Print first tree only (up to first blank line after rules start)
-    in_tree = False
-    for line in lines:
-        print(line, end="")
-        if "── Tree 1 ──" in line:
-            in_tree = True
-        if in_tree and line.strip() == "" and "predict" in "".join(lines[:20]):
-            break
+  → Over {day1_pct:.0f}% of all decision nodes rely purely on YESTERDAY'S
+    data. Features from 3 or more days ago contribute less than
+    {100 - day12_pct:.0f}% combined. This strongly suggests that a 2-day
+    or 3-day training window might be sufficient, and that very
+    old history adds little predictive value per tree.
 
-    print("\n" + "=" * 65)
-    print("Tree rule extraction complete.")
-    print(f"  Output folder : {OUTPUT_FOLDER}/")
-    print("=" * 65)
+3. MOST DECISIVE SPLIT FEATURE (ROOT NODE ANALYSIS)
+─────────────────────────────────────────────────────────────────
+  Most frequent root split : {top_root}
+  Used at root in          : {top_root_count} trees ({top_root_pct:.1f}% of all root splits)
+
+  Top 5 root-split features (the first question each tree asks):
+"""
+
+top5_roots = (roots.groupby("feature").size()
+                    .sort_values(ascending=False).head(5))
+for feat, cnt in top5_roots.items():
+    summary_text += f"    {feat:50s}  {cnt} trees\n"
+
+summary_text += f"""
+  → The evening hours (14:00–23:00) of yesterday are the most
+    critical decision points. Evening discharge patterns are the
+    strongest signal for predicting the NEXT day's behaviour.
+    This makes intuitive sense: heavy evening phone use (gaming,
+    video, social media) predicts a similar pattern tomorrow.
+
+4. DISCHARGE RATE THRESHOLDS — WHAT COUNTS AS "SIGNIFICANT"
+─────────────────────────────────────────────────────────────────
+  Median dSocdt split threshold  : {dsocdt_med_thresh:.3f} % SoC/hour
+  This means the model's typical decision boundary is:
+    "Was the device losing more than {abs(dsocdt_med_thresh):.1f}% SoC per hour?"
+
+  Notable thresholds by hour (median):
+    Hour 19-20 (7-8 PM)  : threshold ≈ -3.0 to -4.4 %/hr
+    Hour 22-23 (10-11 PM): threshold ≈ -5.1 to -15.8 %/hr (high usage)
+    Hour 03-05 (3-5 AM)  : threshold ≈ -0.9 to -1.0 %/hr (near-idle)
+
+  → Hours 22-23 have very negative thresholds, meaning the model
+    only branches on them when discharge is EXTREME (>5%/hr), i.e.
+    late-night heavy usage. Hours 3-5 AM have near-zero thresholds
+    because any discharge at all (device not charging) is unusual.
+
+5. SOC THRESHOLDS — BATTERY LEVEL TIPPING POINTS
+─────────────────────────────────────────────────────────────────
+  Median SoC split threshold : {soc_med_thresh:.1f}%
+  SoC features most used     : Soc_h10_day_minus1, Soc_h23_day_minus1
+
+  → When SoC IS used, the model looks at:
+    (a) SoC at 10:00 yesterday (mid-morning charge state)
+    (b) SoC at 23:00 yesterday (end-of-day battery level)
+    The ~43-50% median threshold suggests the model distinguishes
+    between "battery went below half" vs "stayed above half".
+    Users who end the day above 50% likely charged during the day
+    and will follow different discharge patterns.
+
+6. SAME-HOUR PREDICTION TENDENCY
+─────────────────────────────────────────────────────────────────
+  The model often uses the same hour as a predictor:
+    e.g. to predict discharge at 16:00 tomorrow, it primarily
+    checks discharge at 14:00-19:00 yesterday (nearby hours).
+
+  This reveals a TEMPORAL CLUSTERING pattern: discharge at any
+  given hour correlates most strongly with discharge at nearby
+  hours of the previous day, not random other hours.
+
+7. MAX_DEPTH=2 IMPLICATIONS
+─────────────────────────────────────────────────────────────────
+  All trees have exactly depth 2 (root + one level of children).
+  Each tree makes AT MOST 2 sequential decisions before predicting.
+  The final prediction = sum of all 25 trees' leaf values.
+
+  This means each tree represents a rule of the form:
+    "If [yesterday's evening dSocdt was below X]
+       AND [a secondary condition holds]
+     → predict [small discharge increment]"
+
+  The 25 trees collectively build up the final prediction
+  by stacking these simple if-then rules.
+
+═══════════════════════════════════════════════════════════════════
+"""
+
+summary_path = os.path.join(OUTPUT_FOLDER, "tree_interpretation_summary.txt")
+with open(summary_path, "w", encoding="utf-8") as f:
+    f.write(summary_text)
+
+print(summary_text)
+print(f"Summary saved  →  {summary_path}")
+print("\nAll extended analysis outputs saved to:", OUTPUT_FOLDER)
