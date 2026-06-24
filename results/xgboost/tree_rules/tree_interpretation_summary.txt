@@ -1,0 +1,108 @@
+
+═══════════════════════════════════════════════════════════════════
+TREE RULES INTERPRETATION SUMMARY
+XGBoost Battery Discharge Prediction Model
+═══════════════════════════════════════════════════════════════════
+
+OVERVIEW
+─────────────────────────────────────────────────────────────────
+Total split nodes analysed : 1800
+Unique features used       : 143
+Output hours covered       : 24  (00:00 – 23:00)
+Trees per hour             : 25
+Max tree depth             : 2  (all splits are at depth 0 or 1)
+
+1. FEATURE TYPE DOMINANCE
+─────────────────────────────────────────────────────────────────
+  dSocdt features : 86.3% of all split nodes
+  Soc features    : 11.1% of all split nodes
+  Date features   : 2.7% of all split nodes
+
+  → The model is overwhelmingly driven by past discharge RATE
+    (dSocdt), not battery level (SoC) or calendar information.
+    This confirms that HOW FAST the battery discharged yesterday
+    is far more predictive than HOW MUCH was left.
+
+2. RECENCY DOMINANCE — YESTERDAY MATTERS MOST
+─────────────────────────────────────────────────────────────────
+  Splits using day-minus-1 (yesterday) : 73.1% of all splits
+  Splits using day-minus-1 or -2       : 90.9% of all splits
+
+  → Over 73% of all decision nodes rely purely on YESTERDAY'S
+    data. Features from 3 or more days ago contribute less than
+    9% combined. This strongly suggests that a 2-day
+    or 3-day training window might be sufficient, and that very
+    old history adds little predictive value per tree.
+
+3. MOST DECISIVE SPLIT FEATURE (ROOT NODE ANALYSIS)
+─────────────────────────────────────────────────────────────────
+  Most frequent root split : dSocdt_h19_day_minus1
+  Used at root in          : 64 trees (10.7% of all root splits)
+
+  Top 5 root-split features (the first question each tree asks):
+    dSocdt_h19_day_minus1                               64 trees
+    dSocdt_h14_day_minus1                               61 trees
+    dSocdt_h23_day_minus1                               47 trees
+    dSocdt_h20_day_minus1                               45 trees
+    dSocdt_h15_day_minus1                               41 trees
+
+  → The evening hours (14:00–23:00) of yesterday are the most
+    critical decision points. Evening discharge patterns are the
+    strongest signal for predicting the NEXT day's behaviour.
+    This makes intuitive sense: heavy evening phone use (gaming,
+    video, social media) predicts a similar pattern tomorrow.
+
+4. DISCHARGE RATE THRESHOLDS — WHAT COUNTS AS "SIGNIFICANT"
+─────────────────────────────────────────────────────────────────
+  Median dSocdt split threshold  : -2.999 % SoC/hour
+  This means the model's typical decision boundary is:
+    "Was the device losing more than 3.0% SoC per hour?"
+
+  Notable thresholds by hour (median):
+    Hour 19-20 (7-8 PM)  : threshold ≈ -3.0 to -4.4 %/hr
+    Hour 22-23 (10-11 PM): threshold ≈ -5.1 to -15.8 %/hr (high usage)
+    Hour 03-05 (3-5 AM)  : threshold ≈ -0.9 to -1.0 %/hr (near-idle)
+
+  → Hours 22-23 have very negative thresholds, meaning the model
+    only branches on them when discharge is EXTREME (>5%/hr), i.e.
+    late-night heavy usage. Hours 3-5 AM have near-zero thresholds
+    because any discharge at all (device not charging) is unusual.
+
+5. SOC THRESHOLDS — BATTERY LEVEL TIPPING POINTS
+─────────────────────────────────────────────────────────────────
+  Median SoC split threshold : 43.6%
+  SoC features most used     : Soc_h10_day_minus1, Soc_h23_day_minus1
+
+  → When SoC IS used, the model looks at:
+    (a) SoC at 10:00 yesterday (mid-morning charge state)
+    (b) SoC at 23:00 yesterday (end-of-day battery level)
+    The ~43-50% median threshold suggests the model distinguishes
+    between "battery went below half" vs "stayed above half".
+    Users who end the day above 50% likely charged during the day
+    and will follow different discharge patterns.
+
+6. SAME-HOUR PREDICTION TENDENCY
+─────────────────────────────────────────────────────────────────
+  The model often uses the same hour as a predictor:
+    e.g. to predict discharge at 16:00 tomorrow, it primarily
+    checks discharge at 14:00-19:00 yesterday (nearby hours).
+
+  This reveals a TEMPORAL CLUSTERING pattern: discharge at any
+  given hour correlates most strongly with discharge at nearby
+  hours of the previous day, not random other hours.
+
+7. MAX_DEPTH=2 IMPLICATIONS
+─────────────────────────────────────────────────────────────────
+  All trees have exactly depth 2 (root + one level of children).
+  Each tree makes AT MOST 2 sequential decisions before predicting.
+  The final prediction = sum of all 25 trees' leaf values.
+
+  This means each tree represents a rule of the form:
+    "If [yesterday's evening dSocdt was below X]
+       AND [a secondary condition holds]
+     → predict [small discharge increment]"
+
+  The 25 trees collectively build up the final prediction
+  by stacking these simple if-then rules.
+
+═══════════════════════════════════════════════════════════════════

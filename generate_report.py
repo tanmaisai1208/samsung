@@ -789,3 +789,125 @@ def build_pdf():
 if __name__ == "__main__":
     import pandas   # ensure available
     build_pdf()
+
+
+// C++ Program of the above approach
+#include <bits/stdc++.h>
+using namespace std;
+
+int x[5] = { 0, 0, -1, 1 };
+int y[5] = { 1, -1, 0, 0 };
+
+// Function to check if coordinate
+// (i, j) lies inside N x M matrix
+bool safe(int i, int j, int N, int M)
+{
+    if (i < 0 || j < 0 || i >= N || j >= M)
+        return false;
+    return true;
+}
+
+// Function to perform a BFS
+// Traversal and mark visited
+void BFS(vector<vector<int> > matrix, int N, int M,
+         queue<pair<int, int> > q,
+         vector<vector<bool> >& vis)
+{
+    // Loop to traverse q
+    while (q.empty() == false) {
+        // Stores current coordinate
+        pair<int, int> cur = q.front();
+        q.pop();
+
+        // Mark current visited
+        vis[cur.first][cur.second] = true;
+        for (int i = 0; i < 4; i++) {
+            int nx = cur.first + x[i];
+            int ny = cur.second + y[i];
+
+            // If coordinate (nx, ny)
+            // is inbound and rechable
+            if (safe(nx, ny, N, M)
+                && matrix[nx][ny]
+                       >= matrix[cur.first]
+                                [cur.second]
+                && vis[nx][ny] == false) {
+                // Insert into queue
+                q.push({ nx, ny });
+
+                // Mark visited
+                vis[nx][ny] = true;
+            }
+        }
+    }
+}
+
+// Function to find the count of
+// valid coordinates
+int countCoordinates(vector<vector<int> > mat,
+                     int N, int M)
+{
+    // Queue to perform BFS
+    queue<pair<int, int> > q1, q2;
+
+    // Stores the visited coordinates
+    // during the 1st traversal
+    vector<vector<bool> > visited1(
+        N,
+        vector<bool>(M, false));
+
+    // Stores the visited coordinates
+    // during the 2nd traversal
+    vector<vector<bool> > visited2(
+        N,
+        vector<bool>(M, false));
+    }
+}
+
+
+bool check(adj,col,start){
+    col[start]=0;
+    queue<int>q;
+    q.push(start);
+    while(!q.empty()){
+        int node=q.front();
+        q.pop();
+        for(int child:adj[node]){
+            if(col[child]==-1){
+                col[child]=1-col[node];
+                q.push(child);
+            }else if(col[child]==col[node]){
+                return false;
+            }else{
+                continue;
+            }
+        }
+    }
+}
+
+edges=[[],[],[],[],[],[],[],[]]
+
+for(auto it:edges){
+    int u=it.frist, v=it.second;
+    adj[u].push_back(v);
+}
+
+for(i=0;i<n;i++){
+    if(col[i]==-1){
+        if(!check(adj,col,i)) return false;
+    }
+    return true;
+}
+
+
+Given a 2D grid img[][] representing an image, where each element img[i][j] is an integer that denotes the color of a pixel. Also there is a coordinates (sr, sc) representing the starting pixel (row sr and column sc) and an integer newColor, which represents the new color to apply.
+We need to perform a flood fill on the image starting from (sr, sc).
+It means we must change the color of the starting pixel and all other pixels that are connected to it (directly or indirectly) and have the same original color as the starting pixel.
+Two pixels are considered connected if they are adjacent horizontally or vertically (not diagonally).
+
+Example: 
+
+Input: sr = 1, sc = 2, newColor = 2, 
+img[][]= [[1, 1, 1, 0],  
+         [0, 1, 1, 1], 
+         [1, 0, 1, 1]]

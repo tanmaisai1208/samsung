@@ -1,0 +1,22 @@
+__What the reported model size represents__
+
+- The value printed by `model_size_estimate.py` and `model_size_curve.py` (e.g., __500 KB__) is the __size of the serialized XGBoost model on disk__ (the `pickle` file that is written to `model_pickle.bin` or `tmp_model.bin`).
+- This size is __independent of how many days you later predict__. It contains the learned parameters of the 25 shallow trees (max depth 2) and the wrapper (`MultiOutputRegressor`). Once the model is trained, the same file can be loaded and used to predict any number of days – 1 day, 10 days, 30 days, etc. The model size does __not__ increase with the number of predictions you make.
+- The __inference time__ measured in the scripts (e.g., __56 ms__ or __30 ms__) is the time taken for __a single prediction__ of one 24‑hour `dSocdt` vector (one day). If you need to predict 16 days, you would call `model.predict` 16 times (or batch‑predict an array of 16 samples), and the total time would be roughly 16 × single‑prediction time (plus any overhead for batching).
+- Therefore, in your example of a file with 30 days of data, the __500 KB model file__ is the fixed footprint required to store the trained model, and it can be used to predict day 15, 16, … 30 (or any other day) without increasing its size. The __total runtime__ for those 16 predictions would be roughly 16 × the per‑sample inference time reported by the script.
+
+__Bottom line:__ The model size is a one‑time storage cost for the trained model; it does not scale with the number of days you predict. Only the cumulative inference time grows linearly with the number of predictions you perform.
+
+
+--------------------------------------------------------------------------------------
+
+
+- __Each training window produces its own model__ that would have roughly the same size (≈ 500 KB) because the hyper‑parameters and model structure are identical; only the learned leaf values differ.
+
+- If you __saved every model to disk__, the total storage would be roughly:
+
+  `number_of_windows × model_size`
+
+  e.g. 16 windows × 0.5 MB ≈ __8 MB__.
+
+- In practice the pipeline __does not keep all models__ – it trains a model, makes the prediction for the next day, then discards (or overwrites) the model before moving to the next window. Therefore the __runtime memory footprint stays at a single model (≈ 0.5 MB)__, and you only need that amount of RAM at any moment.

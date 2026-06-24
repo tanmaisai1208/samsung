@@ -25,8 +25,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-SUMMARY_CSV  = "results/tree_rules/tree_rules_summary.csv"
-OUTPUT_FOLDER= "results/tree_rules"
+SUMMARY_CSV  = "results/xgboost/tree_rules/tree_rules_summary.csv"
+OUTPUT_FOLDER= "results/xgboost/tree_rules"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 HOURS = list(range(24))
