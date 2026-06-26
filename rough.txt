@@ -1,3 +1,24 @@
-one small task is to be donein the tre_rules.py file, its related to generation of one result png, which is tree_interp_hour_vs_predictor.png.
+PS C:\Users\chennagiri.s\Desktop\Soc> python xgboost_tree_rules.py
+Loaded 1800 split nodes from results/xgboost/tree_rules/tree_rules_summary.csv
+Saved: results/xgboost/tree_rules\tree_interp_root_features.png
 
-currently the result or interpretation given by it is: for a given future day's hour how many times is each hour of past day's is used by as root split by the trees. so i amthinking that from the heatmap plot i think we can also tell that for a future hour which is the most important past hour in doing predicition(so tell me whether what i thought about the heatmap is right not. And one more request is, i want u to change the code of tree_rules,py file where u have to don change in code related to generation of only this plot, what i want is, generate an even better heatmap between past hours and fututre hours where we can get even more deeper and useful interpretation along with whatever interpretation we are getting currently. And also mention in the plot whether the heatmap which we are getting is majority a diagnol matrix(where larger values are around diagnol cells of grid) or bidiagnol or tridiagnol or even higher etc
+Heatmap analysis:
+  Diagonal %     : 15.0%
+  Evening cols % : 54.0%  (cols 14-23)
+  Morning cols % : 23.4%  (cols 3-6)
+  Top-3 diagonal offsets: [(0, np.float64(88.0)), (-22, np.float64(69.0)), (2, np.float64(69.0))]
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_tree_rules.py", line 203, in <module>
+    ax_heat.add_patch(mpatches.Patch(color="steelblue", alpha=0.25,
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                       label=f"Evening cluster (14-23): {evening_pct:.0f}% of all splits"))
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\site-packages\matplotlib\axes\_base.py", line 2492, in add_patch
+    self._update_patch_limits(p)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Python314\Lib\site-packages\matplotlib\axes\_base.py", line 2510, in _update_patch_limits
+    p = patch.get_path()
+  File "C:\Python314\Lib\site-packages\matplotlib\patches.py", line 652, in get_path
+    raise NotImplementedError('Derived must override')
+NotImplementedError: Derived must override
+PS C:\Users\chennagiri.s\Desktop\Soc> 
