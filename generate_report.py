@@ -898,16 +898,3 @@ for(i=0;i<n;i++){
     }
     return true;
 }
-
-
-Given a 2D grid img[][] representing an image, where each element img[i][j] is an integer that denotes the color of a pixel. Also there is a coordinates (sr, sc) representing the starting pixel (row sr and column sc) and an integer newColor, which represents the new color to apply.
-We need to perform a flood fill on the image starting from (sr, sc).
-It means we must change the color of the starting pixel and all other pixels that are connected to it (directly or indirectly) and have the same original color as the starting pixel.
-Two pixels are considered connected if they are adjacent horizontally or vertically (not diagonally).
-
-Example: 
-
-Input: sr = 1, sc = 2, newColor = 2, 
-img[][]= [[1, 1, 1, 0],  
-         [0, 1, 1, 1], 
-         [1, 0, 1, 1]]
