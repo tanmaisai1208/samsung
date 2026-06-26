@@ -8,9 +8,9 @@ existing PNG files.
 Run from inside SOC-folder:
     python battery_tree_analysis_extended.py
 
-Outputs (all inside results/tree_rules/):
+Outputs (all inside results/xgboost/tree_rules/):
   tree_interp_root_features.png       — which features dominate at root (depth=0)
-  tree_interp_hour_vs_predictor.png   — heatmap: which past hour predicts each output hour
+  tree_interp_hour_vs_predictor.png   — enhanced heatmap: past hour vs future hour
   tree_interp_dsocdt_thresholds.png   — discharge rate thresholds by hour of day
   tree_interp_soc_thresholds.png      — SoC level thresholds used in splits
   tree_interp_recency_dominance.png   — how split usage drops off with days-back
@@ -24,6 +24,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
 
 SUMMARY_CSV  = "results/xgboost/tree_rules/tree_rules_summary.csv"
 OUTPUT_FOLDER= "results/xgboost/tree_rules"
@@ -37,19 +39,17 @@ HOURS = list(range(24))
 df = pd.read_csv(SUMMARY_CSV)
 print(f"Loaded {len(df)} split nodes from {SUMMARY_CSV}")
 
-roots   = df[df["depth"] == 0].copy()
-dsocdt  = df[df["feature_type"] == "dSocdt"].copy()
-soc     = df[df["feature_type"] == "Soc"].copy()
+roots  = df[df["depth"] == 0].copy()
+dsocdt = df[df["feature_type"] == "dSocdt"].copy()
+soc    = df[df["feature_type"] == "Soc"].copy()
 
-# Extract hour-of-day encoded in the feature name (e.g. dSocdt_h19 → 19)
-df["feat_hour"]   = df["feature"].str.extract(r"_h(\d+)_").astype(float)
-roots["feat_hour"]= roots["feature"].str.extract(r"_h(\d+)_").astype(float)
+df["feat_hour"]    = df["feature"].str.extract(r"_h(\d+)_").astype(float)
+roots["feat_hour"] = roots["feature"].str.extract(r"_h(\d+)_").astype(float)
 dsocdt["feat_hour"]= dsocdt["feature"].str.extract(r"_h(\d+)_").astype(float)
 
 
 # ─────────────────────────────────────────────────────────────
 # PLOT 1 — Root node feature frequency
-# (The root split is the single most important decision in each tree)
 # ─────────────────────────────────────────────────────────────
 root_feat_counts = (roots.groupby(["feature", "feature_type"])
                           .size().reset_index(name="count")
@@ -65,22 +65,17 @@ ax.barh(range(len(root_feat_counts)), root_feat_counts["count"].values,
 ax.set_yticks(range(len(root_feat_counts)))
 ax.set_yticklabels(root_feat_counts["feature"].values, fontsize=9)
 ax.invert_yaxis()
-ax.set_xlabel("Number of trees where this feature is the FIRST split (root node)",
-              fontsize=11)
+ax.set_xlabel("Number of trees where this feature is the FIRST split (root node)", fontsize=11)
 ax.set_title("Most Frequent Root-Node Split Features\n"
              "(root split = the single most decisive condition in each tree)",
              fontsize=12, fontweight="bold")
-from matplotlib.patches import Patch
 ax.legend(handles=[
-    Patch(facecolor="steelblue",  label="dSocdt features"),
-    Patch(facecolor="darkorange", label="Soc features"),
+    mpatches.Patch(facecolor="steelblue",  label="dSocdt features"),
+    mpatches.Patch(facecolor="darkorange", label="Soc features"),
 ], fontsize=9, loc="lower right")
 ax.grid(axis="x", linestyle="--", alpha=0.4)
-
-# Annotate counts
 for i, v in enumerate(root_feat_counts["count"].values):
     ax.text(v + 0.5, i, str(v), va="center", fontsize=8.5, fontweight="bold")
-
 fig.tight_layout()
 path = os.path.join(OUTPUT_FOLDER, "tree_interp_root_features.png")
 fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -89,58 +84,186 @@ print(f"Saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────────
-# PLOT 2 — Heatmap: which past hour predicts which output hour
+# PLOT 2 — ENHANCED Heatmap: past hour vs future hour
 # ─────────────────────────────────────────────────────────────
+
 roots_clean = roots.dropna(subset=["feat_hour"]).copy()
 roots_clean["feat_hour"] = roots_clean["feat_hour"].astype(int)
 
+# Build the 24×24 cross-frequency matrix
 cross = (roots_clean.groupby(["hour", "feat_hour"])
                     .size().unstack(fill_value=0))
-# Ensure all 24 hours are present on both axes
 cross = cross.reindex(index=range(24), columns=range(24), fill_value=0)
+mat   = cross.values.astype(float)
 
-fig, ax = plt.subplots(figsize=(13, 10))
-im = ax.imshow(cross.values, cmap="YlOrRd", aspect="auto")
+# Per-row: which past hour is the single best predictor for each future hour?
+best_past_hour = np.argmax(mat, axis=1)          # (24,) — one per future hour
+best_past_val  = mat[range(24), best_past_hour]  # (24,) — count of that best
 
-# ---- Move hour labels to the **top** of the plot ----
-ax.set_xticks(range(24))
-ax.set_xticklabels([f"{h:02d}" for h in range(24)], fontsize=8)
-ax.xaxis.set_label_position('top')   # place the x‑axis label on top
-ax.xaxis.tick_top()                  # move the tick labels to the top
+# Column sums: how much each past hour contributes across ALL future hours
+col_sums = mat.sum(axis=0)
 
-ax.set_yticks(range(24))
-ax.set_yticklabels([f"{h:02d}:00" for h in range(24)], fontsize=8)
+# Diagonal analysis
+diag_sum   = np.trace(mat)
+total_sum  = mat.sum()
+diag_pct   = 100 * diag_sum / total_sum
 
-ax.set_xlabel(
-    "Hour of day in the split feature  (past day's discharge at this hour)",
-    fontsize=11)
-ax.set_ylabel("Output hour being predicted", fontsize=11)
-ax.set_title(
-    "Which Past Hour's Discharge Rate Predicts Each Future Hour?\n"
-    "(cell brightness = how often that past hour is the root‑split feature)",
-    fontsize=12, fontweight="bold")
+# Off-diagonal bands: compute sum along each diagonal offset k
+band_sums  = {}
+for k in range(-23, 24):
+    band_sums[k] = np.sum([mat[i, (i + k) % 24] for i in range(24)])
 
-plt.colorbar(im, ax=ax, label="Root-split frequency", pad=0.01)
+# Dominant band structure: top-3 offsets by weight
+sorted_bands = sorted(band_sums.items(), key=lambda x: -x[1])
+top3_bands   = sorted_bands[:3]
 
-# Highlight diagonal band (same‑hour prediction tendency)
+# Evening cluster (columns 14-23) vs early-morning cluster (columns 3-6)
+evening_cols = list(range(14, 24))
+morning_cols = list(range(3, 7))
+evening_pct  = 100 * mat[:, evening_cols].sum() / total_sum
+morning_pct  = 100 * mat[:, morning_cols].sum() / total_sum
+
+print(f"\nHeatmap analysis:")
+print(f"  Diagonal %     : {diag_pct:.1f}%")
+print(f"  Evening cols % : {evening_pct:.1f}%  (cols 14-23)")
+print(f"  Morning cols % : {morning_pct:.1f}%  (cols 3-6)")
+print(f"  Top-3 diagonal offsets: {top3_bands}")
+
+# Determine structure label
+if diag_pct > 40:
+    structure_label = "Strongly diagonal (same-hour patterns dominate)"
+elif diag_pct > 20:
+    structure_label = "Weakly diagonal (some same-hour tendency)"
+else:
+    if evening_pct > 40:
+        structure_label = "Vertical-band structure (evening hours dominate as predictors for ALL future hours)"
+    else:
+        structure_label = "Diffuse / multi-band (no single dominant structure)"
+
+# ── Figure layout: main heatmap + marginal bars ──────────────
+fig = plt.figure(figsize=(16, 13))
+gs  = GridSpec(3, 3, figure=fig,
+               width_ratios=[0.08, 1, 0.35],
+               height_ratios=[0.35, 1, 0.08],
+               hspace=0.06, wspace=0.06)
+
+ax_heat   = fig.add_subplot(gs[1, 1])   # main heatmap
+ax_top    = fig.add_subplot(gs[0, 1])   # top bar: column sums (past hour importance)
+ax_right  = fig.add_subplot(gs[1, 2])   # right bar: best-predictor per future hour
+ax_left   = fig.add_subplot(gs[1, 0])   # left bar: row sums (future hour activity)
+
+# ── Main heatmap ─────────────────────────────────────────────
+im = ax_heat.imshow(mat, cmap="YlOrRd", aspect="auto",
+                    vmin=0, vmax=mat.max())
+
+# Grid lines
+for x in range(-1, 24):
+    ax_heat.axvline(x + 0.5, color="white", linewidth=0.3, alpha=0.5)
+for y in range(-1, 24):
+    ax_heat.axhline(y + 0.5, color="white", linewidth=0.3, alpha=0.5)
+
+# Mark the best past hour for each future hour (star marker)
+for fut_h in range(24):
+    past_h = best_past_hour[fut_h]
+    ax_heat.plot(past_h, fut_h, marker="*", color="blue",
+                 markersize=9, zorder=5, alpha=0.85)
+
+# Shade the two dominant past-hour clusters
+for col in evening_cols:
+    ax_heat.axvspan(col - 0.5, col + 0.5,
+                    color="steelblue", alpha=0.08, zorder=0)
+for col in morning_cols:
+    ax_heat.axvspan(col - 0.5, col + 0.5,
+                    color="orange", alpha=0.08, zorder=0)
+
+# Annotate each cell with its count (only if > 0)
 for i in range(24):
-    ax.add_patch(
-        plt.Rectangle((i-0.5, i-0.5), 1, 1,
-                      fill=False, edgecolor="blue",
-                      linewidth=0.6, alpha=0.4))
+    for j in range(24):
+        v = int(mat[i, j])
+        if v > 0:
+            txt_color = "white" if v > mat.max() * 0.6 else "black"
+            ax_heat.text(j, i, str(v), ha="center", va="center",
+                         fontsize=5.5, color=txt_color, fontweight="bold")
 
-fig.tight_layout()
+ax_heat.set_xticks(range(24))
+ax_heat.set_xticklabels([f"{h:02d}" for h in range(24)],
+                         fontsize=7.5, rotation=45, ha="right")
+ax_heat.xaxis.set_label_position("bottom")
+ax_heat.xaxis.tick_bottom()
+ax_heat.set_yticks(range(24))
+ax_heat.set_yticklabels([f"{h:02d}:00" for h in range(24)], fontsize=7.5)
+ax_heat.set_xlabel("Past hour used as split feature  (yesterday)", fontsize=10)
+ax_heat.set_ylabel("Future hour being predicted  (tomorrow)", fontsize=10)
+
+plt.colorbar(im, ax=ax_heat, label="Root-split frequency", pad=0.01, shrink=0.8)
+
+# Legend
+ax_heat.plot([], [], marker="*", color="blue", linestyle="None",
+             markersize=8, label="Best past-hour predictor for that row")
+ax_heat.add_patch(mpatches.Patch(color="steelblue", alpha=0.25,
+                                   label=f"Evening cluster (14-23): {evening_pct:.0f}% of all splits"))
+ax_heat.add_patch(mpatches.Patch(color="orange", alpha=0.35,
+                                   label=f"Morning cluster (03-06): {morning_pct:.0f}% of all splits"))
+ax_heat.legend(fontsize=7.5, loc="upper left",
+               bbox_to_anchor=(0.0, -0.18), ncol=1)
+
+# ── Top bar: column sums (how much each past hour is used overall) ──
+ax_top.bar(range(24), col_sums,
+           color=["steelblue" if h in evening_cols
+                  else ("darkorange" if h in morning_cols else "lightgray")
+                  for h in range(24)],
+           edgecolor="white", linewidth=0.5)
+ax_top.set_xlim(-0.5, 23.5)
+ax_top.set_xticks([])
+ax_top.set_ylabel("Total\nroot-split\ncount", fontsize=8, labelpad=3)
+ax_top.set_title("", fontsize=1)
+ax_top.grid(axis="y", linestyle="--", alpha=0.4)
+ax_top.set_title(
+    f"Past Hour → Future Hour Root-Split Heatmap\n"
+    f"Structure: {structure_label}\n"
+    f"(Main diagonal = {diag_pct:.1f}% of total — "
+    f"{'NOT a diagonal matrix' if diag_pct < 25 else 'diagonal tendency present'})",
+    fontsize=11, fontweight="bold", pad=6
+)
+# Annotate top-3 columns
+for past_h, cnt in sorted(enumerate(col_sums), key=lambda x: -x[1])[:3]:
+    ax_top.annotate(f"h{past_h:02d}\n{int(cnt)}",
+                    xy=(past_h, cnt), xytext=(0, 4),
+                    textcoords="offset points",
+                    ha="center", fontsize=7, color="navy", fontweight="bold")
+
+# ── Right bar: best past-hour and its count for each future hour ──
+ax_right.barh(range(24), best_past_val,
+              color="tomato", edgecolor="white", linewidth=0.5, alpha=0.8)
+ax_right.set_ylim(-0.5, 23.5)
+ax_right.set_yticks([])
+ax_right.set_xlabel("Best-predictor\ncount", fontsize=8)
+ax_right.grid(axis="x", linestyle="--", alpha=0.4)
+for fut_h in range(24):
+    ax_right.text(best_past_val[fut_h] + 0.3, fut_h,
+                  f"h{best_past_hour[fut_h]:02d}",
+                  va="center", fontsize=6.5, color="darkred", fontweight="bold")
+
+# ── Left bar: row sums (total splits for each future hour) ──
+row_sums = mat.sum(axis=1)
+ax_left.barh(range(24), row_sums,
+             color="slategray", edgecolor="white", linewidth=0.5, alpha=0.7)
+ax_left.set_ylim(-0.5, 23.5)
+ax_left.set_yticks([])
+ax_left.invert_xaxis()
+ax_left.set_xlabel("Total\nsplits", fontsize=8)
+ax_left.grid(axis="x", linestyle="--", alpha=0.4)
+
+fig.suptitle("", y=0.0)  # spacer
+
 path = os.path.join(OUTPUT_FOLDER, "tree_interp_hour_vs_predictor.png")
 fig.savefig(path, dpi=150, bbox_inches="tight")
 plt.close(fig)
 print(f"Saved: {path}")
 
 
-
 # ─────────────────────────────────────────────────────────────
 # PLOT 3 — dSocdt split thresholds by hour of day
-# Shows WHAT discharge rate level the model considers "significant"
-# for each hour of the day
 # ─────────────────────────────────────────────────────────────
 dsocdt_clean = dsocdt.dropna(subset=["feat_hour"]).copy()
 dsocdt_clean["feat_hour"] = dsocdt_clean["feat_hour"].astype(int)
@@ -151,10 +274,9 @@ thresh_by_hour = (dsocdt_clean.groupby("feat_hour")["threshold"]
 
 fig, axes = plt.subplots(2, 1, figsize=(14, 10))
 
-# Panel 1 — median threshold per hour (the typical decision boundary)
 ax = axes[0]
-bars = ax.bar(range(24), thresh_by_hour["median"].values,
-              color="steelblue", alpha=0.8, edgecolor="white")
+ax.bar(range(24), thresh_by_hour["median"].values,
+       color="steelblue", alpha=0.8, edgecolor="white")
 ax.errorbar(range(24), thresh_by_hour["median"].values,
             yerr=thresh_by_hour["std"].fillna(0).values,
             fmt="none", color="navy", linewidth=1.2, capsize=3)
@@ -167,14 +289,12 @@ ax.set_title("Typical Discharge Rate Decision Boundary per Hour\n"
              "(how negative dSocdt must be before model treats it as 'significant discharge')",
              fontsize=11, fontweight="bold")
 ax.grid(axis="y", linestyle="--", alpha=0.4)
-# Annotate a few notable hours
 for h in [19, 20, 22, 23]:
     v = thresh_by_hour["median"].iloc[h]
     if not np.isnan(v):
         ax.text(h, v - 0.8, f"{v:.1f}", ha="center", fontsize=8,
                 color="white", fontweight="bold")
 
-# Panel 2 — split count per hour (how often each hour is used)
 ax2 = axes[1]
 ax2.bar(range(24), thresh_by_hour["count"].values,
         color="darkorange", alpha=0.8, edgecolor="white")
@@ -201,7 +321,6 @@ print(f"Saved: {path}")
 if len(soc) > 0:
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Left: histogram of all SoC thresholds
     ax = axes[0]
     ax.hist(soc["threshold"].values, bins=30, color="darkorange",
             edgecolor="white", alpha=0.85)
@@ -220,10 +339,8 @@ if len(soc) > 0:
     ax.legend(fontsize=9)
     ax.grid(axis="y", linestyle="--", alpha=0.4)
 
-    # Right: top SoC features by usage
     ax2 = axes[1]
-    top_soc = (soc.groupby("feature").size()
-                   .sort_values(ascending=False).head(12))
+    top_soc = soc.groupby("feature").size().sort_values(ascending=False).head(12)
     ax2.barh(range(len(top_soc)), top_soc.values,
              color="darkorange", edgecolor="white", alpha=0.85)
     ax2.set_yticks(range(len(top_soc)))
@@ -243,7 +360,7 @@ if len(soc) > 0:
 
 
 # ─────────────────────────────────────────────────────────────
-# PLOT 5 — Recency dominance: how split usage drops off with days-back
+# PLOT 5 — Recency dominance
 # ─────────────────────────────────────────────────────────────
 recency = (df.groupby(["days_back", "feature_type"])["feature"]
              .count().reset_index(name="count"))
@@ -257,17 +374,13 @@ for col in recency_pivot.columns:
     ax.plot(recency_pivot.index, recency_pivot[col].values,
             marker="o", linewidth=2.2, color=clrs.get(col, "gray"),
             label=col, markersize=6)
-    # Fill under curve for dSocdt (dominant type)
     if col == "dSocdt":
         ax.fill_between(recency_pivot.index, recency_pivot[col].values,
                         alpha=0.12, color=clrs[col])
 
-ax.set_xlabel("Days back from prediction day  (1 = yesterday, 14 = 2 weeks ago)",
-              fontsize=11)
-ax.set_ylabel("Number of tree split nodes using features from that day",
-              fontsize=11)
-ax.set_title("Recency Effect: How Split Node Usage Drops Off with Days-Back\n"
-             "(confirms whether yesterday dominates or older history also matters)",
+ax.set_xlabel("Days back from prediction day  (1 = yesterday, 14 = 2 weeks ago)", fontsize=11)
+ax.set_ylabel("Number of tree split nodes using features from that day", fontsize=11)
+ax.set_title("Recency Effect: How Split Node Usage Drops Off with Days-Back",
              fontsize=12, fontweight="bold")
 ax.set_xticks(recency_pivot.index)
 ax.set_xticklabels([f"day-{d}" for d in recency_pivot.index],
@@ -275,7 +388,6 @@ ax.set_xticklabels([f"day-{d}" for d in recency_pivot.index],
 ax.legend(fontsize=10)
 ax.grid(linestyle="--", alpha=0.4)
 
-# Annotate drop-off percentage
 d1 = recency_pivot["dSocdt"].iloc[0] if "dSocdt" in recency_pivot.columns else 0
 d2 = recency_pivot["dSocdt"].iloc[1] if len(recency_pivot) > 1 else 0
 if d1 > 0:
@@ -296,28 +408,21 @@ print(f"Saved: {path}")
 # ─────────────────────────────────────────────────────────────
 # PLAIN-ENGLISH INTERPRETATION SUMMARY
 # ─────────────────────────────────────────────────────────────
-total_splits   = len(df)
-day1_splits    = len(df[df["days_back"] == 1])
-day1_pct       = 100 * day1_splits / total_splits
-day2_splits    = len(df[df["days_back"] == 2])
-day12_pct      = 100 * (day1_splits + day2_splits) / total_splits
-dsocdt_pct     = 100 * len(df[df["feature_type"] == "dSocdt"]) / total_splits
-soc_pct        = 100 * len(df[df["feature_type"] == "Soc"]) / total_splits
-date_pct       = 100 * len(df[df["feature_type"] == "Date"]) / total_splits
+total_splits  = len(df)
+day1_splits   = len(df[df["days_back"] == 1])
+day1_pct      = 100 * day1_splits / total_splits
+day2_splits   = len(df[df["days_back"] == 2])
+day12_pct     = 100 * (day1_splits + day2_splits) / total_splits
+dsocdt_pct    = 100 * len(df[df["feature_type"] == "dSocdt"]) / total_splits
+soc_pct       = 100 * len(df[df["feature_type"] == "Soc"]) / total_splits
+date_pct      = 100 * len(df[df["feature_type"] == "Date"]) / total_splits
 
-top_root = (roots.groupby("feature").size().idxmax())
+top_root       = roots.groupby("feature").size().idxmax()
 top_root_count = roots.groupby("feature").size().max()
 top_root_pct   = 100 * top_root_count / len(roots)
 
 dsocdt_med_thresh = dsocdt["threshold"].median()
 soc_med_thresh    = soc["threshold"].median() if len(soc) > 0 else float("nan")
-
-# Hours where same-hour is used at root
-same_hour_usage = {}
-for h in range(24):
-    r_h = roots_clean[roots_clean["hour"] == h]
-    same_h = r_h[r_h["feat_hour"] == h]
-    same_hour_usage[h] = len(same_h)
 
 summary_text = f"""
 ═══════════════════════════════════════════════════════════════════
@@ -341,92 +446,61 @@ Max tree depth             : 2  (all splits are at depth 0 or 1)
 
   → The model is overwhelmingly driven by past discharge RATE
     (dSocdt), not battery level (SoC) or calendar information.
-    This confirms that HOW FAST the battery discharged yesterday
-    is far more predictive than HOW MUCH was left.
 
 2. RECENCY DOMINANCE — YESTERDAY MATTERS MOST
 ─────────────────────────────────────────────────────────────────
   Splits using day-minus-1 (yesterday) : {day1_pct:.1f}% of all splits
   Splits using day-minus-1 or -2       : {day12_pct:.1f}% of all splits
 
-  → Over {day1_pct:.0f}% of all decision nodes rely purely on YESTERDAY'S
-    data. Features from 3 or more days ago contribute less than
-    {100 - day12_pct:.0f}% combined. This strongly suggests that a 2-day
-    or 3-day training window might be sufficient, and that very
-    old history adds little predictive value per tree.
-
 3. MOST DECISIVE SPLIT FEATURE (ROOT NODE ANALYSIS)
 ─────────────────────────────────────────────────────────────────
   Most frequent root split : {top_root}
   Used at root in          : {top_root_count} trees ({top_root_pct:.1f}% of all root splits)
 
-  Top 5 root-split features (the first question each tree asks):
+  Top 5 root-split features:
 """
-
-top5_roots = (roots.groupby("feature").size()
-                    .sort_values(ascending=False).head(5))
+top5_roots = roots.groupby("feature").size().sort_values(ascending=False).head(5)
 for feat, cnt in top5_roots.items():
     summary_text += f"    {feat:50s}  {cnt} trees\n"
 
 summary_text += f"""
-  → The evening hours (14:00–23:00) of yesterday are the most
-    critical decision points. Evening discharge patterns are the
-    strongest signal for predicting the NEXT day's behaviour.
-    This makes intuitive sense: heavy evening phone use (gaming,
-    video, social media) predicts a similar pattern tomorrow.
-
-4. DISCHARGE RATE THRESHOLDS — WHAT COUNTS AS "SIGNIFICANT"
+4. HOUR-VS-PREDICTOR HEATMAP STRUCTURE
 ─────────────────────────────────────────────────────────────────
-  Median dSocdt split threshold  : {dsocdt_med_thresh:.3f} % SoC/hour
-  This means the model's typical decision boundary is:
-    "Was the device losing more than {abs(dsocdt_med_thresh):.1f}% SoC per hour?"
+  Diagonal (same-hour predicts same-hour) : {diag_pct:.1f}% of root splits
+  → This is NOT a diagonal matrix. Only {diag_pct:.0f}% of splits lie
+    on the main diagonal, meaning same-hour self-prediction is NOT
+    the dominant pattern.
 
-  Notable thresholds by hour (median):
-    Hour 19-20 (7-8 PM)  : threshold ≈ -3.0 to -4.4 %/hr
-    Hour 22-23 (10-11 PM): threshold ≈ -5.1 to -15.8 %/hr (high usage)
-    Hour 03-05 (3-5 AM)  : threshold ≈ -0.9 to -1.0 %/hr (near-idle)
+  Structure identified : {structure_label}
 
-  → Hours 22-23 have very negative thresholds, meaning the model
-    only branches on them when discharge is EXTREME (>5%/hr), i.e.
-    late-night heavy usage. Hours 3-5 AM have near-zero thresholds
-    because any discharge at all (device not charging) is unusual.
+  Evening cluster (past hours 14-23) : {evening_pct:.1f}% of all root splits
+  Morning cluster (past hours 03-06) : {morning_pct:.1f}% of all root splits
 
-5. SOC THRESHOLDS — BATTERY LEVEL TIPPING POINTS
+  → The heatmap shows a VERTICAL-BAND pattern rather than a
+    diagonal. This means that regardless of which future hour
+    is being predicted, the model predominantly looks at
+    EVENING and EARLY-MORNING hours of yesterday.
+
+  Per-future-hour best predictor:
+    Hour 00 → past hour 23  Hour 12 → past hour 14
+    Hour 10 → past hour 15  Hour 14 → past hour 19
+    Hour 17 → past hour 19  Hour 19 → past hour 14
+
+5. DISCHARGE RATE THRESHOLDS
+─────────────────────────────────────────────────────────────────
+  Median dSocdt split threshold : {dsocdt_med_thresh:.3f} % SoC/hour
+  Hours 22-23 threshold         : ~-5.1 to -15.8 %/hr  (extreme usage)
+  Hours 03-05 threshold         : ~-0.9 to -1.0 %/hr   (near-idle)
+
+6. SOC THRESHOLDS — BATTERY LEVEL TIPPING POINTS
 ─────────────────────────────────────────────────────────────────
   Median SoC split threshold : {soc_med_thresh:.1f}%
-  SoC features most used     : Soc_h10_day_minus1, Soc_h23_day_minus1
-
-  → When SoC IS used, the model looks at:
-    (a) SoC at 10:00 yesterday (mid-morning charge state)
-    (b) SoC at 23:00 yesterday (end-of-day battery level)
-    The ~43-50% median threshold suggests the model distinguishes
-    between "battery went below half" vs "stayed above half".
-    Users who end the day above 50% likely charged during the day
-    and will follow different discharge patterns.
-
-6. SAME-HOUR PREDICTION TENDENCY
-─────────────────────────────────────────────────────────────────
-  The model often uses the same hour as a predictor:
-    e.g. to predict discharge at 16:00 tomorrow, it primarily
-    checks discharge at 14:00-19:00 yesterday (nearby hours).
-
-  This reveals a TEMPORAL CLUSTERING pattern: discharge at any
-  given hour correlates most strongly with discharge at nearby
-  hours of the previous day, not random other hours.
+  Most used: Soc_h10_day_minus1, Soc_h23_day_minus1
 
 7. MAX_DEPTH=2 IMPLICATIONS
 ─────────────────────────────────────────────────────────────────
-  All trees have exactly depth 2 (root + one level of children).
   Each tree makes AT MOST 2 sequential decisions before predicting.
-  The final prediction = sum of all 25 trees' leaf values.
-
-  This means each tree represents a rule of the form:
-    "If [yesterday's evening dSocdt was below X]
-       AND [a secondary condition holds]
-     → predict [small discharge increment]"
-
-  The 25 trees collectively build up the final prediction
-  by stacking these simple if-then rules.
+  Final prediction = sum of all 25 trees' leaf values.
 
 ═══════════════════════════════════════════════════════════════════
 """
@@ -437,4 +511,4 @@ with open(summary_path, "w", encoding="utf-8") as f:
 
 print(summary_text)
 print(f"Summary saved  →  {summary_path}")
-print("\nAll extended analysis outputs saved to:", OUTPUT_FOLDER)
+print("All outputs saved to:", OUTPUT_FOLDER)
