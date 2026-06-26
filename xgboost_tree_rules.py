@@ -102,30 +102,39 @@ cross = cross.reindex(index=range(24), columns=range(24), fill_value=0)
 fig, ax = plt.subplots(figsize=(13, 10))
 im = ax.imshow(cross.values, cmap="YlOrRd", aspect="auto")
 
+# ---- Move hour labels to the **top** of the plot ----
 ax.set_xticks(range(24))
 ax.set_xticklabels([f"{h:02d}" for h in range(24)], fontsize=8)
+ax.xaxis.set_label_position('top')   # place the x‑axis label on top
+ax.xaxis.tick_top()                  # move the tick labels to the top
+
 ax.set_yticks(range(24))
 ax.set_yticklabels([f"{h:02d}:00" for h in range(24)], fontsize=8)
-ax.set_xlabel("Hour of day in the split feature  (past day's discharge at this hour)",
-              fontsize=11)
+
+ax.set_xlabel(
+    "Hour of day in the split feature  (past day's discharge at this hour)",
+    fontsize=11)
 ax.set_ylabel("Output hour being predicted", fontsize=11)
-ax.set_title("Which Past Hour's Discharge Rate Predicts Each Future Hour?\n"
-             "(cell brightness = how often that past hour is the root-split feature)",
-             fontsize=12, fontweight="bold")
+ax.set_title(
+    "Which Past Hour's Discharge Rate Predicts Each Future Hour?\n"
+    "(cell brightness = how often that past hour is the root‑split feature)",
+    fontsize=12, fontweight="bold")
 
 plt.colorbar(im, ax=ax, label="Root-split frequency", pad=0.01)
 
-# Highlight diagonal band (same-hour prediction tendency)
+# Highlight diagonal band (same‑hour prediction tendency)
 for i in range(24):
-    ax.add_patch(plt.Rectangle((i-0.5, i-0.5), 1, 1,
-                                fill=False, edgecolor="blue",
-                                linewidth=0.6, alpha=0.4))
+    ax.add_patch(
+        plt.Rectangle((i-0.5, i-0.5), 1, 1,
+                      fill=False, edgecolor="blue",
+                      linewidth=0.6, alpha=0.4))
 
 fig.tight_layout()
 path = os.path.join(OUTPUT_FOLDER, "tree_interp_hour_vs_predictor.png")
 fig.savefig(path, dpi=150, bbox_inches="tight")
 plt.close(fig)
 print(f"Saved: {path}")
+
 
 
 # ─────────────────────────────────────────────────────────────
