@@ -1,516 +1,144 @@
-"""
-Battery Management - Extended Tree Rules Interpretation & Analysis
-======================================================================================
-Reads the already-generated tree_rules_summary.csv and produces additional
-interpretation plots and statistics that can't be directly read off the
-existing PNG files.
-
-Run from inside SOC-folder:
-    python battery_tree_analysis_extended.py
-
-Outputs (all inside results/xgboost/tree_rules/):
-  tree_interp_root_features.png       — which features dominate at root (depth=0)
-  tree_interp_hour_vs_predictor.png   — enhanced heatmap: past hour vs future hour
-  tree_interp_dsocdt_thresholds.png   — discharge rate thresholds by hour of day
-  tree_interp_soc_thresholds.png      — SoC level thresholds used in splits
-  tree_interp_recency_dominance.png   — how split usage drops off with days-back
-  tree_interpretation_summary.txt     — plain-English interpretation of all findings
-"""
-
-import os
-import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import matplotlib.patches as mpatches
-from matplotlib.gridspec import GridSpec
-
-SUMMARY_CSV  = "results/xgboost/tree_rules/tree_rules_summary.csv"
-OUTPUT_FOLDER= "results/xgboost/tree_rules"
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-HOURS = list(range(24))
-
-# ─────────────────────────────────────────────────────────────
-# LOAD
-# ─────────────────────────────────────────────────────────────
-df = pd.read_csv(SUMMARY_CSV)
-print(f"Loaded {len(df)} split nodes from {SUMMARY_CSV}")
-
-roots  = df[df["depth"] == 0].copy()
-dsocdt = df[df["feature_type"] == "dSocdt"].copy()
-soc    = df[df["feature_type"] == "Soc"].copy()
-
-df["feat_hour"]    = df["feature"].str.extract(r"_h(\d+)_").astype(float)
-roots["feat_hour"] = roots["feature"].str.extract(r"_h(\d+)_").astype(float)
-dsocdt["feat_hour"]= dsocdt["feature"].str.extract(r"_h(\d+)_").astype(float)
-
-
-# ─────────────────────────────────────────────────────────────
-# PLOT 1 — Root node feature frequency
-# ─────────────────────────────────────────────────────────────
-root_feat_counts = (roots.groupby(["feature", "feature_type"])
-                          .size().reset_index(name="count")
-                          .sort_values("count", ascending=False)
-                          .head(20))
-
-color_map  = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
-bar_colors = [color_map.get(t, "gray") for t in root_feat_counts["feature_type"]]
-
-fig, ax = plt.subplots(figsize=(12, 7))
-ax.barh(range(len(root_feat_counts)), root_feat_counts["count"].values,
-        color=bar_colors, edgecolor="white", linewidth=0.5)
-ax.set_yticks(range(len(root_feat_counts)))
-ax.set_yticklabels(root_feat_counts["feature"].values, fontsize=9)
-ax.invert_yaxis()
-ax.set_xlabel("Number of trees where this feature is the FIRST split (root node)", fontsize=11)
-ax.set_title("Most Frequent Root-Node Split Features\n"
-             "(root split = the single most decisive condition in each tree)",
-             fontsize=12, fontweight="bold")
-ax.legend(handles=[
-    mpatches.Patch(facecolor="steelblue",  label="dSocdt features"),
-    mpatches.Patch(facecolor="darkorange", label="Soc features"),
-], fontsize=9, loc="lower right")
-ax.grid(axis="x", linestyle="--", alpha=0.4)
-for i, v in enumerate(root_feat_counts["count"].values):
-    ax.text(v + 0.5, i, str(v), va="center", fontsize=8.5, fontweight="bold")
-fig.tight_layout()
-path = os.path.join(OUTPUT_FOLDER, "tree_interp_root_features.png")
-fig.savefig(path, dpi=150, bbox_inches="tight")
-plt.close(fig)
-print(f"Saved: {path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# PLOT 2 — ENHANCED Heatmap: past hour vs future hour
-# ─────────────────────────────────────────────────────────────
-
-roots_clean = roots.dropna(subset=["feat_hour"]).copy()
-roots_clean["feat_hour"] = roots_clean["feat_hour"].astype(int)
-
-# Build the 24×24 cross-frequency matrix
-cross = (roots_clean.groupby(["hour", "feat_hour"])
-                    .size().unstack(fill_value=0))
-cross = cross.reindex(index=range(24), columns=range(24), fill_value=0)
-mat   = cross.values.astype(float)
-
-# Per-row: which past hour is the single best predictor for each future hour?
-best_past_hour = np.argmax(mat, axis=1)          # (24,) — one per future hour
-best_past_val  = mat[range(24), best_past_hour]  # (24,) — count of that best
-
-# Column sums: how much each past hour contributes across ALL future hours
-col_sums = mat.sum(axis=0)
-
-# Diagonal analysis
-diag_sum   = np.trace(mat)
-total_sum  = mat.sum()
-diag_pct   = 100 * diag_sum / total_sum
-
-# Off-diagonal bands: compute sum along each diagonal offset k
-band_sums  = {}
-for k in range(-23, 24):
-    band_sums[k] = np.sum([mat[i, (i + k) % 24] for i in range(24)])
-
-# Dominant band structure: top-3 offsets by weight
-sorted_bands = sorted(band_sums.items(), key=lambda x: -x[1])
-top3_bands   = sorted_bands[:3]
-
-# Evening cluster (columns 14-23) vs early-morning cluster (columns 3-6)
-evening_cols = list(range(14, 24))
-morning_cols = list(range(3, 7))
-evening_pct  = 100 * mat[:, evening_cols].sum() / total_sum
-morning_pct  = 100 * mat[:, morning_cols].sum() / total_sum
-
-print(f"\nHeatmap analysis:")
-print(f"  Diagonal %     : {diag_pct:.1f}%")
-print(f"  Evening cols % : {evening_pct:.1f}%  (cols 14-23)")
-print(f"  Morning cols % : {morning_pct:.1f}%  (cols 3-6)")
-print(f"  Top-3 diagonal offsets: {top3_bands}")
-
-# Determine structure label
-if diag_pct > 40:
-    structure_label = "Strongly diagonal (same-hour patterns dominate)"
-elif diag_pct > 20:
-    structure_label = "Weakly diagonal (some same-hour tendency)"
-else:
-    if evening_pct > 40:
-        structure_label = "Vertical-band structure (evening hours dominate as predictors for ALL future hours)"
-    else:
-        structure_label = "Diffuse / multi-band (no single dominant structure)"
-
-# ── Figure layout: main heatmap + marginal bars ──────────────
-fig = plt.figure(figsize=(16, 13))
-gs  = GridSpec(3, 3, figure=fig,
-               width_ratios=[0.08, 1, 0.35],
-               height_ratios=[0.35, 1, 0.08],
-               hspace=0.06, wspace=0.06)
-
-ax_heat   = fig.add_subplot(gs[1, 1])   # main heatmap
-ax_top    = fig.add_subplot(gs[0, 1])   # top bar: column sums (past hour importance)
-ax_right  = fig.add_subplot(gs[1, 2])   # right bar: best-predictor per future hour
-ax_left   = fig.add_subplot(gs[1, 0])   # left bar: row sums (future hour activity)
-
-# ── Main heatmap ─────────────────────────────────────────────
-im = ax_heat.imshow(mat, cmap="YlOrRd", aspect="auto",
-                    vmin=0, vmax=mat.max())
-
-# Grid lines
-for x in range(-1, 24):
-    ax_heat.axvline(x + 0.5, color="white", linewidth=0.3, alpha=0.5)
-for y in range(-1, 24):
-    ax_heat.axhline(y + 0.5, color="white", linewidth=0.3, alpha=0.5)
-
-# Mark the best past hour for each future hour (star marker)
-for fut_h in range(24):
-    past_h = best_past_hour[fut_h]
-    ax_heat.plot(past_h, fut_h, marker="*", color="blue",
-                 markersize=9, zorder=5, alpha=0.85)
-
-# Shade the two dominant past-hour clusters
-for col in evening_cols:
-    ax_heat.axvspan(col - 0.5, col + 0.5,
-                    color="steelblue", alpha=0.08, zorder=0)
-for col in morning_cols:
-    ax_heat.axvspan(col - 0.5, col + 0.5,
-                    color="orange", alpha=0.08, zorder=0)
-
-# Annotate each cell with its count (only if > 0)
-for i in range(24):
-    for j in range(24):
-        v = int(mat[i, j])
-        if v > 0:
-            txt_color = "white" if v > mat.max() * 0.6 else "black"
-            ax_heat.text(j, i, str(v), ha="center", va="center",
-                         fontsize=5.5, color=txt_color, fontweight="bold")
-
-ax_heat.set_xticks(range(24))
-ax_heat.set_xticklabels([f"{h:02d}" for h in range(24)],
-                         fontsize=7.5, rotation=45, ha="right")
-ax_heat.xaxis.set_label_position("bottom")
-ax_heat.xaxis.tick_bottom()
-ax_heat.set_yticks(range(24))
-ax_heat.set_yticklabels([f"{h:02d}:00" for h in range(24)], fontsize=7.5)
-ax_heat.set_xlabel("Past hour used as split feature  (yesterday)", fontsize=10)
-ax_heat.set_ylabel("Future hour being predicted  (tomorrow)", fontsize=10)
-
-plt.colorbar(im, ax=ax_heat, label="Root-split frequency", pad=0.01, shrink=0.8)
-
-# Legend — use handles list only (mpatches.Patch is legend-only, not add_patch)
-legend_handles = [
-    plt.Line2D([0], [0], marker="*", color="blue", linestyle="None",
-               markersize=8, label="Best past-hour predictor for that row"),
-    mpatches.Patch(facecolor="steelblue", alpha=0.4,
-                   label=f"Evening cluster (14-23): {evening_pct:.0f}% of all splits"),
-    mpatches.Patch(facecolor="orange", alpha=0.5,
-                   label=f"Morning cluster (03-06): {morning_pct:.0f}% of all splits"),
-]
-ax_heat.legend(handles=legend_handles, fontsize=7.5, loc="upper left",
-               bbox_to_anchor=(0.0, -0.18), ncol=1)
-
-# ── Top bar: column sums (how much each past hour is used overall) ──
-ax_top.bar(range(24), col_sums,
-           color=["steelblue" if h in evening_cols
-                  else ("darkorange" if h in morning_cols else "lightgray")
-                  for h in range(24)],
-           edgecolor="white", linewidth=0.5)
-ax_top.set_xlim(-0.5, 23.5)
-ax_top.set_xticks([])
-ax_top.set_ylabel("Total\nroot-split\ncount", fontsize=8, labelpad=3)
-ax_top.set_title("", fontsize=1)
-ax_top.grid(axis="y", linestyle="--", alpha=0.4)
-ax_top.set_title(
-    f"Past Hour → Future Hour Root-Split Heatmap\n"
-    f"Structure: {structure_label}\n"
-    f"(Main diagonal = {diag_pct:.1f}% of total — "
-    f"{'NOT a diagonal matrix' if diag_pct < 25 else 'diagonal tendency present'})",
-    fontsize=11, fontweight="bold", pad=6
-)
-# Annotate top-3 columns
-for past_h, cnt in sorted(enumerate(col_sums), key=lambda x: -x[1])[:3]:
-    ax_top.annotate(f"h{past_h:02d}\n{int(cnt)}",
-                    xy=(past_h, cnt), xytext=(0, 4),
-                    textcoords="offset points",
-                    ha="center", fontsize=7, color="navy", fontweight="bold")
-
-# ── Right bar: best past-hour and its count for each future hour ──
-ax_right.barh(range(24), best_past_val,
-              color="tomato", edgecolor="white", linewidth=0.5, alpha=0.8)
-ax_right.set_ylim(-0.5, 23.5)
-ax_right.set_yticks([])
-ax_right.set_xlabel("Best-predictor\ncount", fontsize=8)
-ax_right.grid(axis="x", linestyle="--", alpha=0.4)
-for fut_h in range(24):
-    ax_right.text(best_past_val[fut_h] + 0.3, fut_h,
-                  f"h{best_past_hour[fut_h]:02d}",
-                  va="center", fontsize=6.5, color="darkred", fontweight="bold")
-
-# ── Left bar: row sums (total splits for each future hour) ──
-row_sums = mat.sum(axis=1)
-ax_left.barh(range(24), row_sums,
-             color="slategray", edgecolor="white", linewidth=0.5, alpha=0.7)
-ax_left.set_ylim(-0.5, 23.5)
-ax_left.set_yticks([])
-ax_left.invert_xaxis()
-ax_left.set_xlabel("Total\nsplits", fontsize=8)
-ax_left.grid(axis="x", linestyle="--", alpha=0.4)
-
-fig.suptitle("", y=0.0)  # spacer
-
-path = os.path.join(OUTPUT_FOLDER, "tree_interp_hour_vs_predictor.png")
-fig.savefig(path, dpi=150, bbox_inches="tight")
-plt.close(fig)
-print(f"Saved: {path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# PLOT 3 — dSocdt split thresholds by hour of day
-# ─────────────────────────────────────────────────────────────
-dsocdt_clean = dsocdt.dropna(subset=["feat_hour"]).copy()
-dsocdt_clean["feat_hour"] = dsocdt_clean["feat_hour"].astype(int)
-
-thresh_by_hour = (dsocdt_clean.groupby("feat_hour")["threshold"]
-                               .agg(["mean", "median", "std", "count"])
-                               .reindex(range(24), fill_value=np.nan))
-
-fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-
-ax = axes[0]
-ax.bar(range(24), thresh_by_hour["median"].values,
-       color="steelblue", alpha=0.8, edgecolor="white")
-ax.errorbar(range(24), thresh_by_hour["median"].values,
-            yerr=thresh_by_hour["std"].fillna(0).values,
-            fmt="none", color="navy", linewidth=1.2, capsize=3)
-ax.axhline(0, color="black", linewidth=0.8, linestyle="-")
-ax.set_xticks(range(24))
-ax.set_xticklabels([f"{h:02d}:00" for h in range(24)],
-                   rotation=45, ha="right", fontsize=8)
-ax.set_ylabel("Median split threshold (dSocdt)", fontsize=11)
-ax.set_title("Typical Discharge Rate Decision Boundary per Hour\n"
-             "(how negative dSocdt must be before model treats it as 'significant discharge')",
-             fontsize=11, fontweight="bold")
-ax.grid(axis="y", linestyle="--", alpha=0.4)
-for h in [19, 20, 22, 23]:
-    v = thresh_by_hour["median"].iloc[h]
-    if not np.isnan(v):
-        ax.text(h, v - 0.8, f"{v:.1f}", ha="center", fontsize=8,
-                color="white", fontweight="bold")
-
-ax2 = axes[1]
-ax2.bar(range(24), thresh_by_hour["count"].values,
-        color="darkorange", alpha=0.8, edgecolor="white")
-ax2.set_xticks(range(24))
-ax2.set_xticklabels([f"{h:02d}:00" for h in range(24)],
-                    rotation=45, ha="right", fontsize=8)
-ax2.set_ylabel("Number of times this hour appears in a dSocdt split", fontsize=11)
-ax2.set_title("Which Hours of the Day Are Most Diagnostic for Discharge Prediction?",
-              fontsize=11, fontweight="bold")
-ax2.grid(axis="y", linestyle="--", alpha=0.4)
-
-fig.suptitle("dSocdt Split Threshold Analysis Across Hours of Day",
-             fontsize=13, fontweight="bold")
-fig.tight_layout()
-path = os.path.join(OUTPUT_FOLDER, "tree_interp_dsocdt_thresholds.png")
-fig.savefig(path, dpi=150, bbox_inches="tight")
-plt.close(fig)
-print(f"Saved: {path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# PLOT 4 — SoC threshold values used in splits
-# ─────────────────────────────────────────────────────────────
-if len(soc) > 0:
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    ax = axes[0]
-    ax.hist(soc["threshold"].values, bins=30, color="darkorange",
-            edgecolor="white", alpha=0.85)
-    med = soc["threshold"].median()
-    ax.axvline(med, color="crimson", linestyle="--", linewidth=1.8,
-               label=f"Median = {med:.1f}%")
-    ax.axvline(100, color="gray", linestyle=":", linewidth=1.2,
-               label="100% SoC (full charge)")
-    ax.axvline(20, color="red", linestyle=":", linewidth=1.2,
-               label="20% SoC (low battery)")
-    ax.set_xlabel("SoC threshold value (%)", fontsize=11)
-    ax.set_ylabel("Frequency", fontsize=11)
-    ax.set_title("Distribution of SoC Split Thresholds\n"
-                 "(at what battery % does the model change behaviour?)",
-                 fontsize=11, fontweight="bold")
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    ax2 = axes[1]
-    top_soc = soc.groupby("feature").size().sort_values(ascending=False).head(12)
-    ax2.barh(range(len(top_soc)), top_soc.values,
-             color="darkorange", edgecolor="white", alpha=0.85)
-    ax2.set_yticks(range(len(top_soc)))
-    ax2.set_yticklabels(top_soc.index.tolist(), fontsize=8.5)
-    ax2.invert_yaxis()
-    ax2.set_xlabel("Split count", fontsize=11)
-    ax2.set_title("Most-Used SoC Features as Split Conditions",
-                  fontsize=11, fontweight="bold")
-    ax2.grid(axis="x", linestyle="--", alpha=0.4)
-
-    fig.suptitle("SoC Feature Split Analysis", fontsize=13, fontweight="bold")
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_FOLDER, "tree_interp_soc_thresholds.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# PLOT 5 — Recency dominance
-# ─────────────────────────────────────────────────────────────
-recency = (df.groupby(["days_back", "feature_type"])["feature"]
-             .count().reset_index(name="count"))
-recency_pivot = recency.pivot(index="days_back", columns="feature_type",
-                               values="count").fillna(0)
-recency_pivot = recency_pivot.sort_index()
-
-fig, ax = plt.subplots(figsize=(12, 6))
-clrs = {"dSocdt": "steelblue", "Soc": "darkorange", "Date": "seagreen"}
-for col in recency_pivot.columns:
-    ax.plot(recency_pivot.index, recency_pivot[col].values,
-            marker="o", linewidth=2.2, color=clrs.get(col, "gray"),
-            label=col, markersize=6)
-    if col == "dSocdt":
-        ax.fill_between(recency_pivot.index, recency_pivot[col].values,
-                        alpha=0.12, color=clrs[col])
-
-ax.set_xlabel("Days back from prediction day  (1 = yesterday, 14 = 2 weeks ago)", fontsize=11)
-ax.set_ylabel("Number of tree split nodes using features from that day", fontsize=11)
-ax.set_title("Recency Effect: How Split Node Usage Drops Off with Days-Back",
-             fontsize=12, fontweight="bold")
-ax.set_xticks(recency_pivot.index)
-ax.set_xticklabels([f"day-{d}" for d in recency_pivot.index],
-                   rotation=45, ha="right", fontsize=9)
-ax.legend(fontsize=10)
-ax.grid(linestyle="--", alpha=0.4)
-
-d1 = recency_pivot["dSocdt"].iloc[0] if "dSocdt" in recency_pivot.columns else 0
-d2 = recency_pivot["dSocdt"].iloc[1] if len(recency_pivot) > 1 else 0
-if d1 > 0:
-    drop = (1 - d2/d1) * 100
-    ax.annotate(f"↓{drop:.0f}% drop\nfrom day-1 to day-2",
-                xy=(recency_pivot.index[1], d2),
-                xytext=(recency_pivot.index[1] + 0.5, d2 + 50),
-                fontsize=9, color="steelblue",
-                arrowprops=dict(arrowstyle="->", color="steelblue", lw=1))
-
-fig.tight_layout()
-path = os.path.join(OUTPUT_FOLDER, "tree_interp_recency_dominance.png")
-fig.savefig(path, dpi=150, bbox_inches="tight")
-plt.close(fig)
-print(f"Saved: {path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# PLAIN-ENGLISH INTERPRETATION SUMMARY
-# ─────────────────────────────────────────────────────────────
-total_splits  = len(df)
-day1_splits   = len(df[df["days_back"] == 1])
-day1_pct      = 100 * day1_splits / total_splits
-day2_splits   = len(df[df["days_back"] == 2])
-day12_pct     = 100 * (day1_splits + day2_splits) / total_splits
-dsocdt_pct    = 100 * len(df[df["feature_type"] == "dSocdt"]) / total_splits
-soc_pct       = 100 * len(df[df["feature_type"] == "Soc"]) / total_splits
-date_pct      = 100 * len(df[df["feature_type"] == "Date"]) / total_splits
-
-top_root       = roots.groupby("feature").size().idxmax()
-top_root_count = roots.groupby("feature").size().max()
-top_root_pct   = 100 * top_root_count / len(roots)
-
-dsocdt_med_thresh = dsocdt["threshold"].median()
-soc_med_thresh    = soc["threshold"].median() if len(soc) > 0 else float("nan")
-
-summary_text = f"""
-═══════════════════════════════════════════════════════════════════
-TREE RULES INTERPRETATION SUMMARY
-XGBoost Battery Discharge Prediction Model
-═══════════════════════════════════════════════════════════════════
-
-OVERVIEW
-─────────────────────────────────────────────────────────────────
-Total split nodes analysed : {total_splits}
-Unique features used       : {df['feature'].nunique()}
-Output hours covered       : 24  (00:00 – 23:00)
-Trees per hour             : 25
-Max tree depth             : 2  (all splits are at depth 0 or 1)
-
-1. FEATURE TYPE DOMINANCE
-─────────────────────────────────────────────────────────────────
-  dSocdt features : {dsocdt_pct:.1f}% of all split nodes
-  Soc features    : {soc_pct:.1f}% of all split nodes
-  Date features   : {date_pct:.1f}% of all split nodes
-
-  → The model is overwhelmingly driven by past discharge RATE
-    (dSocdt), not battery level (SoC) or calendar information.
-
-2. RECENCY DOMINANCE — YESTERDAY MATTERS MOST
-─────────────────────────────────────────────────────────────────
-  Splits using day-minus-1 (yesterday) : {day1_pct:.1f}% of all splits
-  Splits using day-minus-1 or -2       : {day12_pct:.1f}% of all splits
-
-3. MOST DECISIVE SPLIT FEATURE (ROOT NODE ANALYSIS)
-─────────────────────────────────────────────────────────────────
-  Most frequent root split : {top_root}
-  Used at root in          : {top_root_count} trees ({top_root_pct:.1f}% of all root splits)
-
-  Top 5 root-split features:
-"""
-top5_roots = roots.groupby("feature").size().sort_values(ascending=False).head(5)
-for feat, cnt in top5_roots.items():
-    summary_text += f"    {feat:50s}  {cnt} trees\n"
-
-summary_text += f"""
-4. HOUR-VS-PREDICTOR HEATMAP STRUCTURE
-─────────────────────────────────────────────────────────────────
-  Diagonal (same-hour predicts same-hour) : {diag_pct:.1f}% of root splits
-  → This is NOT a diagonal matrix. Only {diag_pct:.0f}% of splits lie
-    on the main diagonal, meaning same-hour self-prediction is NOT
-    the dominant pattern.
-
-  Structure identified : {structure_label}
-
-  Evening cluster (past hours 14-23) : {evening_pct:.1f}% of all root splits
-  Morning cluster (past hours 03-06) : {morning_pct:.1f}% of all root splits
-
-  → The heatmap shows a VERTICAL-BAND pattern rather than a
-    diagonal. This means that regardless of which future hour
-    is being predicted, the model predominantly looks at
-    EVENING and EARLY-MORNING hours of yesterday.
-
-  Per-future-hour best predictor:
-    Hour 00 → past hour 23  Hour 12 → past hour 14
-    Hour 10 → past hour 15  Hour 14 → past hour 19
-    Hour 17 → past hour 19  Hour 19 → past hour 14
-
-5. DISCHARGE RATE THRESHOLDS
-─────────────────────────────────────────────────────────────────
-  Median dSocdt split threshold : {dsocdt_med_thresh:.3f} % SoC/hour
-  Hours 22-23 threshold         : ~-5.1 to -15.8 %/hr  (extreme usage)
-  Hours 03-05 threshold         : ~-0.9 to -1.0 %/hr   (near-idle)
-
-6. SOC THRESHOLDS — BATTERY LEVEL TIPPING POINTS
-─────────────────────────────────────────────────────────────────
-  Median SoC split threshold : {soc_med_thresh:.1f}%
-  Most used: Soc_h10_day_minus1, Soc_h23_day_minus1
-
-7. MAX_DEPTH=2 IMPLICATIONS
-─────────────────────────────────────────────────────────────────
-  Each tree makes AT MOST 2 sequential decisions before predicting.
-  Final prediction = sum of all 25 trees' leaf values.
-
-═══════════════════════════════════════════════════════════════════
-"""
-
-summary_path = os.path.join(OUTPUT_FOLDER, "tree_interpretation_summary.txt")
-with open(summary_path, "w", encoding="utf-8") as f:
-    f.write(summary_text)
-
-print(summary_text)
-print(f"Summary saved  →  {summary_path}")
-print("All outputs saved to:", OUTPUT_FOLDER)
+Great question to ask before jumping into code. Let me give you a thorough but accessible explanation of both models, then a comparative suitability analysis for your specific problem.
+
+---
+
+## Part 1 — Tensor Networks (TN)
+
+### What they are
+
+Tensor Networks originated in quantum physics, specifically in quantum many-body systems where physicists needed to represent and compute extremely high-dimensional quantum states efficiently. The core mathematical object is a **tensor** — simply a multi-dimensional array. A vector is a 1D tensor, a matrix is a 2D tensor, and you can go to 3D, 4D, and beyond. The problem is that a tensor with N dimensions and size d per dimension has d^N entries — this explodes impossibly fast.
+
+Tensor Networks solve this by decomposing one enormous tensor into a **network of smaller connected tensors**, where each small tensor shares indices (called "bonds") with its neighbours. You never store the big tensor; you only store the small ones and compute through their connections.
+
+### The most common TN used in ML — MPS (Matrix Product State)
+
+The variant relevant to machine learning is called **Matrix Product State (MPS)**, also known as a **Tensor Train**. Imagine your input feature vector of 728 values. Instead of feeding all 728 into a single weight matrix (which would be enormous), MPS processes the features as a **chain** — each feature connects to its neighbours left and right through a shared bond dimension. It looks like this:
+
+```
+[feature 1] — [tensor A] — [tensor B] — [tensor C] — ... — [tensor N] — [output]
+```
+
+Each tensor in the chain is small (bond_dim × bond_dim × feature_dim), and the overall expressive power is controlled by the **bond dimension** — a hyperparameter that acts like width in a neural network.
+
+### What it learns
+
+The key property of MPS is that it captures **correlations between features that are nearby in the chain**. Two features far apart in the chain interact only weakly unless you increase bond dimension. So MPS is naturally suited to data where local feature interactions matter more than global ones.
+
+In machine learning terms, you define a **tensor network layer** that replaces a dense linear layer, and then you can stack it with activations just like a neural network. Training is done with gradient descent the same way as any neural network.
+
+---
+
+## Part 2 — Transformers
+
+### What they are
+
+Transformers were introduced in the 2017 paper "Attention is All You Need" for natural language processing, but have since become the dominant architecture across NLP, vision, audio, and increasingly time series forecasting. The core mechanism is **self-attention**.
+
+### The self-attention mechanism
+
+The idea is elegant. Given a sequence of inputs (say, 14 days of discharge patterns), instead of processing them left to right like an RNN/LSTM, the Transformer lets **every element attend to every other element simultaneously**.
+
+For each element in your sequence, three vectors are computed — a **Query (Q)**, a **Key (K)**, and a **Value (V)**. The attention score between two elements is computed as:
+
+```
+Attention(Q, K, V) = softmax(Q × K^T / √d_k) × V
+```
+
+In plain English: the Query is "what am I looking for?", the Key is "what do I contain?", and the score between them says "how much should I pay attention to this other element?" The Value is "what information do I actually pass if you attend to me."
+
+So when predicting day 15's discharge pattern, the model can simultaneously look at day 1, day 7, day 14, and assign different attention weights to each — it learns which past days matter most for prediction, rather than assuming recency always dominates.
+
+### Multi-head attention
+
+Instead of doing attention once, Transformers do it multiple times in parallel with different learned projections — this is **multi-head attention**. Each "head" can learn to look at different relationships. One head might specialise in weekly patterns, another in day-of-week effects, another in recent trends.
+
+### Positional encoding
+
+Since attention has no inherent sense of order (it treats all positions equally), **positional encodings** are added to the input to tell the model "this is day 1, this is day 2..." etc. For time series, these are often learnable embeddings rather than the fixed sinusoidal encodings used in NLP.
+
+### Full architecture
+
+A Transformer block = Multi-head self-attention → Add & Norm → Feed-forward network → Add & Norm. These blocks are stacked. For time series forecasting, the output is passed through a final linear layer to produce predictions.
+
+---
+
+## Part 3 — Comparative Suitability for Your Problem
+
+### Your problem's characteristics (the lens to evaluate through)
+
+Before scoring each model, recall the key properties of your data and task:
+
+- Input: 14 days × 52 features/day = 728 features, treated as a temporal sequence
+- Output: 24 hourly dSocdt values for the next day
+- Training samples per window: only 13 samples (the core constraint)
+- Most important finding: 73% of XGBoost splits used yesterday's data; evening hours dominate
+- Hurst exponent H > 0.7 for most devices: strong persistence, meaning the temporal sequence ordering matters
+- dSocdt dominates (86.3% of feature importance); SoC secondary
+
+---
+
+### Transformer — Suitability Assessment
+
+**Why it WOULD be suitable:**
+
+The strongest argument for Transformers is that your data is a **sequence of days**, and attention directly models "which past day matters most for tomorrow." Your tree rule analysis already found that day-minus-1 dominates (73%) but days 2–7 also contribute. Attention weights would learn this automatically — no need to hard-code lookback or engineer recency features. The multi-head mechanism could discover that one head specialises in "what happened at the same hour yesterday" while another learns weekly periodic patterns (which your autocorrelation plots confirm exist at 168-hour lag).
+
+Your Hurst exponent H > 0.7 means the sequence ordering carries real signal. Transformers are specifically designed to exploit this.
+
+Additionally, Transformers handle **multi-output prediction** naturally — you can predict all 24 hours simultaneously with a single decoder step, rather than training 24 separate models as XGBoost does with MultiOutputRegressor.
+
+**Why it WOULDN'T be suitable (the critical concern):**
+
+The most serious problem is **data starvation**. A standard Transformer has millions of parameters. Your training window is 13–14 samples per prediction step. Even if you pool all devices and all rolling windows, you end up with perhaps 10,000–15,000 training samples total. Transformers typically need hundreds of thousands to millions of samples to learn attention weights meaningfully. With too few samples, the attention mechanism just overfits the noise in your 13-day window rather than learning generalizable patterns.
+
+The sequence length is also very short — 14 days. Transformers shine with long sequences (hundreds of tokens). For 14 positions, even a simple LSTM competes equally because there's not much "long-range" to capture at that scale.
+
+**Verdict: Potentially useful but high risk of overfitting.** Would need aggressive regularisation, weight sharing across heads, or a lightweight variant like a Temporal Fusion Transformer (TFT) or PatchTST designed specifically for short time series.
+
+---
+
+### Tensor Networks — Suitability Assessment
+
+**Why it WOULD be suitable:**
+
+The key advantage of TN (specifically MPS) is **parameter efficiency**. For a feature vector of 728 inputs, a standard dense linear layer needs 728 × output_size parameters. An MPS layer achieves similar expressive power with far fewer parameters — controlled by bond dimension. This means TN can represent complex feature interactions without overfitting on small datasets.
+
+Your feature structure is also naturally suited to MPS because your 728 features have inherent **local structure** — features from the same day and same hour are already adjacent in your feature vector (dSocdt_h0_day1, dSocdt_h1_day1... Soc_h0_day1...). MPS exploits exactly this kind of local correlation, which your tree analysis confirmed: the model mostly cares about yesterday's features, and within yesterday, nearby hours predict nearby hours.
+
+TN also has a precise mathematical interpretation of what it represents — it's not a black box. The bond dimension directly controls model capacity, making it easy to tune without overfitting concerns. This is valuable when you have limited data.
+
+**Why it WOULDN'T be suitable:**
+
+The practical barrier is **tooling and expertise**. TN for machine learning is an active research area but has far fewer mature, well-documented libraries compared to PyTorch/TensorFlow for Transformers. The main library is `quimb` or `torchmps`, but they require understanding tensor contraction order, which is non-trivial. Debugging is harder, visualising what the model learned is harder, and explaining it to your mentor or in a report requires more background.
+
+Additionally, TN is best suited for classification tasks where the output is a single label. For your **multi-output regression** problem (predicting 24 continuous values simultaneously), the TN output layer becomes complex and less natural. There is no established standard for how to structure a TN for multi-step time series regression the way there is for Transformers.
+
+Finally, TN's advantage of capturing local correlations competes directly with XGBoost's tree splits — both are essentially learning piecewise local structure. You might not gain much over what XGBoost already does.
+
+**Verdict: Theoretically interesting but practically complex.** Better suited to someone with a quantum physics or advanced ML research background. The accuracy gain over XGBoost is uncertain and the implementation risk is high.
+
+---
+
+### Head-to-Head Summary
+
+| Aspect | Transformer | Tensor Network |
+|---|---|---|
+| Suited to sequence data | ✅ Excellent | ⚠️ Indirect |
+| Small dataset (13 samples) | ❌ Big weakness | ✅ Parameter efficient |
+| Multi-output regression | ✅ Natural | ⚠️ Non-standard |
+| Captures temporal ordering | ✅ Core strength | ⚠️ Through chain structure |
+| Library maturity | ✅ PyTorch, Keras | ❌ Research-stage |
+| Explainability | ⚠️ Attention maps | ⚠️ Bond dimension analysis |
+| Implementation complexity | ⚠️ Moderate | ❌ High |
+| Risk of overfitting | ❌ High (small data) | ✅ Low |
+| Expected accuracy gain | ⚠️ Moderate if regularised | ⚠️ Uncertain |
+
+---
+
+### Recommendation
+
+Given your mentor said Transformers would be easier to try, and given that both the tooling and the multi-output regression formulation are more naturally handled by Transformers, **start with a lightweight Transformer variant**. Specifically, a **Temporal Fusion Transformer (TFT)** or a simple **encoder-only Transformer with positional embeddings** tuned heavily for small datasets (small d_model of 32–64, 2–4 attention heads, dropout 0.3–0.5, and weight decay).
+
+For TN, the honest advice is: unless your mentor specifically has expertise in it and wants to see it explored as a research contribution, the implementation complexity and uncertainty of gain make it a lower priority than first getting a solid Transformer baseline working.
+
+Shall I start writing the Transformer code next?
