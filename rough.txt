@@ -1,144 +1,19 @@
-Great question to ask before jumping into code. Let me give you a thorough but accessible explanation of both models, then a comparative suitability analysis for your specific problem.
+int f(i,start,end){
+  if(i==n) return (start==end ? 0:-1e9);
+  if(dp[i][start][end]!=-1) return dp[i][start][end];
+  int ans=0;
+  ans=max(ans,f(i+1,start,end));
+  if(start==-1 || v[i][0]-'0'==end){
+    ans=max(ans,v[i].length()+f(i+1,(start==-1 ? v[i][0]-'0' : start) ,v[i].back()-'0'));
+  }
+  return dp[i][start][end]=ans;
+}
 
----
-
-## Part 1 — Tensor Networks (TN)
-
-### What they are
-
-Tensor Networks originated in quantum physics, specifically in quantum many-body systems where physicists needed to represent and compute extremely high-dimensional quantum states efficiently. The core mathematical object is a **tensor** — simply a multi-dimensional array. A vector is a 1D tensor, a matrix is a 2D tensor, and you can go to 3D, 4D, and beyond. The problem is that a tensor with N dimensions and size d per dimension has d^N entries — this explodes impossibly fast.
-
-Tensor Networks solve this by decomposing one enormous tensor into a **network of smaller connected tensors**, where each small tensor shares indices (called "bonds") with its neighbours. You never store the big tensor; you only store the small ones and compute through their connections.
-
-### The most common TN used in ML — MPS (Matrix Product State)
-
-The variant relevant to machine learning is called **Matrix Product State (MPS)**, also known as a **Tensor Train**. Imagine your input feature vector of 728 values. Instead of feeding all 728 into a single weight matrix (which would be enormous), MPS processes the features as a **chain** — each feature connects to its neighbours left and right through a shared bond dimension. It looks like this:
-
-```
-[feature 1] — [tensor A] — [tensor B] — [tensor C] — ... — [tensor N] — [output]
-```
-
-Each tensor in the chain is small (bond_dim × bond_dim × feature_dim), and the overall expressive power is controlled by the **bond dimension** — a hyperparameter that acts like width in a neural network.
-
-### What it learns
-
-The key property of MPS is that it captures **correlations between features that are nearby in the chain**. Two features far apart in the chain interact only weakly unless you increase bond dimension. So MPS is naturally suited to data where local feature interactions matter more than global ones.
-
-In machine learning terms, you define a **tensor network layer** that replaces a dense linear layer, and then you can stack it with activations just like a neural network. Training is done with gradient descent the same way as any neural network.
-
----
-
-## Part 2 — Transformers
-
-### What they are
-
-Transformers were introduced in the 2017 paper "Attention is All You Need" for natural language processing, but have since become the dominant architecture across NLP, vision, audio, and increasingly time series forecasting. The core mechanism is **self-attention**.
-
-### The self-attention mechanism
-
-The idea is elegant. Given a sequence of inputs (say, 14 days of discharge patterns), instead of processing them left to right like an RNN/LSTM, the Transformer lets **every element attend to every other element simultaneously**.
-
-For each element in your sequence, three vectors are computed — a **Query (Q)**, a **Key (K)**, and a **Value (V)**. The attention score between two elements is computed as:
-
-```
-Attention(Q, K, V) = softmax(Q × K^T / √d_k) × V
-```
-
-In plain English: the Query is "what am I looking for?", the Key is "what do I contain?", and the score between them says "how much should I pay attention to this other element?" The Value is "what information do I actually pass if you attend to me."
-
-So when predicting day 15's discharge pattern, the model can simultaneously look at day 1, day 7, day 14, and assign different attention weights to each — it learns which past days matter most for prediction, rather than assuming recency always dominates.
-
-### Multi-head attention
-
-Instead of doing attention once, Transformers do it multiple times in parallel with different learned projections — this is **multi-head attention**. Each "head" can learn to look at different relationships. One head might specialise in weekly patterns, another in day-of-week effects, another in recent trends.
-
-### Positional encoding
-
-Since attention has no inherent sense of order (it treats all positions equally), **positional encodings** are added to the input to tell the model "this is day 1, this is day 2..." etc. For time series, these are often learnable embeddings rather than the fixed sinusoidal encodings used in NLP.
-
-### Full architecture
-
-A Transformer block = Multi-head self-attention → Add & Norm → Feed-forward network → Add & Norm. These blocks are stacked. For time series forecasting, the output is passed through a final linear layer to produce predictions.
-
----
-
-## Part 3 — Comparative Suitability for Your Problem
-
-### Your problem's characteristics (the lens to evaluate through)
-
-Before scoring each model, recall the key properties of your data and task:
-
-- Input: 14 days × 52 features/day = 728 features, treated as a temporal sequence
-- Output: 24 hourly dSocdt values for the next day
-- Training samples per window: only 13 samples (the core constraint)
-- Most important finding: 73% of XGBoost splits used yesterday's data; evening hours dominate
-- Hurst exponent H > 0.7 for most devices: strong persistence, meaning the temporal sequence ordering matters
-- dSocdt dominates (86.3% of feature importance); SoC secondary
-
----
-
-### Transformer — Suitability Assessment
-
-**Why it WOULD be suitable:**
-
-The strongest argument for Transformers is that your data is a **sequence of days**, and attention directly models "which past day matters most for tomorrow." Your tree rule analysis already found that day-minus-1 dominates (73%) but days 2–7 also contribute. Attention weights would learn this automatically — no need to hard-code lookback or engineer recency features. The multi-head mechanism could discover that one head specialises in "what happened at the same hour yesterday" while another learns weekly periodic patterns (which your autocorrelation plots confirm exist at 168-hour lag).
-
-Your Hurst exponent H > 0.7 means the sequence ordering carries real signal. Transformers are specifically designed to exploit this.
-
-Additionally, Transformers handle **multi-output prediction** naturally — you can predict all 24 hours simultaneously with a single decoder step, rather than training 24 separate models as XGBoost does with MultiOutputRegressor.
-
-**Why it WOULDN'T be suitable (the critical concern):**
-
-The most serious problem is **data starvation**. A standard Transformer has millions of parameters. Your training window is 13–14 samples per prediction step. Even if you pool all devices and all rolling windows, you end up with perhaps 10,000–15,000 training samples total. Transformers typically need hundreds of thousands to millions of samples to learn attention weights meaningfully. With too few samples, the attention mechanism just overfits the noise in your 13-day window rather than learning generalizable patterns.
-
-The sequence length is also very short — 14 days. Transformers shine with long sequences (hundreds of tokens). For 14 positions, even a simple LSTM competes equally because there's not much "long-range" to capture at that scale.
-
-**Verdict: Potentially useful but high risk of overfitting.** Would need aggressive regularisation, weight sharing across heads, or a lightweight variant like a Temporal Fusion Transformer (TFT) or PatchTST designed specifically for short time series.
-
----
-
-### Tensor Networks — Suitability Assessment
-
-**Why it WOULD be suitable:**
-
-The key advantage of TN (specifically MPS) is **parameter efficiency**. For a feature vector of 728 inputs, a standard dense linear layer needs 728 × output_size parameters. An MPS layer achieves similar expressive power with far fewer parameters — controlled by bond dimension. This means TN can represent complex feature interactions without overfitting on small datasets.
-
-Your feature structure is also naturally suited to MPS because your 728 features have inherent **local structure** — features from the same day and same hour are already adjacent in your feature vector (dSocdt_h0_day1, dSocdt_h1_day1... Soc_h0_day1...). MPS exploits exactly this kind of local correlation, which your tree analysis confirmed: the model mostly cares about yesterday's features, and within yesterday, nearby hours predict nearby hours.
-
-TN also has a precise mathematical interpretation of what it represents — it's not a black box. The bond dimension directly controls model capacity, making it easy to tune without overfitting concerns. This is valuable when you have limited data.
-
-**Why it WOULDN'T be suitable:**
-
-The practical barrier is **tooling and expertise**. TN for machine learning is an active research area but has far fewer mature, well-documented libraries compared to PyTorch/TensorFlow for Transformers. The main library is `quimb` or `torchmps`, but they require understanding tensor contraction order, which is non-trivial. Debugging is harder, visualising what the model learned is harder, and explaining it to your mentor or in a report requires more background.
-
-Additionally, TN is best suited for classification tasks where the output is a single label. For your **multi-output regression** problem (predicting 24 continuous values simultaneously), the TN output layer becomes complex and less natural. There is no established standard for how to structure a TN for multi-step time series regression the way there is for Transformers.
-
-Finally, TN's advantage of capturing local correlations competes directly with XGBoost's tree splits — both are essentially learning piecewise local structure. You might not gain much over what XGBoost already does.
-
-**Verdict: Theoretically interesting but practically complex.** Better suited to someone with a quantum physics or advanced ML research background. The accuracy gain over XGBoost is uncertain and the implementation risk is high.
-
----
-
-### Head-to-Head Summary
-
-| Aspect | Transformer | Tensor Network |
-|---|---|---|
-| Suited to sequence data | ✅ Excellent | ⚠️ Indirect |
-| Small dataset (13 samples) | ❌ Big weakness | ✅ Parameter efficient |
-| Multi-output regression | ✅ Natural | ⚠️ Non-standard |
-| Captures temporal ordering | ✅ Core strength | ⚠️ Through chain structure |
-| Library maturity | ✅ PyTorch, Keras | ❌ Research-stage |
-| Explainability | ⚠️ Attention maps | ⚠️ Bond dimension analysis |
-| Implementation complexity | ⚠️ Moderate | ❌ High |
-| Risk of overfitting | ❌ High (small data) | ✅ Low |
-| Expected accuracy gain | ⚠️ Moderate if regularised | ⚠️ Uncertain |
-
----
-
-### Recommendation
-
-Given your mentor said Transformers would be easier to try, and given that both the tooling and the multi-output regression formulation are more naturally handled by Transformers, **start with a lightweight Transformer variant**. Specifically, a **Temporal Fusion Transformer (TFT)** or a simple **encoder-only Transformer with positional embeddings** tuned heavily for small datasets (small d_model of 32–64, 2–4 attention heads, dropout 0.3–0.5, and weight decay).
-
-For TN, the honest advice is: unless your mentor specifically has expertise in it and wants to see it explored as a research contribution, the implementation complexity and uncertainty of gain make it a lower priority than first getting a solid Transformer baseline working.
-
-Shall I start writing the Transformer code next?
+int main(){
+  vector<string>v;
+  int ans=-1;
+  for(int i=0;i<n;i++){
+    ans=max(ans,f(i,-1,-1));
+  }
+  return ans;
+}
