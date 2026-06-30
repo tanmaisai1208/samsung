@@ -1,19 +1,79 @@
-int f(i,start,end){
-  if(i==n) return (start==end ? 0:-1e9);
-  if(dp[i][start][end]!=-1) return dp[i][start][end];
-  int ans=0;
-  ans=max(ans,f(i+1,start,end));
-  if(start==-1 || v[i][0]-'0'==end){
-    ans=max(ans,v[i].length()+f(i+1,(start==-1 ? v[i][0]-'0' : start) ,v[i].back()-'0'));
-  }
-  return dp[i][start][end]=ans;
+// https://codeforces.com/blog/entry/63962
+/*
+Given a tree with n vertices, where each vertex has a number ai written on it. 
+Distance between two vertices is defined as the number of edges on the path between them. 
+You have to choose a vertex v such that d1 × a1 + d2 × a2 + d3 × a3 + ... ... + dn × an is maximized, 
+where di denotes the distance between vertex i and vertex v. You have to print this maximum value.
+*/
+#include <bits/stdc++.h>
+using namespace std;
+ 
+using ll = long long;
+
+const int N = 200005;
+
+vector<int> adj[N];
+ll a[N];
+ll sub[N];
+ll dp[N];
+ll totalWeight = 0;
+ll answer = 0;
+
+void dfs1(int u, int parent, int depth) {
+    sub[u] = a[u];
+
+    dp[1] += 1LL * depth * a[u];
+
+    for (int v : adj[u]) {
+        if (v == parent) continue;
+
+        dfs1(v, u, depth + 1);
+        sub[u] += sub[v];
+    }
 }
 
-int main(){
-  vector<string>v;
-  int ans=-1;
-  for(int i=0;i<n;i++){
-    ans=max(ans,f(i,-1,-1));
-  }
-  return ans;
+void dfs2(int u, int parent) {
+    answer = max(answer, dp[u]);
+
+    for (int v : adj[u]) {
+        if (v == parent) continue;
+
+        // Reroot from u to v
+        dp[v] = dp[u] + totalWeight - 2 * sub[v];
+
+        dfs2(v, u);
+    }
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n;
+    cin >> n;
+
+    for (int i = 1; i <= n; i++) {
+        cin >> a[i];
+        totalWeight += a[i];
+    }
+
+    for (int i = 0; i < n - 1; i++) {
+        int u, v;
+        cin >> u >> v;
+
+        adj[u].push_back(v);
+        adj[v].push_back(u);
+    }
+
+    // Compute subtree sums and dp[1]
+    dfs1(1, 0, 0);
+
+    answer = dp[1];
+
+    // Compute dp for all nodes using rerooting
+    dfs2(1, 0);
+
+    cout << answer << '\n';
+
+    return 0;
 }
