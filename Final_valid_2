@@ -279,9 +279,16 @@ def charging_discrimination_stats(results):
 
     mean_charging = float(np.mean(pred_when_charging))
     mean_mild      = float(np.mean(pred_when_mild))
-    # Gap should be positive if model correctly predicts higher (closer to 0)
-    # values for actual-charging hours than for actual-mild-discharge hours
+    # Signed gap: positive means model correctly predicts higher (closer to 0)
+    # values for actual-charging hours than for actual-mild-discharge hours.
+    # Negative means the model predicts MORE negative values for charging hours
+    # than for mild-discharge hours — i.e. it has learned an INVERTED signal,
+    # likely because heavy discharge momentum from the previous day often
+    # precedes a charging event (low battery -> user plugs in), so the model
+    # associates "strong recent discharge" with both "more discharge tomorrow"
+    # AND coincidentally with hours that turn out to be charging.
     gap = mean_charging - mean_mild
+    abs_gap = abs(gap)
 
     return {
         "n_actual_charging_hours"      : n_charging,
@@ -291,6 +298,9 @@ def charging_discrimination_stats(results):
         "mean_pred_when_mild"          : round(mean_mild, 6),
         "std_pred_when_mild"           : round(float(np.std(pred_when_mild)), 6),
         "separation_gap"               : round(gap, 6),
+        "abs_separation_gap"           : round(abs_gap, 6),
+        "direction"                    : ("CORRECT (charging closer to 0)" if gap > 0
+                                          else "INVERTED (charging more negative)"),
         "pred_when_charging"           : pred_when_charging,
         "pred_when_mild"               : pred_when_mild,
     }
@@ -343,8 +353,11 @@ def plot_charging_discrimination(per_device_stats, plot_path):
         "Predicted dSocdt: Actual-Charging Hours vs Actual-Mild-Discharge Hours\n"
         "(blue = model's prediction when truth was charging/idle (dSocdt=0)  |  "
         "red = model's prediction when truth was mild discharge "
-        f"({MILD_DISCHARGE_LOWER} to 0))",
-        fontsize=11, fontweight="bold"
+        f"({MILD_DISCHARGE_LOWER} to 0))\n"
+        "Note: if blue boxes sit BELOW red boxes, the model has learned an "
+        "inverted signal — it predicts stronger discharge right before charging,\n"
+        "likely because heavy recent usage often precedes the user plugging in the device.",
+        fontsize=10, fontweight="bold"
     )
     legend_elems = [
         mpatches.Patch(facecolor="steelblue", alpha=0.7, label="Predicted value — actual charging hours"),
@@ -808,8 +821,10 @@ if __name__ == "__main__":
             if not np.isnan(disc_stats.get("separation_gap", np.nan)):
                 print(f"    Mean predicted (charging)  : {disc_stats['mean_pred_when_charging']:.4f}")
                 print(f"    Mean predicted (mild disch): {disc_stats['mean_pred_when_mild']:.4f}")
-                print(f"    Separation gap              : {disc_stats['separation_gap']:.4f}  "
-                      f"({'GOOD — model distinguishes them' if disc_stats['separation_gap'] > 0.1 else 'WEAK — values overlap'})")
+                print(f"    Separation gap (signed)     : {disc_stats['separation_gap']:.4f}")
+                print(f"    Separation gap (absolute)   : {disc_stats['abs_separation_gap']:.4f}  "
+                      f"({'GOOD — model statistically distinguishes the two groups' if disc_stats['abs_separation_gap'] > 0.1 else 'WEAK — values overlap, model cannot tell them apart'})")
+                print(f"    Direction                   : {disc_stats['direction']}")
             else:
                 print("    Not enough samples in one of the groups to compare.")
 
@@ -822,6 +837,8 @@ if __name__ == "__main__":
                 "mean_pred_when_mild"           : disc_stats.get("mean_pred_when_mild", np.nan),
                 "std_pred_when_mild"            : disc_stats.get("std_pred_when_mild", np.nan),
                 "separation_gap"                : disc_stats.get("separation_gap", np.nan),
+                "abs_separation_gap"            : disc_stats.get("abs_separation_gap", np.nan),
+                "direction"                     : disc_stats.get("direction", "N/A"),
             })
 
             # ── TASK B: Charging event detection (precision/recall/F1) ──
@@ -966,12 +983,14 @@ if __name__ == "__main__":
     print("\n" + "=" * 65)
     print("[Task A] CHARGING vs MILD-DISCHARGE DISCRIMINATION SUMMARY")
     print("=" * 65)
-    print("  (separation_gap > 0 and large means model distinguishes them well;")
-    print("   gap near 0 means model treats near-zero values as indistinguishable)")
+    print("  (abs_separation_gap > 0.1 means model statistically separates the two")
+    print("   groups; direction tells you whether the separation points the expected")
+    print("   way — charging closer to 0 — or is inverted.)")
     for _, row in discrimination_df.iterrows():
-        gap = row["separation_gap"]
+        gap = row["abs_separation_gap"]
         gap_str = f"{gap:.4f}" if not pd.isna(gap) else "N/A"
-        print(f"  {row['device']:<35}  separation_gap={gap_str}")
+        direction = row.get("direction", "N/A")
+        print(f"  {row['device']:<35}  abs_gap={gap_str}  ({direction})")
 
     print("\n" + "=" * 65)
     print(f"[Task B] CHARGING EVENT DETECTION SUMMARY  (epsilon={ZERO_EPSILON})")
