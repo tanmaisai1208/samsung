@@ -1,21 +1,5 @@
-  [Task A] Charging vs mild-discharge discrimination:
-    Actual charging hours      : 219
-    Actual mild-discharge hours: 451
-    Mean predicted (charging)  : -4.2769
-    Mean predicted (mild disch): -1.6983
-    Separation gap              : -2.5786  (WEAK — values overlap)
-
-  [Task B] Charging event detection (epsilon=0.5):
-    Precision: 0.0365  Recall: 0.032  F1: 0.0341
-    TP=7  FP=185  TN=1012  FN=212
-
-    [Task A] Charging vs mild-discharge discrimination:
-    Actual charging hours      : 619
-    Actual mild-discharge hours: 133
-    Mean predicted (charging)  : -2.5462
-    Mean predicted (mild disch): -1.4845
-    Separation gap              : -1.0617  (WEAK — values overlap)
-
-  [Task B] Charging event detection (epsilon=0.5):
-    Precision: 0.7696  Recall: 0.2859  F1: 0.417
-    TP=177  FP=53  TN=768  FN=442
+ok, now one more small task is to be done wrt to final_validation_plots pngs files of all user devices, the thing is each device's plot contains 4 different parts inside it
+1) daily accuracy with 7-day rolling mean etc
+2) daily MAE 
+3) daily cosine similarity
+4) actual vs predicted dsocdt graphs for sample days which are seperated by 7days, meaning for every 7 days we are plotting both the actual and predicted dsocdt graph lines in one single plot. So the thing I think doing the daily accuracy, rolling mean and daily mae , daily cosine similarity graphs for each device is not required to be plotted (maybe their calcuated values are required so that they might be useful for plotting the overall_avg_(accuracy/mae/cosinesimilarity.png file) averaged over all devices, but each individual's device plot is not required i think, so dont alter the code which generates plots of the overall_averaged_over_alldevices.png files like "cosine_similarity_plot.png", "threshold_accuracy.png" files (these are the only plot files which plot averaged value of some parameter over all devices), so now also retain only these two files as the avg_over_alldevices plot, dont create/add any additional png plots of overall_averaged. the change which u have to do is related to plots present in final_validation_plot_<device>.png files. remove the "daily_accuracy with rolling mean", "daily mae", "daily cosine similarity" plots. retain only the actual vs predicted dsocdt plot, but in that too change is required. 
