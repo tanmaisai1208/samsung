@@ -1,0 +1,97 @@
+"""
+battery_pivot_wide.py
+=====================
+Converts all *_hourly.csv files in results/resampled_csv/ into wide daily
+format and saves them to results/wide_csv/.
+
+Change from previous version:
+  +ve dSocdt values are NOW RETAINED as-is (charging hours kept).
+  Previously they were clipped to 0 — that is no longer done here.
+
+Wide format:
+  Rows    = dates (yyyy-mm-dd)
+  Columns = dSocdt_h0…h23  |  Soc_h0…h23  |  ChargingStatus_h0…h23
+            (72 columns total)
+
+Run from inside SOC-folder:
+    python battery_pivot_wide.py
+"""
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+
+RESAMPLED_FOLDER = "results/resampled_csv"
+WIDE_FOLDER      = "results/wide_csv"
+os.makedirs(WIDE_FOLDER, exist_ok=True)
+
+HOURS = list(range(24))
+
+DSOCDT_COLS = [f"dSocdt_h{h}"         for h in HOURS]
+SOC_COLS    = [f"Soc_h{h}"            for h in HOURS]
+CS_COLS     = [f"ChargingStatus_h{h}" for h in HOURS]
+ALL_COLS    = DSOCDT_COLS + SOC_COLS + CS_COLS   # 72 columns, ordered
+
+
+def pivot_to_wide(hourly_csv_path: str, wide_csv_path: str) -> None:
+    df = pd.read_csv(hourly_csv_path)
+    df["DateTime"] = pd.to_datetime(df["DateTime"])
+    df = df.sort_values("DateTime").reset_index(drop=True)
+    df["hour"] = df["DateTime"].dt.hour
+    df["Date"] = df["DateTime"].dt.date.astype(str)
+
+    # ── NO clipping of dSocdt — +ve values (charging) kept as-is ──
+
+    rows = []
+    for date, grp in df.groupby("Date", sort=True):
+        grp = grp.set_index("hour")
+        row = {"Date": date}
+        for h in HOURS:
+            if h in grp.index:
+                row[f"dSocdt_h{h}"]         = grp.loc[h, "dSocdt"]
+                row[f"Soc_h{h}"]            = grp.loc[h, "Soc"]
+                row[f"ChargingStatus_h{h}"] = grp.loc[h, "ChargingStatus"]
+            else:
+                # Missing hour (partial first/last day) — neutral fill
+                row[f"dSocdt_h{h}"]         = 0.0
+                row[f"Soc_h{h}"]            = np.nan
+                row[f"ChargingStatus_h{h}"] = np.nan
+        rows.append(row)
+
+    wide = pd.DataFrame(rows).set_index("Date")
+
+    # Fill missing Soc and ChargingStatus within a day (across hours)
+    wide[SOC_COLS] = wide[SOC_COLS].ffill(axis=1).bfill(axis=1)
+    wide[CS_COLS]  = wide[CS_COLS].ffill(axis=1).bfill(axis=1).fillna(0)
+
+    # Enforce column order
+    wide = wide[ALL_COLS]
+    wide.to_csv(wide_csv_path)
+
+
+# ── Main loop ─────────────────────────────────────────────────
+hourly_files = sorted(glob.glob(os.path.join(RESAMPLED_FOLDER, "*_hourly.csv")))
+print(f"Found {len(hourly_files)} resampled CSV file(s) in '{RESAMPLED_FOLDER}'\n")
+
+for path in hourly_files:
+    base_name   = os.path.splitext(os.path.basename(path))[0]
+    device_name = base_name.replace("_hourly", "")
+    wide_path   = os.path.join(WIDE_FOLDER, f"{device_name}_wide.csv")
+
+    pivot_to_wide(path, wide_path)
+
+    # Quick sanity check
+    wide = pd.read_csv(wide_path, index_col="Date")
+    pos_count = (wide[DSOCDT_COLS] > 0).values.sum()
+    neg_count = (wide[DSOCDT_COLS] < 0).values.sum()
+    zero_count= (wide[DSOCDT_COLS] == 0).values.sum()
+
+    print(f"  {device_name}")
+    print(f"    Days : {len(wide)}")
+    print(f"    dSocdt breakdown — positive(charging): {pos_count}  "
+          f"negative(discharge): {neg_count}  zero(idle): {zero_count}")
+    print(f"    Saved → {wide_path}")
+    print()
+
+print("All wide CSVs generated with +ve dSocdt values retained.")
