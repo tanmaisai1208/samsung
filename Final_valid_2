@@ -32,7 +32,10 @@ Outputs (all inside results/final_validation/):
   final_summary_all_thresholds.csv        — all thresholds × devices combined
   final_summary_threshold_<T>.csv         — per-device metrics at threshold T
   cosine_similarity_summary.csv           — per-device mean cosine sim + overall mean
-  final_validation_plot_<device>.png      — daily accuracy/MAE/actual-vs-pred (T=2)
+  final_validation_plot_<device>.png      — 6-panel grid: actual vs predicted dSocdt
+                                             for days sampled every 7 days (covers first
+                                             ~48 days). Each panel = one day, clean
+                                             side-by-side comparison.
   cosine_similarity_plot.png              — per-device + overall mean cosine sim bar chart
   threshold_accuracy_curve.png            — overall mean accuracy vs threshold value
   charging_discrimination_summary.csv     — per-device separability stats (Task A)
@@ -507,96 +510,59 @@ def plot_epsilon_sweep(sweep_df, plot_path):
 # ─────────────────────────────────────────────────────────────
 
 def plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T):
-    dates      = [r["predict_date"] for r in results]
-    accuracies = [accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
-                  for r in results]
-    maes       = [r["mae"]        for r in results]
-    cos_sims   = [r["cosine_sim"] for r in results]
-    mean_acc   = np.mean(accuracies)
+    """
+    Per-device plot showing ONLY actual vs predicted dSocdt, as a grid of
+    up to 6 separate subplots — one subplot per sampled day, sampled every
+    7 days (covering at most the first 48 days). Each subplot shows that
+    single day's actual (solid) and predicted (dashed) 24-hour dSocdt curve,
+    avoiding the clutter of overlaying many days on one axes.
+    """
+    SAMPLE_STEP  = 7
+    MAX_PANELS   = 6
 
-    fig, axes = plt.subplots(4, 1, figsize=(16, 17))
+    sample_idx = list(range(0, min(len(results), SAMPLE_STEP * MAX_PANELS), SAMPLE_STEP))
+    sample_idx = sample_idx[:MAX_PANELS]
+
+    n_panels = len(sample_idx)
+    n_cols   = 3
+    n_rows   = int(np.ceil(n_panels / n_cols))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 5 * n_rows))
+    axes = np.array(axes).reshape(-1)   # flatten regardless of shape
+
     fig.suptitle(
-        f"Final Validation — {device_name}\n"
+        f"Actual vs Predicted dSocdt — {device_name}\n"
         f"n_estimators={BEST_PARAMS['n_estimators']}  "
         f"max_depth={BEST_PARAMS['max_depth']}  "
         f"lr={BEST_PARAMS['learning_rate']}  "
-        f"subsample={BEST_PARAMS['subsample']}  "
-        f"(accuracy shown at threshold={threshold})",
-        fontsize=11, fontweight="bold"
+        f"subsample={BEST_PARAMS['subsample']}",
+        fontsize=12, fontweight="bold"
     )
 
-    tick_step = max(1, len(dates) // 15)
+    for panel_i, idx in enumerate(sample_idx):
+        ax = axes[panel_i]
+        r  = results[idx]
 
-    # Panel 1 — daily accuracy + 7-day rolling mean
-    ax = axes[0]
-    ax.plot(dates, accuracies, color="steelblue", linewidth=1.0,
-            alpha=0.6, label="Daily accuracy")
-    roll7 = pd.Series(accuracies).rolling(7, min_periods=1).mean().tolist()
-    ax.plot(dates, roll7, color="navy", linewidth=2.0, label="7-day rolling mean")
-    ax.axhline(mean_acc, color="crimson", linestyle="-", linewidth=1.5,
-               label=f"Overall mean: {mean_acc:.1f}%")
-    ax.axhline(50, color="gray", linestyle="--", linewidth=1.0, label="50% reference")
-    ax.set_ylabel("Accuracy (%)", fontsize=11)
-    ax.set_title(f"Daily Accuracy  (threshold = {threshold})", fontsize=11)
-    ax.set_ylim(0, 110)
-    ax.legend(fontsize=9)
-    ax.grid(linestyle="--", alpha=0.4)
-    ax.set_xticks(dates[::tick_step])
-    ax.set_xticklabels(dates[::tick_step], rotation=45, ha="right", fontsize=8)
+        ax.plot(HOURS, r["y_actual"], color="steelblue", linewidth=2.0,
+                marker="o", markersize=3, label="Actual")
+        ax.plot(HOURS, r["y_pred"],   color="crimson",   linewidth=2.0,
+                linestyle="--", marker="s", markersize=3, label="Predicted")
 
-    # Panel 2 — daily MAE
-    ax2 = axes[1]
-    ax2.bar(range(len(maes)), maes, color="steelblue", alpha=0.7)
-    ax2.axhline(np.mean(maes), color="crimson", linestyle="-", linewidth=1.5,
-                label=f"Mean MAE: {np.mean(maes):.4f}")
-    ax2.set_ylabel("MAE", fontsize=11)
-    ax2.set_title("Daily MAE", fontsize=11)
-    ax2.legend(fontsize=9)
-    ax2.grid(axis="y", linestyle="--", alpha=0.4)
-    ax2.set_xticks(range(0, len(maes), max(1, len(maes) // 15)))
-    ax2.set_xticklabels(dates[::max(1, len(dates) // 15)],
-                        rotation=45, ha="right", fontsize=8)
+        day_acc = accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
+        ax.set_title(
+            f"{r['predict_date']}   |   Acc(T={threshold})={day_acc:.1f}%   |   "
+            f"MAE={r['mae']:.3f}   |   CosSim={r['cosine_sim']:.3f}",
+            fontsize=9.5
+        )
+        ax.set_xlabel("Hour of day", fontsize=9)
+        ax.set_ylabel("dSocdt", fontsize=9)
+        ax.set_xticks(range(0, 24, 4))
+        ax.legend(fontsize=8, loc="lower left")
+        ax.grid(linestyle="--", alpha=0.35)
 
-    # Panel 3 — daily cosine similarity
-    ax3 = axes[2]
-    colors_cs = ["steelblue" if c >= 0 else "salmon" for c in cos_sims]
-    ax3.bar(range(len(cos_sims)), cos_sims, color=colors_cs, alpha=0.75)
-    mean_cs = np.mean(cos_sims)
-    ax3.axhline(mean_cs, color="crimson", linestyle="-", linewidth=1.5,
-                label=f"Mean cosine sim: {mean_cs:.4f}")
-    ax3.axhline(0, color="black", linestyle="-", linewidth=0.8)
-    ax3.set_ylabel("Cosine Similarity", fontsize=11)
-    ax3.set_title("Daily Cosine Similarity (Actual vs Predicted dSocdt)", fontsize=11)
-    ax3.set_ylim(-1.1, 1.1)
-    ax3.legend(fontsize=9)
-    ax3.grid(axis="y", linestyle="--", alpha=0.4)
-    ax3.set_xticks(range(0, len(cos_sims), max(1, len(cos_sims) // 15)))
-    ax3.set_xticklabels(dates[::max(1, len(dates) // 15)],
-                        rotation=45, ha="right", fontsize=8)
-
-    # Panel 4 — actual vs predicted for ~8 sampled days
-    ax4 = axes[3]
-    sample_idx = list(range(0, len(results), max(1, len(results) // 8)))
-    cmap = plt.cm.tab10
-    for si, idx in enumerate(sample_idx):
-        r     = results[idx]
-        color = cmap(si % 10)
-        ax4.plot(HOURS, r["y_actual"], color=color, linewidth=1.6,
-                 label=f"{r['predict_date']} actual")
-        ax4.plot(HOURS, r["y_pred"],   color=color, linewidth=1.4,
-                 linestyle="--", alpha=0.8)
-
-    solid_p = mpatches.Patch(color="gray", label="Actual (solid)")
-    dash_p  = mpatches.Patch(color="gray", label="Predicted (dashed)")
-    handles, lbls = ax4.get_legend_handles_labels()
-    ax4.legend(handles + [solid_p, dash_p],
-               lbls   + ["Actual (solid)", "Predicted (dashed)"],
-               fontsize=7, ncol=5, loc="lower right")
-    ax4.set_xlabel("Hour of day", fontsize=11)
-    ax4.set_ylabel("dSocdt (discharge rate)", fontsize=11)
-    ax4.set_title("Actual vs Predicted dSocdt — Sample Days", fontsize=11)
-    ax4.set_xticks(HOURS)
-    ax4.grid(linestyle="--", alpha=0.3)
+    # Hide any unused subplot axes (e.g. if fewer than 6 panels available)
+    for empty_i in range(n_panels, len(axes)):
+        axes[empty_i].axis("off")
 
     fig.tight_layout()
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
@@ -776,7 +742,7 @@ if __name__ == "__main__":
             pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
             print(f"\n  Raw predictions CSV  →  {pred_path}")
 
-            # Per-device plot (4 panels including cosine sim)
+            # Per-device plot — 6 actual-vs-predicted subplots (one per sampled day)
             plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T)
 
             # Threshold sweep
