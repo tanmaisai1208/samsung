@@ -1,6 +1,9 @@
-overall_by_value = (results_df.groupby("param_value")["mean_accuracy"]
-                                  .mean().reset_index())
-    if overall_by_value["mean_accuracy"].isna().all():
-        print("No valid results to determine best value. Exiting.")
-        raise SystemExit
-    best_row = overall_by_value.loc[overall_by_value["mean_accuracy"].idxmax(skipna=True)]
+import pandas as pd
+import glob
+for f in glob.glob("results/wide_csv/*.csv")[:1]:
+    wide = pd.read_csv(f, index_col="Date")
+    cols = [c for c in wide.columns if c.startswith("dSocdt")]
+    vals = wide[cols].values.flatten()
+    import numpy as np
+    vals = vals[~np.isnan(vals)]
+    print(f"min={vals.min():.4f}  max={vals.max():.4f}  mean={vals.mean():.4f}  std={vals.std():.4f}")
