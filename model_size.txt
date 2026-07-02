@@ -1,108 +1,17 @@
-PS C:\Users\chennagiri.s\Desktop\Soc> python xgboost_hypersearch.py
-=================================================================
-Tuning parameter : n_estimators
-Values to try    : [10, 25, 50, 100, 150, 200]
-Fixed params     : {'max_depth': 2.0, 'learning_rate': 0.05, 'subsample': 0.95, 'colsample_bytree': 0.8}
-Total runs       : 6 values x N devices
-=================================================================
+accs, maes, rmses = [], [], []
+    for d in day_data:
+        model.fit(d["X_train"], d["y_train"])
+        y_pred   = model.predict(d["X_pred"])[0]
+        y_actual = d["y_actual"]
 
-Found 8 device(s). Pre-computing features...
-  3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb: 74 days  →  60 prediction days each run
-  401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767: 74 days  →  60 prediction days each run
-  42f0e81125403519ed71e035d0c54a22fceea95362363151936ee87628c7a08e: 73 days  →  59 prediction days each run
-  6629d47f285139f95d148293c9b8f7115840bf21970299ddf50db544d09f724d: 70 days  →  56 prediction days each run
-  941a15e6d02a161f780d24d99b5c96ac7b73ed02652b95818e73473ba8d8fb66: 71 days  →  57 prediction days each run
-  ea1f79f3b9f2510c229de2d4ee98441c7fcf39bf384b32a2212535325fb5ac69: 69 days  →  55 prediction days each run
-  ec92f70a957b2292031f4342096c17736c6d1b92a0371095875c51296e708d43: 74 days  →  60 prediction days each run
-  f44d16fb80f7e7c786028b14e831619bdc3e362c36f60f1a5f124fbace89616a: 73 days  →  59 prediction days each run
+        # Only evaluate on hours where ground truth is not NaN
+        valid_mask = ~np.isnan(y_actual)
+        if valid_mask.sum() == 0:
+            continue   # no valid hours to evaluate on this day
 
-Devices: ['3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb', '401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767', '42f0e81125403519ed71e035d0c54a22fceea95362363151936ee87628c7a08e', '6629d47f285139f95d148293c9b8f7115840bf21970299ddf50db544d09f724d', '941a15e6d02a161f780d24d99b5c96ac7b73ed02652b95818e73473ba8d8fb66', 'ea1f79f3b9f2510c229de2d4ee98441c7fcf39bf384b32a2212535325fb5ac69', 'ec92f70a957b2292031f4342096c17736c6d1b92a0371095875c51296e708d43', 'f44d16fb80f7e7c786028b14e831619bdc3e362c36f60f1a5f124fbace89616a']
-Total model runs : 48  (6 values × 8 devices)
+        y_actual_valid = y_actual[valid_mask]
+        y_pred_valid   = y_pred[valid_mask]
 
-Values: 6 total | 0 done | 6 remaining
-
-Starting tuning run (joblib parallel)...
-
-  Running n_estimators=10 on [3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb]...
-joblib.externals.loky.process_executor._RemoteTraceback: 
-"""
-Traceback (most recent call last):
-  File "C:\Python314\Lib\site-packages\joblib\_utils.py", line 109, in __call__
-    return self.func(**kwargs)
-           ~~~~~~~~~^^^^^^^^^^
-  File "C:\Python314\Lib\site-packages\joblib\parallel.py", line 607, in __call__
-    return [func(*args, **kwargs) for func, args, kwargs in self.items]
-            ~~~~^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_hypersearch.py", line 234, in process_value
-    row = run_value_on_device(param_value, day_data, device_name)
-  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_hypersearch.py", line 184, in run_value_on_device
-    maes.append(mean_absolute_error(d["y_actual"], y_pred))
-                ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Python314\Lib\site-packages\sklearn\utils\_param_validation.py", line 218, in wrapper
-    return func(*args, **kwargs)
-  File "C:\Python314\Lib\site-packages\sklearn\metrics\_regression.py", line 285, in mean_absolute_error
-    _check_reg_targets_with_floating_dtype(
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        y_true, y_pred, sample_weight, multioutput, xp=xp
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Python314\Lib\site-packages\sklearn\metrics\_regression.py", line 209, in _check_reg_targets_with_floating_dtype
-    y_type, y_true, y_pred, sample_weight, multioutput = _check_reg_targets(
-                                                         ~~~~~~~~~~~~~~~~~~^
-        y_true, y_pred, sample_weight, multioutput, dtype=dtype_name, xp=xp
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Python314\Lib\site-packages\sklearn\metrics\_regression.py", line 115, in _check_reg_targets
-    y_true = check_array(y_true, ensure_2d=False, dtype=dtype)
-  File "C:\Python314\Lib\site-packages\sklearn\utils\validation.py", line 1087, in check_array
-    _assert_all_finite(
-    ~~~~~~~~~~~~~~~~~~^
-        array,
-        ^^^^^^
-    ...<2 lines>...
-        allow_nan=ensure_all_finite == "allow-nan",
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Python314\Lib\site-packages\sklearn\utils\validation.py", line 137, in _assert_all_finite
-    _assert_all_finite_element_wise(
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        X,
-        ^^
-    ...<4 lines>...
-        input_name=input_name,
-        ^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Python314\Lib\site-packages\sklearn\utils\validation.py", line 186, in _assert_all_finite_element_wise
-    raise ValueError(msg_err)
-ValueError: Input contains NaN.
-"""
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_hypersearch.py", line 350, in <module>
-    batch_results = joblib.Parallel(n_jobs=-1, prefer="threads")(
-        joblib.delayed(process_value)(v, all_device_data, done_set)
-        for v in batch
-    )
-  File "C:\Python314\Lib\site-packages\joblib\parallel.py", line 2072, in __call__
-    return output if self.return_generator else list(output)
-                                                ~~~~^^^^^^^^
-  File "C:\Python314\Lib\site-packages\joblib\parallel.py", line 1682, in _get_outputs
-    yield from self._retrieve()
-  File "C:\Python314\Lib\site-packages\joblib\parallel.py", line 1784, in _retrieve
-    self._raise_error_fast()
-    ~~~~~~~~~~~~~~~~~~~~~~^^
-  File "C:\Python314\Lib\site-packages\joblib\parallel.py", line 1859, in _raise_error_fast
-    error_job.get_result(self.timeout)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
-  File "C:\Python314\Lib\site-packages\joblib\parallel.py", line 758, in get_result
-    return self._return_or_raise()
-           ~~~~~~~~~~~~~~~~~~~~~^^
-  File "C:\Python314\Lib\site-packages\joblib\parallel.py", line 773, in _return_or_raise
-    raise self._result
-ValueError: Input contains NaN.
+        accs.append(accuracy_threshold(y_actual_valid, y_pred_valid))
+        maes.append(mean_absolute_error(y_actual_valid, y_pred_valid))
+        rmses.append(np.sqrt(mean_squared_error(y_actual_valid, y_pred_valid)))
