@@ -5,5 +5,5 @@ Additionally you may check these too:
 - Fenwick Tree (not that important)
 
 Session 1 -> leetocde 410, 875
-Session88 2 ->8 123, 188
+Session 2 -> 123, 188
 Session 3 -> 51, 52, 37
