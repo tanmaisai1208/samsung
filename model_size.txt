@@ -1,7 +1,6 @@
-for device, grp in results_df.groupby("device"):
-        if grp["mean_accuracy"].isna().all():
-            print(f"  {device:30s}  SKIPPED — all results NaN (no valid prediction days)")
-            continue
-        best = grp.loc[grp["mean_accuracy"].idxmax(skipna=True)]
-        print(f"  {device:30s}  best {TUNING_PARAM}={best['param_value']}  "
-              f"acc={best['mean_accuracy']:.2f}%  mae={best['mean_mae']:.5f}")
+overall_by_value = (results_df.groupby("param_value")["mean_accuracy"]
+                                  .mean().reset_index())
+    if overall_by_value["mean_accuracy"].isna().all():
+        print("No valid results to determine best value. Exiting.")
+        raise SystemExit
+    best_row = overall_by_value.loc[overall_by_value["mean_accuracy"].idxmax(skipna=True)]
