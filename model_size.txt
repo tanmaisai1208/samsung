@@ -33,23 +33,29 @@ Traceback (most recent call last):
   File "C:\Python314\Lib\site-packages\joblib\parallel.py", line 607, in __call__
     return [func(*args, **kwargs) for func, args, kwargs in self.items]
             ~~~~^^^^^^^^^^^^^^^^^
-  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_hypersearch.py", line 231, in process_value
+  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_hypersearch.py", line 234, in process_value
     row = run_value_on_device(param_value, day_data, device_name)
-  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_hypersearch.py", line 178, in run_value_on_device
-    model.fit(d["X_train"], d["y_train"])
-    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Python314\Lib\site-packages\sklearn\base.py", line 1403, in wrapper
-    return fit_method(estimator, *args, **kwargs)
-  File "C:\Python314\Lib\site-packages\sklearn\multioutput.py", line 242, in fit
-    y = validate_data(self, X="no_validation", y=y, multi_output=True)
-  File "C:\Python314\Lib\site-packages\sklearn\utils\validation.py", line 3040, in validate_data
-    out = _check_y(y, **check_params)
-  File "C:\Python314\Lib\site-packages\sklearn\utils\validation.py", line 1354, in _check_y
-    y = check_array(
-        y,
-    ...<5 lines>...
-        estimator=estimator,
+  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_hypersearch.py", line 184, in run_value_on_device
+    maes.append(mean_absolute_error(d["y_actual"], y_pred))
+                ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\site-packages\sklearn\utils\_param_validation.py", line 218, in wrapper
+    return func(*args, **kwargs)
+  File "C:\Python314\Lib\site-packages\sklearn\metrics\_regression.py", line 285, in mean_absolute_error
+    _check_reg_targets_with_floating_dtype(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        y_true, y_pred, sample_weight, multioutput, xp=xp
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     )
+    ^
+  File "C:\Python314\Lib\site-packages\sklearn\metrics\_regression.py", line 209, in _check_reg_targets_with_floating_dtype
+    y_type, y_true, y_pred, sample_weight, multioutput = _check_reg_targets(
+                                                         ~~~~~~~~~~~~~~~~~~^
+        y_true, y_pred, sample_weight, multioutput, dtype=dtype_name, xp=xp
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Python314\Lib\site-packages\sklearn\metrics\_regression.py", line 115, in _check_reg_targets
+    y_true = check_array(y_true, ensure_2d=False, dtype=dtype)
   File "C:\Python314\Lib\site-packages\sklearn\utils\validation.py", line 1087, in check_array
     _assert_all_finite(
     ~~~~~~~~~~~~~~~~~~^
@@ -72,13 +78,13 @@ Traceback (most recent call last):
     ^
   File "C:\Python314\Lib\site-packages\sklearn\utils\validation.py", line 186, in _assert_all_finite_element_wise
     raise ValueError(msg_err)
-ValueError: Input y contains NaN.
+ValueError: Input contains NaN.
 """
 
 The above exception was the direct cause of the following exception:
 
 Traceback (most recent call last):
-  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_hypersearch.py", line 347, in <module>
+  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_hypersearch.py", line 350, in <module>
     batch_results = joblib.Parallel(n_jobs=-1, prefer="threads")(
         joblib.delayed(process_value)(v, all_device_data, done_set)
         for v in batch
@@ -99,4 +105,4 @@ Traceback (most recent call last):
            ~~~~~~~~~~~~~~~~~~~~~^^
   File "C:\Python314\Lib\site-packages\joblib\parallel.py", line 773, in _return_or_raise
     raise self._result
-ValueError: Input y contains NaN.
+ValueError: Input contains NaN.
