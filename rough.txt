@@ -1,75 +1,36 @@
-PS C:\Users\chennagiri.s\Desktop\Soc> python xgboost_final_validation.py
-=================================================================
-FINAL COMBINED VALIDATION — BEST HYPERPARAMETERS
-=================================================================
-  n_estimators         = 200
-  max_depth            = 2
-  learning_rate        = 0.1
-  subsample            = 0.95
-  colsample_bytree     = 0.8
+def metrics_at_threshold(results, threshold):
+    daily_accs = [
+        accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
+        for r in results
+    ]
+    daily_accs = [a for a in daily_accs if not np.isnan(a)]
+    valid_mae  = [r["mae"]  for r in results if not np.isnan(r["mae"])]
+    valid_rmse = [r["rmse"] for r in results if not np.isnan(r["rmse"])]
 
-  Thresholds evaluated : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-=================================================================
+    return {
+        "mean_accuracy_%": round(float(np.mean(daily_accs)), 4) if daily_accs else np.nan,
+        "mean_mae"        : round(float(np.mean(valid_mae)), 6) if valid_mae else np.nan,
+        "mean_rmse"       : round(float(np.mean(valid_rmse)), 6) if valid_rmse else np.nan,
+    }
 
-=================================================================
-Device : 3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb
-=================================================================
-  Predicting 60 days...
-  Day   1/60 | 2024-05-19 | MAE: nan | CosSim: nan
-  Day  11/60 | 2024-05-29 | MAE: nan | CosSim: nan
-  Day  21/60 | 2024-06-08 | MAE: 0.001267 | CosSim: 0.08214788435610418
-  Day  31/60 | 2024-06-18 | MAE: nan | CosSim: nan
-  Day  41/60 | 2024-06-28 | MAE: 0.001812 | CosSim: 0.35208845130917193
-  Day  51/60 | 2024-07-08 | MAE: nan | CosSim: nan
+-----
 
-  Raw predictions CSV  →  results/xgboost/final_validation\final_predictions_3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb.csv
-  Device plot saved  →  results/xgboost/final_validation\final_validation_plot_3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb.png
+# Cosine similarity summary per device
+valid_cos = [r["cosine_sim"] for r in results if not np.isnan(r["cosine_sim"])]
 
-  Threshold sweep:
-    T= 1  →  acc=100.00%  mae=0.00184  rmse=0.00323
-    T= 2  →  acc=100.00%  mae=0.00184  rmse=0.00323
-    T= 3  →  acc=100.00%  mae=0.00184  rmse=0.00323
-    T= 4  →  acc=100.00%  mae=0.00184  rmse=0.00323
-    T= 5  →  acc=100.00%  mae=0.00184  rmse=0.00323
-    T= 6  →  acc=100.00%  mae=0.00184  rmse=0.00323
-    T= 7  →  acc=100.00%  mae=0.00184  rmse=0.00323
-    T= 8  →  acc=100.00%  mae=0.00184  rmse=0.00323
-    T= 9  →  acc=100.00%  mae=0.00184  rmse=0.00323
-    T=10  →  acc=100.00%  mae=0.00184  rmse=0.00323
+if valid_cos:
+    mean_cos = round(float(np.mean(valid_cos)), 6)
+    min_cos  = round(float(np.min(valid_cos)), 6)
+    max_cos  = round(float(np.max(valid_cos)), 6)
+    print(f"\n  Cosine similarity — mean: {mean_cos:.4f}  min: {min_cos:.4f}  max: {max_cos:.4f}")
+else:
+    mean_cos = min_cos = max_cos = np.nan
+    print(f"\n  Cosine similarity — no valid (non-NaN) days for this device")
 
-  Cosine similarity — mean: 0.1311  min: -0.0941  max: 0.5900
-
-=================================================================
-Device : 401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767
-=================================================================
-  Predicting 60 days...
-  Day   1/60 | 2024-05-19 | MAE: nan | CosSim: nan
-  Day  21/60 | 2024-06-08 | MAE: nan | CosSim: nan
-  Day  60/60 | 2024-07-17 | MAE: nan | CosSim: nan
-
-  Raw predictions CSV  →  results/xgboost/final_validation\final_predictions_401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767.csv
-  Device plot saved  →  results/xgboost/final_validation\final_validation_plot_401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767.png
-
-  Threshold sweep:
-    T= 1  →  acc=nan%  mae=nan  rmse=nan
-    T= 2  →  acc=nan%  mae=nan  rmse=nan
-    T= 3  →  acc=nan%  mae=nan  rmse=nan
-    T= 4  →  acc=nan%  mae=nan  rmse=nan
-    T= 5  →  acc=nan%  mae=nan  rmse=nan
-    T= 6  →  acc=nan%  mae=nan  rmse=nan
-    T= 7  →  acc=nan%  mae=nan  rmse=nan
-    T= 8  →  acc=nan%  mae=nan  rmse=nan
-    T= 9  →  acc=nan%  mae=nan  rmse=nan
-    T=10  →  acc=nan%  mae=nan  rmse=nan
-  ERROR: zero-size array to reduction operation minimum which has no identity
-Traceback (most recent call last):
-  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_final_validation.py", line 458, in <module>
-    min_cos  = round(float(np.min ([r["cosine_sim"] for r in results if not np.isnan(r["cosine_sim"])])), 6)
-                           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Python314\Lib\site-packages\numpy\_core\fromnumeric.py", line 3261, in min
-    return _wrapreduction(a, np.minimum, 'min', axis, None, out,
-                          keepdims=keepdims, initial=initial, where=where)
-  File "C:\Python314\Lib\site-packages\numpy\_core\fromnumeric.py", line 83, in _wrapreduction
-    return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-ValueError: zero-size array to reduction operation minimum which has no identity
+cosine_rows.append({
+    "device"         : device_name,
+    "mean_cosine_sim": mean_cos,
+    "min_cosine_sim" : min_cos,
+    "max_cosine_sim" : max_cos,
+    "total_days"     : len(results),
+})
