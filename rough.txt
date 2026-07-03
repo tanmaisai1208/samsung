@@ -1,8 +1,4 @@
-Remove wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0) — no more clipping
-Remove y_pred = np.clip(y_pred, a_min=None, a_max=0.0) — predictions can be positive
-Remove Task A and Task B entirely (all discrimination/detection code)
-Add NaN guards in run_predictions for both training and evaluation
-Fix mean_absolute_error/cosine_similarity to handle NaN in y_actual
+
 
 PS C:\Users\chennagiri.s\Desktop\Soc> python xgboost_final_validation.py
 =================================================================
