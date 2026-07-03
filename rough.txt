@@ -1,36 +1,7 @@
-def metrics_at_threshold(results, threshold):
-    daily_accs = [
-        accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
-        for r in results
-    ]
-    daily_accs = [a for a in daily_accs if not np.isnan(a)]
-    valid_mae  = [r["mae"]  for r in results if not np.isnan(r["mae"])]
-    valid_rmse = [r["rmse"] for r in results if not np.isnan(r["rmse"])]
-
-    return {
-        "mean_accuracy_%": round(float(np.mean(daily_accs)), 4) if daily_accs else np.nan,
-        "mean_mae"        : round(float(np.mean(valid_mae)), 6) if valid_mae else np.nan,
-        "mean_rmse"       : round(float(np.mean(valid_rmse)), 6) if valid_rmse else np.nan,
-    }
-
------
-
-# Cosine similarity summary per device
-valid_cos = [r["cosine_sim"] for r in results if not np.isnan(r["cosine_sim"])]
-
-if valid_cos:
-    mean_cos = round(float(np.mean(valid_cos)), 6)
-    min_cos  = round(float(np.min(valid_cos)), 6)
-    max_cos  = round(float(np.max(valid_cos)), 6)
-    print(f"\n  Cosine similarity — mean: {mean_cos:.4f}  min: {min_cos:.4f}  max: {max_cos:.4f}")
-else:
-    mean_cos = min_cos = max_cos = np.nan
-    print(f"\n  Cosine similarity — no valid (non-NaN) days for this device")
-
-cosine_rows.append({
-    "device"         : device_name,
-    "mean_cosine_sim": mean_cos,
-    "min_cosine_sim" : min_cos,
-    "max_cosine_sim" : max_cos,
-    "total_days"     : len(results),
-})
+  Threshold sweep:
+  ERROR: 'float' object is not iterable
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_final_validation.py", line 440, in <module>
+    for T in THRESHOLDS:
+             ^^^^^^^^^^
+TypeError: 'float' object is not iterable
