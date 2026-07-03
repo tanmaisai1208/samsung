@@ -1,99 +1,75 @@
-def run_predictions(wide, device_name):
-    """
-    Returns list of per-day dicts with raw y_actual, y_pred, MAE, RMSE,
-    and cosine similarity. Handles NaN values gracefully.
-    """
-    n_days  = len(wide)
-    results = []
+PS C:\Users\chennagiri.s\Desktop\Soc> python xgboost_final_validation.py
+=================================================================
+FINAL COMBINED VALIDATION — BEST HYPERPARAMETERS
+=================================================================
+  n_estimators         = 200
+  max_depth            = 2
+  learning_rate        = 0.1
+  subsample            = 0.95
+  colsample_bytree     = 0.8
 
-    model = MultiOutputRegressor(
-        XGBRegressor(**BEST_PARAMS),
-        n_jobs=-1
-    )
+  Thresholds evaluated : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+=================================================================
 
-    total = n_days - TRAIN_DAYS
-    print(f"  Predicting {total} days...")
+=================================================================
+Device : 3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb
+=================================================================
+  Predicting 60 days...
+  Day   1/60 | 2024-05-19 | MAE: nan | CosSim: nan
+  Day  11/60 | 2024-05-29 | MAE: nan | CosSim: nan
+  Day  21/60 | 2024-06-08 | MAE: 0.001267 | CosSim: 0.08214788435610418
+  Day  31/60 | 2024-06-18 | MAE: nan | CosSim: nan
+  Day  41/60 | 2024-06-28 | MAE: 0.001812 | CosSim: 0.35208845130917193
+  Day  51/60 | 2024-07-08 | MAE: nan | CosSim: nan
 
-    for predict_day_idx in range(TRAIN_DAYS, n_days):
-        train_start  = predict_day_idx - TRAIN_DAYS
-        train_end    = predict_day_idx
-        predict_date = wide.index[predict_day_idx]
+  Raw predictions CSV  →  results/xgboost/final_validation\final_predictions_3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb.csv
+  Device plot saved  →  results/xgboost/final_validation\final_validation_plot_3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb.png
 
-        X_train, y_train = [], []
-        for k in range(1, TRAIN_DAYS):
-            target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
+  Threshold sweep:
+    T= 1  →  acc=100.00%  mae=0.00184  rmse=0.00323
+    T= 2  →  acc=100.00%  mae=0.00184  rmse=0.00323
+    T= 3  →  acc=100.00%  mae=0.00184  rmse=0.00323
+    T= 4  →  acc=100.00%  mae=0.00184  rmse=0.00323
+    T= 5  →  acc=100.00%  mae=0.00184  rmse=0.00323
+    T= 6  →  acc=100.00%  mae=0.00184  rmse=0.00323
+    T= 7  →  acc=100.00%  mae=0.00184  rmse=0.00323
+    T= 8  →  acc=100.00%  mae=0.00184  rmse=0.00323
+    T= 9  →  acc=100.00%  mae=0.00184  rmse=0.00323
+    T=10  →  acc=100.00%  mae=0.00184  rmse=0.00323
 
-            # --- NaN guard (training) : skip samples whose target has NaN ---
-            if np.isnan(target).any():
-                continue
+  Cosine similarity — mean: 0.1311  min: -0.0941  max: 0.5900
 
-            pad_days = TRAIN_DAYS - k
-            feats = build_padded_feature_row(wide, train_start,
-                                              train_start + k, pad_days)
-            X_train.append(feats)
-            y_train.append(target)
+=================================================================
+Device : 401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767
+=================================================================
+  Predicting 60 days...
+  Day   1/60 | 2024-05-19 | MAE: nan | CosSim: nan
+  Day  21/60 | 2024-06-08 | MAE: nan | CosSim: nan
+  Day  60/60 | 2024-07-17 | MAE: nan | CosSim: nan
 
-        # Not enough clean training samples for this window -> skip this day
-        if len(X_train) < 2:
-            results.append({
-                "predict_date": predict_date,
-                "train_start" : wide.index[train_start],
-                "train_end"   : wide.index[train_end - 1],
-                "y_actual"    : wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float),
-                "y_pred"      : np.full(len(DSOCDT_COLS), np.nan),
-                "mae"         : np.nan,
-                "rmse"        : np.nan,
-                "cosine_sim"  : np.nan,
-            })
-            continue
+  Raw predictions CSV  →  results/xgboost/final_validation\final_predictions_401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767.csv
+  Device plot saved  →  results/xgboost/final_validation\final_validation_plot_401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767.png
 
-        X_train = np.array(X_train, dtype=float)
-        y_train = np.array(y_train, dtype=float)
-        model.fit(X_train, y_train)
-
-        X_pred   = build_feature_row(wide, train_start, train_end).reshape(1, -1)
-        y_pred   = model.predict(X_pred)[0]
-        # No clipping – predictions may be positive
-        y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
-
-        # --- NaN guard (evaluation) ---
-        if np.isnan(y_actual).any() or np.isnan(y_pred).any():
-            mae, rmse, cos_sim = np.nan, np.nan, np.nan
-        else:
-            mae = round(mean_absolute_error(y_actual, y_pred), 6)
-            rmse = round(np.sqrt(mean_squared_error(y_actual, y_pred)), 6)
-            cos_sim = cosine_similarity(y_actual, y_pred)
-
-        results.append({
-            "predict_date"   : predict_date,
-            "train_start"    : wide.index[train_start],
-            "train_end"      : wide.index[train_end - 1],
-            "y_actual"       : y_actual,
-            "y_pred"         : y_pred,
-            "mae"            : mae,
-            "rmse"           : rmse,
-            "cosine_sim"     : round(cos_sim, 6) if not np.isnan(cos_sim) else np.nan,
-        })
-
-        if (predict_day_idx - TRAIN_DAYS) % 10 == 0 or predict_day_idx == n_days - 1:
-            print(f"  Day {predict_day_idx - TRAIN_DAYS + 1:3d}/{total} "
-                  f"| {predict_date} | MAE: {mae if not np.isnan(mae) else 'nan'} | CosSim: {cos_sim if not np.isnan(cos_sim) else 'nan'}")
-
-    return results
-
------
-
-def metrics_at_threshold(results, threshold):
-    daily_accs = [
-        accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
-        for r in results
-    ]
-    daily_accs = [a for a in daily_accs if not np.isnan(a)]
-    valid_mae  = [r["mae"]  for r in results if not np.isnan(r["mae"])]
-    valid_rmse = [r["rmse"] for r in results if not np.isnan(r["rmse"])]
-
-    return {
-        "mean_accuracy_%": round(float(np.mean(daily_accs)), 4) if daily_accs else np.nan,
-        "mean_mae"        : round(float(np.mean(valid_mae)), 6) if valid_mae else np.nan,
-        "mean_rmse"       : round(float(np.mean(valid_rmse)), 6) if valid_rmse else np.nan,
-    }
+  Threshold sweep:
+    T= 1  →  acc=nan%  mae=nan  rmse=nan
+    T= 2  →  acc=nan%  mae=nan  rmse=nan
+    T= 3  →  acc=nan%  mae=nan  rmse=nan
+    T= 4  →  acc=nan%  mae=nan  rmse=nan
+    T= 5  →  acc=nan%  mae=nan  rmse=nan
+    T= 6  →  acc=nan%  mae=nan  rmse=nan
+    T= 7  →  acc=nan%  mae=nan  rmse=nan
+    T= 8  →  acc=nan%  mae=nan  rmse=nan
+    T= 9  →  acc=nan%  mae=nan  rmse=nan
+    T=10  →  acc=nan%  mae=nan  rmse=nan
+  ERROR: zero-size array to reduction operation minimum which has no identity
+Traceback (most recent call last):
+  File "C:\Users\chennagiri.s\Desktop\Soc\xgboost_final_validation.py", line 458, in <module>
+    min_cos  = round(float(np.min ([r["cosine_sim"] for r in results if not np.isnan(r["cosine_sim"])])), 6)
+                           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\site-packages\numpy\_core\fromnumeric.py", line 3261, in min
+    return _wrapreduction(a, np.minimum, 'min', axis, None, out,
+                          keepdims=keepdims, initial=initial, where=where)
+  File "C:\Python314\Lib\site-packages\numpy\_core\fromnumeric.py", line 83, in _wrapreduction
+    return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: zero-size array to reduction operation minimum which has no identity
