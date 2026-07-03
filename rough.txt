@@ -1,5 +1,5 @@
-IP Address: 107.99.236.88	
-User: test@ws2030077096
-password: Mob12@Bats34
-
-remote SSH feature is available in VS Code. You can use above credentials to set up for your environment.
+Remove wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0) — no more clipping
+Remove y_pred = np.clip(y_pred, a_min=None, a_max=0.0) — predictions can be positive
+Remove Task A and Task B entirely (all discrimination/detection code)
+Add NaN guards in run_predictions for both training and evaluation
+Fix mean_absolute_error/cosine_similarity to handle NaN in y_actual
