@@ -1,7 +1,2 @@
-So the way u train the model doesn't change, u have to train based on the whole data (don't clip neither of positive or negative), 
-but the target variabke or thing whihc u predict changes actually, now u have to predict the charging events or the time when a particular user 
-does his charging in each test day. and by charging doesnt mean just slight increase in SOC and then falling down etc, some significant big or medium increase in 
-SOC will be considered as charging . because our use-case on which we are focsuing now is, suggesting charging schedules to user. 
-
-And the metric to decide how good the model is MAE, so do the MAE between actual charging schedule time done by user and the time which model predcited as charging schedule.
-like lets say there is a charging scedhule event or peak in time-series of SOC done by user at 3pm and model predicts it as 4pm, so ur error for this data point is 1hr etc
+Why lower thresholds for predicted values:
+XGBoost trained with MSE-style loss functions tends to predict values closer to the average of what it saw in training rather than sharp extremes. If your training data has charging spikes reaching 0.010–0.015 dSocdt, but also many hours near 0, the model hedges its bets and often predicts something in between — say 0.005–0.008 for what was actually a 0.012 spike. This is a well-known regression phenomenon called regression to the mean or shrinkage. So if you used the same strict threshold (0.007) on predictions, many genuine charging predictions would fall just under the bar and get missed — which is exactly the low detection rate (28%) you saw. Lowering the predicted-side threshold compensates for this systematic underprediction.
