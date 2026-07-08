@@ -10,25 +10,27 @@ CHANGE IN OBJECTIVE:
   different question: "At what hour of the day does the user actually start
   charging their device, and can the model predict that hour?"
 
-DEFINITION OF A "CHARGING EVENT"  (simplified — SoC-jump based):
-  A charging event is any hour where the SoC value itself jumps up by at
-  least a threshold amount compared to the previous hour. This is simpler
-  and more directly interpretable than the earlier dSocdt-rate-based
-  detection: we just ask "did SoC visibly increase by a large amount in this
-  hour?" rather than reasoning about per-minute rates and contiguous runs.
+DEFINITION OF A "CHARGING EVENT"  (dual constraint — dSocdt rate AND total SoC rise):
+  A charging event is a contiguous run of hours where dSocdt exceeds a
+  minimum per-hour rate threshold, AND the total SoC gained across that run
+  (rate-sum converted to actual percentage via *60 minutes) exceeds a
+  minimum total-rise threshold. Both constraints must hold — a single noisy
+  hour above the rate threshold is not enough; the accumulated rise across
+  the contiguous run must also be substantial.
 
-    Actual curve   : SoC_h - SoC_(h-1) >= MIN_SOC_JUMP_ACTUAL  (e.g. 40%)
-    Predicted curve: SoC_h - SoC_(h-1) >= MIN_SOC_JUMP_PRED    (e.g. 20-25%)
+    Actual curve    : per-hour dSocdt > MIN_HOURLY_RISE_ACTUAL
+                       AND total_rise (sum(dSocdt)*60) >= MIN_CHARGE_RISE_ACTUAL
+    Predicted curve : per-hour dSocdt > MIN_HOURLY_RISE_PRED
+                       AND total_rise (sum(dSocdt)*60) >= MIN_CHARGE_RISE_PRED
 
-  A looser threshold is used on the predicted side because XGBoost regression
-  systematically underpredicts sharp single-hour jumps (regression toward
-  the mean), so demanding the same large jump on the predicted curve would
-  almost always detect nothing.
+  A looser threshold pair is used on the predicted side because XGBoost
+  regression systematically underpredicts sharp single-hour charging spikes
+  (regression toward the mean), so demanding the same strict thresholds on
+  the predicted curve would almost always detect nothing.
 
-  NOTE: since the wide CSV's SoC columns are themselves hourly averages
-  (from the earlier resampling step), the SoC series used here is
-  reconstructed from the model's dSocdt predictions/actuals by integrating
-  forward from a start-of-day baseline. See `soc_curve_from_dsocdt()`.
+  The representative "charging hour" for a detected run is the
+  rise-magnitude-weighted average hour across that run (so a run like
+  [+1, +8, +1] is centered near the +8 hour, not a flat midpoint).
 
 METRIC:
   MAE — for each day, actual charging-event hours are matched to predicted
@@ -36,9 +38,9 @@ METRIC:
   between each matched pair is the "error" for that event. MAE is the mean
   of all these per-event errors across all devices and days.
 
-  Absolute-count confusion-matrix-style metrics (replacing percentage-based
-  detection/false-alarm rates, since those had inconsistent denominators
-  across devices and made comparison misleading):
+  Absolute-count confusion-matrix-style metrics (NOT percentage-based
+  detection/false-alarm rates, since those have inconsistent denominators
+  across devices and make cross-device comparison misleading):
     - True Positives (TP)  : matched (actual, predicted) event pairs
     - False Positives (FP) : predicted events with no corresponding actual event
     - False Negatives (FN) : actual events with no corresponding predicted event
@@ -50,7 +52,7 @@ Outputs (all inside results/xgboost/charging_schedule/):
   charging_schedule_error_distribution.png    — histogram of hour-errors across all events
   charging_schedule_tp_fp_plot.png            — absolute TP / FP counts per device + mean
   charging_schedule_sample_days_<device>.png  — sample days showing actual vs predicted
-                                                 SoC curves with marked charging events
+                                                 dSocdt curves with marked charging events
 """
 
 import os
@@ -90,13 +92,25 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 TRAIN_DAYS = 14
 HOURS      = list(range(24))
 
-# A charging event = an hour where SoC jumps up by at least this many
-# percentage points compared to the previous hour.
+# A charging event = contiguous rising run of hours where TOTAL SoC rise
+# across the run is >= this many percentage points. Small blips (e.g. a
+# single-hour +1% jitter) are ignored.
 #
-# Looser threshold on the predicted side compensates for XGBoost's tendency
-# to underpredict sharp single-hour jumps (regression toward the mean).
-MIN_SOC_JUMP_ACTUAL = 40.0
-MIN_SOC_JUMP_PRED   = 20.0
+# NOTE: Empirically, charging events in this hourly-averaged dataset show up
+# as ISOLATED single-hour spikes (runs rarely span more than 1-2 hours) rather
+# than sustained multi-hour ramps. A single strong hour typically sums (after
+# the *60 conversion) to roughly 0.4-1.1 in this dataset.
+#
+# Two separate threshold sets are used: XGBoost regression systematically
+# underpredicts sharp single-hour spikes (regression toward the mean), so a
+# looser threshold is used when scanning PREDICTED curves to compensate for
+# this systematic peak-flattening, while the stricter thresholds (validated
+# against real data) are retained for scanning ACTUAL curves.
+MIN_HOURLY_RISE_ACTUAL = 0.007
+MIN_CHARGE_RISE_ACTUAL = 0.35
+
+MIN_HOURLY_RISE_PRED = 0.004
+MIN_CHARGE_RISE_PRED = 0.20
 
 # ─────────────────────────────────────────────────────────────
 # COLUMN DEFINITIONS  (identical to final_validation.py)
@@ -135,23 +149,45 @@ def build_padded_feature_row(wide, context_start, context_end, pad_days):
 
 
 # ─────────────────────────────────────────────────────────────
-# CHARGING EVENT DETECTION  (SoC-jump based, simplified)
+# CHARGING EVENT DETECTION  (dSocdt rate + total SoC rise, dual constraint)
 # ─────────────────────────────────────────────────────────────
 
-def detect_charging_events_from_soc(soc_24h, min_soc_jump):
+def detect_charging_events(dsocdt_24h, min_hourly_rise, min_total_rise):
     """
-    Scan a 24-hour SoC vector and return a list of charging event hours —
-    any hour h (h >= 1) where SoC_h - SoC_(h-1) >= min_soc_jump.
+    Scan a 24-hour dSocdt vector and return a list of charging event times
+    (representative hour for each contiguous significant-rise run).
 
-    Returns: list of ints (hour indices, 1-23)
+    A "run" is a maximal contiguous sequence of hours where dSocdt >
+    min_hourly_rise. The run counts as a genuine charging event only if the
+    SUM of dSocdt across the run, converted to actual % SoC gained (rate-sum
+    * 60 minutes), is >= min_total_rise.
+
+    The representative hour for an event is the rise-magnitude-weighted
+    average hour of the run (so a run like [+1, +8, +1] is centered near the
+    +8 hour, not a flat midpoint).
+
+    Returns: list of floats (hour values, can be fractional, e.g. 13.5)
     """
     events = []
-    for h in range(1, len(soc_24h)):
-        prev, curr = soc_24h[h - 1], soc_24h[h]
-        if np.isnan(prev) or np.isnan(curr):
-            continue
-        if (curr - prev) >= min_soc_jump:
-            events.append(h)
+    n = len(dsocdt_24h)
+    i = 0
+    while i < n:
+        val = dsocdt_24h[i]
+        if not np.isnan(val) and val > min_hourly_rise:
+            run_hours = [i]
+            run_vals  = [val]
+            j = i + 1
+            while j < n and not np.isnan(dsocdt_24h[j]) and dsocdt_24h[j] > min_hourly_rise:
+                run_hours.append(j)
+                run_vals.append(dsocdt_24h[j])
+                j += 1
+            total_rise = float(np.sum(run_vals)) * 60   # rate-sum -> actual % SoC gained
+            if total_rise >= min_total_rise:
+                weighted_hour = float(np.average(run_hours, weights=run_vals))
+                events.append(weighted_hour)
+            i = j
+        else:
+            i += 1
     return events
 
 
@@ -222,41 +258,28 @@ def run_charging_schedule_predictions(wide, device_name):
         model.fit(X_train, y_train)
 
         X_pred   = build_feature_row(wide, train_start, train_end).reshape(1, -1)
-        y_pred_dsocdt   = model.predict(X_pred)[0]
+        y_pred   = model.predict(X_pred)[0]
         # No clipping — full signal retained, +ve and -ve both meaningful
-        y_actual_dsocdt = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
+        y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
 
-        if np.all(np.isnan(y_actual_dsocdt)):
+        if np.all(np.isnan(y_actual)):
             continue
 
-        # ── Use the actual Soc columns directly for ground truth,
-        #    and reconstruct a predicted Soc curve by integrating the
-        #    predicted dSocdt forward from the actual start-of-day SoC ──
-        soc_actual = wide.iloc[predict_day_idx][SOC_COLS].values.astype(float)
-
-        start_soc = next((v for v in soc_actual if not np.isnan(v)), 50.0)
-        soc_pred  = np.full(24, np.nan)
-        running   = start_soc
-        for h in range(24):
-            # dSocdt is fractional-change-per-minute; convert to an
-            # approximate per-hour SoC delta the same way as elsewhere
-            # in this pipeline (rate * 60 minutes).
-            delta = y_pred_dsocdt[h] * 60 if not np.isnan(y_pred_dsocdt[h]) else 0.0
-            running = running + delta
-            soc_pred[h] = running
-
-        # ── Detect charging events directly from SoC jumps ──
-        actual_events    = detect_charging_events_from_soc(soc_actual, MIN_SOC_JUMP_ACTUAL)
-        predicted_events = detect_charging_events_from_soc(soc_pred,   MIN_SOC_JUMP_PRED)
+        # ── Detect charging events on both actual and predicted curves ──
+        # Actual curve uses the stricter, real-data-validated thresholds;
+        # predicted curve uses looser thresholds to compensate for XGBoost's
+        # tendency to underpredict sharp single-hour charging spikes.
+        actual_events    = detect_charging_events(
+            y_actual, MIN_HOURLY_RISE_ACTUAL, MIN_CHARGE_RISE_ACTUAL)
+        predicted_events = detect_charging_events(
+            y_pred, MIN_HOURLY_RISE_PRED, MIN_CHARGE_RISE_PRED)
 
         matches, n_false_negative, n_false_positive = match_events(actual_events, predicted_events)
 
         results.append({
             "predict_date"    : predict_date,
-            "y_actual"        : y_actual_dsocdt,
-            "y_pred"          : y_pred_dsocdt,
-            "soc_actual"      : soc_actual,
-            "soc_pred"        : soc_pred,
+            "y_actual"        : y_actual,
+            "y_pred"          : y_pred,
             "actual_events"   : actual_events,
             "predicted_events": predicted_events,
             "matches"         : matches,
@@ -332,9 +355,9 @@ def plot_tp_fp(summary_df, plot_path):
     """
     Absolute-count confusion-matrix-style plot: True Positives (matched
     events) and False Positives (unmatched predicted events) per device,
-    plus the mean across all devices. Replaces the earlier percentage-based
-    detection/false-alarm-rate plot, which had inconsistent denominators
-    across devices and made cross-device comparison misleading.
+    plus the mean across all devices. Replaces percentage-based
+    detection/false-alarm-rate plots, which have inconsistent denominators
+    across devices and make cross-device comparison misleading.
     """
     dev_data = summary_df[summary_df["device"] != "OVERALL_MEAN"].copy()
     overall  = summary_df[summary_df["device"] == "OVERALL_MEAN"]
@@ -371,8 +394,8 @@ def plot_tp_fp(summary_df, plot_path):
     ax.set_ylabel("Absolute event count", fontsize=11)
     ax.set_title(
         "Charging Event Detection — True Positives vs False Positives per Device\n"
-        f"(actual event: SoC jump ≥ {MIN_SOC_JUMP_ACTUAL:.0f}%  |  "
-        f"predicted event: SoC jump ≥ {MIN_SOC_JUMP_PRED:.0f}%)",
+        f"(actual: rate>{MIN_HOURLY_RISE_ACTUAL}, total≥{MIN_CHARGE_RISE_ACTUAL}  |  "
+        f"predicted: rate>{MIN_HOURLY_RISE_PRED}, total≥{MIN_CHARGE_RISE_PRED})",
         fontsize=12, fontweight="bold")
     ax.legend(fontsize=9)
     ax.grid(axis="y", linestyle="--", alpha=0.4)
@@ -393,19 +416,19 @@ def plot_sample_days(results, device_name, plot_path, n_samples=6):
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 5 * n_rows))
     axes = np.array(axes).reshape(-1)
 
-    fig.suptitle(f"Charging Schedule — Actual vs Predicted SoC — {device_name}",
+    fig.suptitle(f"Charging Schedule — Actual vs Predicted — {device_name}",
                  fontsize=13, fontweight="bold")
 
     for panel_i, idx in enumerate(sample_idx):
         ax = axes[panel_i]
         r  = results[idx]
-        soc_actual, soc_pred = r["soc_actual"], r["soc_pred"]
-        valid = ~np.isnan(soc_actual)
+        actual, pred = r["y_actual"], r["y_pred"]
+        valid = ~np.isnan(actual)
 
-        ax.plot(np.array(HOURS)[valid], soc_actual[valid], color="steelblue",
-                linewidth=1.8, marker="o", markersize=3, label="Actual SoC")
-        ax.plot(HOURS, soc_pred, color="crimson", linewidth=1.8, linestyle="--",
-                marker="s", markersize=3, label="Predicted SoC (reconstructed)")
+        ax.plot(np.array(HOURS)[valid], actual[valid], color="steelblue",
+                linewidth=1.8, marker="o", markersize=3, label="Actual dSocdt")
+        ax.plot(HOURS, pred, color="crimson", linewidth=1.8, linestyle="--",
+                marker="s", markersize=3, label="Predicted dSocdt")
 
         for ev in r["actual_events"]:
             ax.axvline(ev, color="steelblue", linestyle="-", alpha=0.5, linewidth=2)
@@ -418,7 +441,7 @@ def plot_sample_days(results, device_name, plot_path, n_samples=6):
                      f"pred_ev={len(r['predicted_events'])} | avg_err={mae_str}",
                      fontsize=9)
         ax.set_xlabel("Hour of day", fontsize=8)
-        ax.set_ylabel("SoC (%)", fontsize=8)
+        ax.set_ylabel("dSocdt", fontsize=8)
         ax.set_xticks(range(0, 24, 4))
         ax.legend(fontsize=7, loc="upper right")
         ax.grid(linestyle="--", alpha=0.3)
@@ -444,15 +467,17 @@ if __name__ == "__main__":
     for k, v in BEST_PARAMS.items():
         if k not in ("random_state", "verbosity"):
             print(f"  {k:20s} = {v}")
-    print(f"\n  Actual   — min SoC jump to count as charging event : {MIN_SOC_JUMP_ACTUAL:.0f}%")
-    print(f"  Predicted — min SoC jump to count as charging event : {MIN_SOC_JUMP_PRED:.0f}%")
+    print(f"\n  Actual    — min hourly rise / min total rise : "
+          f"{MIN_HOURLY_RISE_ACTUAL} / {MIN_CHARGE_RISE_ACTUAL}")
+    print(f"  Predicted — min hourly rise / min total rise : "
+          f"{MIN_HOURLY_RISE_PRED} / {MIN_CHARGE_RISE_PRED}")
     print("=" * 65 + "\n")
 
     wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
     if not wide_files:
         raise FileNotFoundError(f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'.")
 
-    all_summary_rows = []
+    all_summary_rows  = []
     all_errors_pooled = []
 
     for wf in wide_files:
@@ -477,13 +502,13 @@ if __name__ == "__main__":
                 print("  No valid prediction days produced.\n")
                 continue
 
-            # Save per-day predictions CSV
+            # Save per-day predictions CSV + accumulate TP/FP/FN
             pred_rows = []
-            all_device_errors = []
-            total_tp = 0
-            total_fp = 0
-            total_fn = 0
-            n_event_count_match = 0
+            all_device_errors   = []
+            total_tp             = 0
+            total_fp             = 0
+            total_fn             = 0
+            n_event_count_match  = 0
 
             for r in results:
                 matched_errors = [m[2] for m in r["matches"]]
@@ -499,8 +524,8 @@ if __name__ == "__main__":
 
                 pred_rows.append({
                     "predict_date"      : r["predict_date"],
-                    "actual_events"     : "; ".join(str(e) for e in r["actual_events"]),
-                    "predicted_events"  : "; ".join(str(e) for e in r["predicted_events"]),
+                    "actual_events"     : "; ".join(f"{e:.2f}" for e in r["actual_events"]),
+                    "predicted_events"  : "; ".join(f"{e:.2f}" for e in r["predicted_events"]),
                     "n_actual_events"   : len(r["actual_events"]),
                     "n_predicted_events": len(r["predicted_events"]),
                     "true_positive"     : len(r["matches"]),
