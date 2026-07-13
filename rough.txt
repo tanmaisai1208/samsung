@@ -1,24 +1,18 @@
-int ans=0;
-void f(node,adj,wt,val){
-    ans+=abs(wt[node]-val);
-    for(int child:adj[node]){
-        f(child,adj,wt,val+wt[node]-val);
-    }
-    return;
-}
+ok, so i have tried the bucket method too, still the performacne didnt improve much, below is the summary output given in temrinal:
 
-int main(){
-    int n;
-    cin>>n;
-    vector<int>wt(n);
-    for(int i=0;i<n;i++){
-        cin>>wt[i];
-        cin>>parent[i];
-        if(parent[i]==-1) root=i;
-        else{
-            adj[parent[i]].push_back(i);
-        }
-    }
+=================================================================
+FINAL SUMMARY
+=================================================================
+  3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb  MAE=  1.50 hrs  matched=1/37
+  401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767  MAE=  8.50 hrs  matched=2/16
+  42f0e81125403519ed71e035d0c54a22fceea95362363151936ee87628c7a08e  MAE=  7.72 hrs  matched=9/40
+  6629d47f285139f95d148293c9b8f7115840bf21970299ddf50db544d09f724d  MAE=       N/A  matched=0/21
+  941a15e6d02a161f780d24d99b5c96ac7b73ed02652b95818e73473ba8d8fb66  MAE= 12.70 hrs  matched=5/9
+  ea1f79f3b9f2510c229de2d4ee98441c7fcf39bf384b32a2212535325fb5ac69  MAE=       N/A  matched=0/39
+  ec92f70a957b2292031f4342096c17736c6d1b92a0371095875c51296e708d43  MAE=       N/A  matched=0/41
+  f44d16fb80f7e7c786028b14e831619bdc3e362c36f60f1a5f124fbace89616a  MAE=  7.33 hrs  matched=6/19
+  OVERALL_MEAN                         MAE=  7.55 hrs  matched=23/222
 
-    f(root,adj,wt,0);
-}
+can u also tell why sometimes while running a particular user-device data file i get actual=15.0 , pred=None, err-nan, i mean how can pred=None sometimes? and also tell in short what does matched = 23/222 mean.
+
+explain above 2 things in short first, then afterwards think what next approach we have to try to improve the MAE, I want to make MAE<=4hrs finally in any way.
