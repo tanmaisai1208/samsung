@@ -1,18 +1,363 @@
-ok, so i have tried the bucket method too, still the performacne didnt improve much, below is the summary output given in temrinal:
+"""
+Battery Management - Charging Schedule Prediction (Two-Stage Classifier)
+======================================================================================
+Reuses the same daily rolling-window data (Approach 2 wide CSVs, no clipping,
+NaN-preserving). This is the THIRD modeling attempt for this task:
 
-=================================================================
-FINAL SUMMARY
-=================================================================
-  3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb  MAE=  1.50 hrs  matched=1/37
-  401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767  MAE=  8.50 hrs  matched=2/16
-  42f0e81125403519ed71e035d0c54a22fceea95362363151936ee87628c7a08e  MAE=  7.72 hrs  matched=9/40
-  6629d47f285139f95d148293c9b8f7115840bf21970299ddf50db544d09f724d  MAE=       N/A  matched=0/21
-  941a15e6d02a161f780d24d99b5c96ac7b73ed02652b95818e73473ba8d8fb66  MAE= 12.70 hrs  matched=5/9
-  ea1f79f3b9f2510c229de2d4ee98441c7fcf39bf384b32a2212535325fb5ac69  MAE=       N/A  matched=0/39
-  ec92f70a957b2292031f4342096c17736c6d1b92a0371095875c51296e708d43  MAE=       N/A  matched=0/41
-  f44d16fb80f7e7c786028b14e831619bdc3e362c36f60f1a5f124fbace89616a  MAE=  7.33 hrs  matched=6/19
-  OVERALL_MEAN                         MAE=  7.55 hrs  matched=23/222
+  v1 (regression + threshold): regress all 24 dSocdt values, threshold+peak-find
+     the prediction. Result: MAE ~7.8 hrs, plateaued.
+  v2 (single 25/7-class classifier): classify hour bucket directly, incl. a
+     "no event" class. Result: MAE ~7.55 hrs, matched pairs stuck at 23/222
+     regardless of 25-class vs 7-class bucketing - the bottleneck was never
+     hour granularity, it's that the model defaults to "no event" almost
+     every day (majority-class collapse).
+  v3 (THIS FILE, two-stage):
+     Stage 1 - binary classifier: "does a charging event happen today at all?"
+               trained on ALL days, with class weighting to counter the
+               no-event/event imbalance directly (instead of it silently
+               dominating a single multi-way softmax).
+     Stage 2 - bucket classifier: "which 4h bucket is the event in?"
+               trained ONLY on days that actually had an event, so every
+               training sample is informative for timing (no wasted
+               capacity re-learning "no event" inside this stage).
+     Inference: Stage 1 decides event/no-event first; only if "event" do we
+     call Stage 2 for the bucket -> hour.
 
-can u also tell why sometimes while running a particular user-device data file i get actual=15.0 , pred=None, err-nan, i mean how can pred=None sometimes? and also tell in short what does matched = 23/222 mean.
+Outputs (results/xgboost/charging_schedule/) - same filenames/columns as
+prior versions, so generate_report.py needs no changes:
+  charging_schedule_predictions_<device>.csv
+  charging_schedule_summary.csv
+  charging_schedule_mae_plot.png
+  charging_schedule_sample_days_<device>.png
+"""
 
-explain above 2 things in short first, then afterwards think what next approach we have to try to improve the MAE, I want to make MAE<=4hrs finally in any way.
+import os
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import xgboost as xgb
+
+warnings.filterwarnings("ignore")
+
+# --- Bucketing (Stage 2 label space) ------------------------------------
+BUCKET_SIZE     = 4                      # hours per bucket
+N_HOUR_BUCKETS  = 24 // BUCKET_SIZE      # 6 buckets covering hours 0-23
+
+def hour_to_bucket(hour):
+    return hour // BUCKET_SIZE
+
+def bucket_to_representative_hour(bucket):
+    # center of the bucket, e.g. bucket 0 (hrs 0-3) -> 1.5, used only for
+    # converting a predicted bucket back into an hour figure for the MAE
+    return bucket * BUCKET_SIZE + (BUCKET_SIZE - 1) / 2.0
+
+# --- Stage 1: event / no-event binary classifier -------------------------
+STAGE1_PARAMS = {
+    "max_depth": 2, "eta": 0.1,
+    "subsample": 0.95, "colsample_bytree": 0.8,
+    "seed": 42, "verbosity": 0,
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+}
+STAGE1_ROUNDS = 200
+# Decision threshold on predicted event-probability. Lower than 0.5 biases
+# toward predicting "event" more often - worth tuning empirically once the
+# two-stage split itself is confirmed to help.
+EVENT_THRESHOLD = 0.5
+
+# --- Stage 2: which bucket, given an event happens -----------------------
+STAGE2_PARAMS = {
+    "max_depth": 2, "eta": 0.1,
+    "subsample": 0.95, "colsample_bytree": 0.8,
+    "seed": 42, "verbosity": 0,
+    "objective": "multi:softprob",
+    "eval_metric": "mlogloss",
+    "num_class": N_HOUR_BUCKETS,
+}
+STAGE2_ROUNDS = 200
+
+WIDE_CSV_FOLDER = "results/wide_csv"
+OUTPUT_FOLDER   = "results/xgboost/charging_schedule"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+TRAIN_DAYS = 14
+HOURS      = list(range(24))
+
+# Threshold that DEFINES the ground-truth label (what counts as "the"
+# charging event) - a labeling decision, not a runtime inference knob.
+MIN_HOURLY_RISE_ACTUAL = 0.0095
+
+DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
+SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
+DATE_FEAT_COUNT = 4
+FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT
+
+
+def date_feats(date_str):
+    ts = pd.Timestamp(date_str)
+    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
+
+
+def build_feature_row(wide, train_start, train_end):
+    feats = []
+    for i in range(train_start, train_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return np.array(feats, dtype=float)
+
+
+def build_padded_feature_row(wide, context_start, context_end, pad_days):
+    feats = [0.0] * (pad_days * FEATS_PER_DAY)
+    for i in range(context_start, context_end):
+        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
+        feats.extend(wide.iloc[i][SOC_COLS].tolist())
+        feats.extend(date_feats(wide.index[i]))
+    return feats
+
+
+def find_top_peak_hour(dsocdt_24h, min_hourly_rise):
+    """
+    Scan a 24h dSocdt vector, find all contiguous rising runs, return the
+    representative hour (rise-weighted average, rounded to nearest int hour)
+    of the run with the LARGEST total rise, in the PRECISE 0-23 hour domain.
+    Returns -1 if no rising run exists.
+    """
+    n = len(dsocdt_24h)
+    runs = []
+    i = 0
+    while i < n:
+        v = dsocdt_24h[i]
+        if not np.isnan(v) and v > min_hourly_rise:
+            run_hours, run_vals = [i], [v]
+            j = i + 1
+            while j < n and not np.isnan(dsocdt_24h[j]) and dsocdt_24h[j] > min_hourly_rise:
+                run_hours.append(j); run_vals.append(dsocdt_24h[j]); j += 1
+            total_rise = float(np.sum(run_vals)) * 60
+            weighted_hour = float(np.average(run_hours, weights=run_vals))
+            runs.append((total_rise, weighted_hour))
+            i = j
+        else:
+            i += 1
+    if not runs:
+        return -1
+    best_hour = max(runs, key=lambda x: x[0])[1]
+    return int(round(best_hour))
+
+
+def run_predictions(wide, device_name):
+    n_days, results = len(wide), []
+    total = n_days - TRAIN_DAYS
+    print(f"  Predicting {total} days...")
+
+    for predict_day_idx in range(TRAIN_DAYS, n_days):
+        train_start, train_end = predict_day_idx - TRAIN_DAYS, predict_day_idx
+        predict_date = wide.index[predict_day_idx]
+
+        # Build training rows: precise hour label + derived event flag + bucket
+        X_train, event_train, bucket_train = [], [], []
+        for k in range(1, TRAIN_DAYS):
+            target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
+            if np.any(np.isnan(target)):
+                continue
+            precise_hour = find_top_peak_hour(target, MIN_HOURLY_RISE_ACTUAL)
+            feats = build_padded_feature_row(wide, train_start, train_start + k, TRAIN_DAYS - k)
+            X_train.append(feats)
+            event_train.append(0 if precise_hour == -1 else 1)
+            bucket_train.append(None if precise_hour == -1 else hour_to_bucket(precise_hour))
+        if len(X_train) < 2:
+            continue
+
+        y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
+        if np.all(np.isnan(y_actual)):
+            continue
+        actual_hour = find_top_peak_hour(y_actual, MIN_HOURLY_RISE_ACTUAL)   # precise, -1 if none
+        actual_peak_out = None if actual_hour == -1 else float(actual_hour)
+
+        X_train_arr = np.array(X_train, dtype=float)
+        event_arr = np.array(event_train, dtype=int)
+        X_pred = build_feature_row(wide, train_start, train_end).reshape(1, -1)
+        dpred = xgb.DMatrix(X_pred)
+
+        # ---------------- Stage 1: event / no-event ----------------
+        n_event, n_no_event = int(event_arr.sum()), int((event_arr == 0).sum())
+        if n_event == 0:
+            # every training day was a no-event day -> predict no-event directly
+            predicted_event = False
+        elif n_no_event == 0:
+            # every training day had an event -> predict event directly
+            predicted_event = True
+        else:
+            scale_pos_weight = n_no_event / n_event   # upweight the minority (event) class
+            stage1_params = dict(STAGE1_PARAMS, scale_pos_weight=scale_pos_weight)
+            dtrain1 = xgb.DMatrix(X_train_arr, label=event_arr)
+            booster1 = xgb.train(stage1_params, dtrain1, num_boost_round=STAGE1_ROUNDS)
+            event_prob = float(booster1.predict(dpred)[0])
+            predicted_event = event_prob >= EVENT_THRESHOLD
+
+        # ---------------- Stage 2: which bucket (only if event) ----------------
+        pred_peak = None
+        if predicted_event:
+            event_mask = event_arr == 1
+            X_event = X_train_arr[event_mask]
+            y_event = np.array([b for b in bucket_train if b is not None], dtype=int)
+            if len(X_event) >= 2 and len(set(y_event.tolist())) >= 2:
+                dtrain2 = xgb.DMatrix(X_event, label=y_event)
+                booster2 = xgb.train(STAGE2_PARAMS, dtrain2, num_boost_round=STAGE2_ROUNDS)
+                probs2 = booster2.predict(dpred)[0]
+                pred_bucket = int(np.argmax(probs2))
+                pred_peak = bucket_to_representative_hour(pred_bucket)
+            elif len(X_event) >= 1:
+                # not enough variety to train Stage 2 meaningfully - fall back
+                # to the single bucket seen most often among event days
+                pred_bucket = int(pd.Series(y_event).mode()[0])
+                pred_peak = bucket_to_representative_hour(pred_bucket)
+            # else: predicted_event True but no usable event samples -> leave None
+
+        error = (abs(actual_peak_out - pred_peak)
+                 if (actual_peak_out is not None and pred_peak is not None) else np.nan)
+
+        results.append({
+            "predict_date": predict_date, "y_actual": y_actual,
+            "actual_peak": actual_peak_out, "pred_peak": pred_peak, "error": error,
+        })
+        if (predict_day_idx - TRAIN_DAYS) % 10 == 0 or predict_day_idx == n_days - 1:
+            print(f"  Day {predict_day_idx - TRAIN_DAYS + 1:3d}/{total} | {predict_date} "
+                  f"| actual={actual_peak_out} pred={pred_peak} err={error}")
+    return results
+
+
+def plot_mae_per_device(summary_df, plot_path):
+    dev_data = summary_df[summary_df["device"] != "OVERALL_MEAN"]
+    overall  = summary_df[summary_df["device"] == "OVERALL_MEAN"]
+    short_names = [d[:12] + "…" if len(d) > 12 else d for d in dev_data["device"]]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(dev_data) * 1.2), 6))
+    bars = ax.bar(range(len(dev_data)), dev_data["mae_hours"],
+                  color="steelblue", edgecolor="white", zorder=3)
+    if not overall.empty:
+        ax.axhline(overall["mae_hours"].values[0], color="crimson", linestyle="--",
+                   linewidth=1.8, label=f"Overall mean MAE: {overall['mae_hours'].values[0]:.2f} hrs")
+    for bar, val in zip(bars, dev_data["mae_hours"]):
+        if not pd.isna(val):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                    f"{val:.2f}", ha="center", va="bottom", fontsize=8, fontweight="bold")
+    ax.set_xticks(range(len(dev_data))); ax.set_xticklabels(short_names, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("MAE (hours)", fontsize=11)
+    ax.set_title("Top-1 Charging Peak (Two-Stage) — MAE per Device\n(hour error between actual and predicted peak)",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9); ax.grid(axis="y", linestyle="--", alpha=0.4)
+    fig.tight_layout(); fig.savefig(plot_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"  Saved: {plot_path}")
+
+
+def plot_sample_days(results, device_name, plot_path, n_samples=6):
+    if not results:
+        return
+    sample_idx = list(range(0, min(len(results), 7 * n_samples), 7))[:n_samples]
+    n_cols, n_rows = 3, int(np.ceil(len(sample_idx) / 3))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 5 * n_rows))
+    axes = np.array(axes).reshape(-1)
+    fig.suptitle(f"Charging Schedule (Two-Stage, Top-1 Peak) — {device_name}", fontsize=13, fontweight="bold")
+
+    for panel_i, idx in enumerate(sample_idx):
+        ax, r = axes[panel_i], results[idx]
+        actual = r["y_actual"]
+        valid = ~np.isnan(actual)
+        ax.plot(np.array(HOURS)[valid], actual[valid], color="steelblue", linewidth=1.8,
+                marker="o", markersize=3, label="Actual dSocdt")
+        if r["actual_peak"] is not None:
+            ax.axvline(r["actual_peak"], color="steelblue", linewidth=2, alpha=0.6, label="Actual peak")
+        if r["pred_peak"] is not None:
+            ax.axvline(r["pred_peak"], color="crimson", linestyle="--", linewidth=2, alpha=0.6, label="Predicted peak")
+        err_str = f"{r['error']:.2f}hrs" if not pd.isna(r["error"]) else "N/A"
+        ax.set_title(f"{r['predict_date']} | err={err_str}", fontsize=9)
+        ax.set_xlabel("Hour of day", fontsize=8); ax.set_ylabel("dSocdt", fontsize=8)
+        ax.set_xticks(range(0, 24, 4)); ax.legend(fontsize=7, loc="upper right")
+        ax.grid(linestyle="--", alpha=0.3)
+    for empty_i in range(len(sample_idx), len(axes)):
+        axes[empty_i].axis("off")
+    fig.tight_layout(); fig.savefig(plot_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"  Saved: {plot_path}")
+
+
+if __name__ == "__main__":
+    print("=" * 65)
+    print("CHARGING SCHEDULE PREDICTION — TWO-STAGE (EVENT + BUCKET)")
+    print("=" * 65)
+    print(f"  Label-defining min hourly rise (actual) : {MIN_HOURLY_RISE_ACTUAL}")
+    print(f"  Stage 1                                  : event / no-event (weighted)")
+    print(f"  Stage 2                                  : {N_HOUR_BUCKETS} buckets of {BUCKET_SIZE}h (event days only)")
+    print(f"  Event probability threshold              : {EVENT_THRESHOLD}")
+    print("=" * 65 + "\n")
+
+    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
+    if not wide_files:
+        raise FileNotFoundError(f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'.")
+
+    all_summary_rows = []
+
+    for wf in wide_files:
+        device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
+        pred_path = os.path.join(OUTPUT_FOLDER, f"charging_schedule_predictions_{device_name}.csv")
+        plot_path = os.path.join(OUTPUT_FOLDER, f"charging_schedule_sample_days_{device_name}.png")
+
+        print("=" * 65); print(f"Device : {device_name}"); print("=" * 65)
+        try:
+            wide = pd.read_csv(wf, index_col="Date")
+            if len(wide) <= TRAIN_DAYS:
+                print("  Skipping: not enough days.\n"); continue
+
+            results = run_predictions(wide, device_name)
+            if not results:
+                print("  No valid prediction days.\n"); continue
+
+            pd.DataFrame([{
+                "predict_date": r["predict_date"], "actual_peak_hr": r["actual_peak"],
+                "pred_peak_hr": r["pred_peak"], "error_hrs": r["error"],
+            } for r in results]).to_csv(pred_path, index=False)
+            print(f"\n  Predictions CSV  →  {pred_path}")
+
+            plot_sample_days(results, device_name, plot_path)
+
+            errors = [r["error"] for r in results if not pd.isna(r["error"])]
+            device_mae = float(np.mean(errors)) if errors else np.nan
+            print(f"\n  MAE (hours)          : {device_mae:.3f}" if not np.isnan(device_mae) else "\n  MAE: N/A")
+            print(f"  Matched day pairs    : {len(errors)} / {len(results)}")
+
+            all_summary_rows.append({
+                "device": device_name, "total_days": len(results),
+                "matched_pairs": len(errors),
+                "mae_hours": round(device_mae, 4) if not np.isnan(device_mae) else np.nan,
+            })
+        except Exception as e:
+            import traceback
+            print(f"  ERROR: {e}"); traceback.print_exc()
+        print()
+
+    summary_df = pd.DataFrame(all_summary_rows)
+    if not summary_df.empty:
+        overall_mae = round(float(np.nanmean(summary_df["mae_hours"])), 4)
+        summary_df = pd.concat([summary_df, pd.DataFrame([{
+            "device": "OVERALL_MEAN", "total_days": summary_df["total_days"].sum(),
+            "matched_pairs": summary_df["matched_pairs"].sum(), "mae_hours": overall_mae,
+        }])], ignore_index=True)
+
+    summary_csv_path = os.path.join(OUTPUT_FOLDER, "charging_schedule_summary.csv")
+    summary_df.to_csv(summary_csv_path, index=False)
+    print(f"\nGlobal summary  →  {summary_csv_path}")
+
+    if not summary_df.empty:
+        plot_mae_per_device(summary_df, os.path.join(OUTPUT_FOLDER, "charging_schedule_mae_plot.png"))
+
+    print("\n" + "=" * 65)
+    print("FINAL SUMMARY")
+    print("=" * 65)
+    for _, row in summary_df.iterrows():
+        mae_str = f"{row['mae_hours']:.2f} hrs" if not pd.isna(row['mae_hours']) else "N/A"
+        print(f"  {row['device']:<35}  MAE={mae_str:>10}  matched={int(row['matched_pairs'])}/{int(row['total_days'])}")
+    print("=" * 65)
