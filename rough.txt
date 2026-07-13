@@ -1,12 +1,22 @@
-=================================================================
-FINAL SUMMARY
-=================================================================
-  3370f23cd7055a73bca859557669d8269438d7e42469389e5f315f4d225397eb  MAE=  6.00 hrs  matched=2/17
-  401f02de69f658de9e87b74fd3155aa7295cc8a2fcb67d43988d051cb0c48767  MAE=       N/A  matched=0/17
-  42f0e81125403519ed71e035d0c54a22fceea95362363151936ee87628c7a08e  MAE=  5.00 hrs  matched=4/17
-  6629d47f285139f95d148293c9b8f7115840bf21970299ddf50db544d09f724d  MAE=       N/A  matched=0/16
-  941a15e6d02a161f780d24d99b5c96ac7b73ed02652b95818e73473ba8d8fb66  MAE=  3.50 hrs  matched=2/16
-  ea1f79f3b9f2510c229de2d4ee98441c7fcf39bf384b32a2212535325fb5ac69  MAE=       N/A  matched=0/16
-  ec92f70a957b2292031f4342096c17736c6d1b92a0371095875c51296e708d43  MAE=       N/A  matched=0/17
-  f44d16fb80f7e7c786028b14e831619bdc3e362c36f60f1a5f124fbace89616a  MAE=  2.10 hrs  matched=5/17
-  OVERALL_MEAN                         MAE=  4.15 hrs  matched=13/133
+[
+day_of_week,
+day,
+month,
+year,
+
+days_since_last_charge,
+
+last_charge_hour,
+
+rolling_mean_3,
+
+rolling_mean_7,
+
+rolling_std_7,
+
+mean_charge_hour,
+
+yesterday_min_soc,
+
+yesterday_end_soc
+]
