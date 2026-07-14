@@ -61,6 +61,7 @@ PATHS_2 = {
     "val_curves"        : os.path.join(R2, "xgboost", "hypersearch", "validation_curves"),
     "tree_rules"        : os.path.join(R2, "xgboost", "tree_rules"),
     "all_users_summary" : os.path.join(R2, "all_users_summary.csv"),
+    "charging_schedule" : os.path.join(R2, "xgboost", "charging_schedule"),
 }
 
 PAGE_W, PAGE_H = A4
@@ -301,7 +302,8 @@ def toc():
         ("16", "Revised Feature Importance Analysis"),
         ("17", "Revised Tree Rule Extraction & Interpretation"),
         ("18", "Comparison: Approach 1 vs Approach 2"),
-        ("19", "Next Steps"),
+        ("19", "Charging Schedule Prediction (Pooled Model, Walk-Forward Retrain)"),
+        ("20", "Next Steps"),
     ]
     for num, title in sections:
         if num in ("PART A", "PART B"):
@@ -997,9 +999,104 @@ def s18_comparison():
     elems.append(PageBreak())
     return elems
 
-def s19_next_steps():
+def s19_charging_schedule():
     elems = []
-    elems += section_header("19.  Next Steps", "h1")
+    elems += section_header(
+        "19.  Charging Schedule Prediction (Pooled Model, Walk-Forward Retrain)", "h1")
+    elems.append(body(
+        "Beyond predicting the full 24-hour dSocdt curve, a downstream task was "
+        "built on top of the Approach 2 model: predicting the single hour of the "
+        "day when the device's main charging event occurs, so that charging-time "
+        "recommendations can be generated. This is implemented in "
+        "<b>xgboost_charging_schedule.py</b>."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Ground-truth labeling.</b> For each day, the actual charging hour is "
+        "found by scanning the day's dSocdt vector for contiguous rising runs "
+        "above a minimum-rise noise floor (dSocdt &gt; 0.0095), and taking the "
+        "rise-weighted hour of whichever run has the largest total rise. A day "
+        "with no such run is labeled a no-event day."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Two-stage classifier.</b> Rather than regressing all 24 hourly "
+        "dSocdt values and thresholding the prediction to find a peak — which "
+        "plateaued around 7.5–9.5 hrs MAE across several earlier attempts — the "
+        "task is split into two XGBoost classifiers: <b>Stage 1</b> predicts "
+        "whether a charging event happens at all that day (binary), and "
+        "<b>Stage 2</b>, trained only on days Stage 1 identifies as event days, "
+        "predicts which 4-hour bucket (6 buckets covering the 24-hour day) the "
+        "event falls into. The predicted bucket's center hour is used as the "
+        "final predicted charging hour."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Pooled per-device features.</b> Each day is represented by 12 "
+        "compact, causally-computed features rather than a raw multi-day block: "
+        "calendar (day-of-week, day, month, year), recency (days since the last "
+        "charging event, and that event's hour), rolling dSocdt behaviour "
+        "(3-day and 7-day rolling mean/std of the day's strongest hourly rise), "
+        "habit (mean hour of the last 10 charging events seen), and battery "
+        "state (yesterday's minimum and end-of-day SoC)."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Walk-forward rolling retrain.</b> Rather than a single train/test "
+        "split, the model is retrained every 7 days on a fixed-size rolling "
+        "window of the most recent 50 days of history, then used to predict the "
+        "next 7 days, then retrained again on the next 50-day window — "
+        "simulating how the model would behave in an actual deployment, where "
+        "the timeline keeps moving forward and the training window ages out "
+        "old days as new ones arrive, rather than assuming a fixed, known total "
+        "day count."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Calibrated event threshold.</b> Instead of a fixed 0.5 cutoff on "
+        "Stage 1's predicted event-probability, the decision threshold is "
+        "calibrated separately for each rolling window by sweeping candidate "
+        "thresholds against that window's own training labels (no test data "
+        "involved) and selecting whichever maximizes F1 for the event class. "
+        "This corrects for devices with a naturally low or high event rate, "
+        "which under a fixed threshold defaulted to always predicting no-event."
+    ))
+    elems.append(sp(0.3))
+
+    summary_csv = os.path.join(PATHS_2["charging_schedule"], "charging_schedule_summary.csv")
+    if os.path.exists(summary_csv):
+        sdf = pd.read_csv(summary_csv)
+        rows = [[str(r["device"])[:28], str(r["total_days"]), str(r["matched_pairs"]),
+                 f"{r['mae_hours']:.2f} hrs" if pd.notna(r["mae_hours"]) else "N/A"]
+                for _, r in sdf.iterrows()]
+        elems.append(results_table(
+            ["Device", "Predicted Days", "Matched Pairs", "MAE (hours)"], rows))
+        elems.append(sp(0.3))
+
+    mae_plot = os.path.join(PATHS_2["charging_schedule"], "charging_schedule_mae_plot.png")
+    elems += insert_image(mae_plot, width_cm=14,
+        caption_text="Figure: MAE per device — charging schedule prediction (walk-forward, pooled model)")
+
+    sample_plots = glob_all(os.path.join(PATHS_2["charging_schedule"], "charging_schedule_sample_days_*.png"))
+    if sample_plots:
+        elems += insert_image(sample_plots[0], width_cm=15,
+            caption_text="Figure: Sample device — actual dSocdt vs actual/predicted charging peak, held-out days")
+
+    elems.append(body(
+        "<b>Result:</b> The pooled walk-forward approach reduced overall MAE to "
+        "approximately 3.9 hours, a substantial improvement over the ~7.5–9.5 "
+        "hr range seen with per-day-retrained models trained on only the "
+        "preceding 13–14 days. Some devices with very few total days of history "
+        "still show no matched day-pairs, reflecting genuine data scarcity for "
+        "those devices rather than a model or threshold issue."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+def s20_next_steps():
+    elems = []
+    elems += section_header("20.  Next Steps", "h1")
     for item in [
         " ",
     ]:
@@ -1050,7 +1147,8 @@ def build_pdf():
     story += s16_feature_importance_v2()
     story += s17_tree_rules_v2()
     story += s18_comparison()
-    story += s19_next_steps()
+    story += s19_charging_schedule()
+    story += s20_next_steps()
 
     doc.build(story)
     print(f"\nReport generated:  {OUTPUT_PDF}")
