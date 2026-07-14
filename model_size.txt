@@ -1,966 +1,1061 @@
 """
-Battery Management - Final Combined Validation with Best Hyperparameters
-======================================================================================
-Runs the daily rolling-window XGBoost model using the best hyperparameter
-values found from sequential tuning in battery_hypersearch.py:
+generate_report.py
+==================
+Run from inside your project folder to generate the full PDF progress report,
+covering BOTH the original (Approach 1 / "main" branch) and the revised
+(Approach 2 / "test" branch) methodology.
 
-  n_estimators  = 25   (tuned in step 1)
-  max_depth     = 2     (tuned in step 2)
-  learning_rate = 0.05  (tuned in step 3)
-  subsample     = 0.95   (tuned in step 4)
-  colsample_bytree = 0.8 (fixed throughout)
+Folder convention (as used by the project's git branches):
+    results_old/   <- results copied from the "main" branch  (Approach 1)
+    results/   <- results already in the "test" branch    (Approach 2)
 
-Threshold sweep : ACC_THRESHOLD varied 1→10.
-Cosine similarity: computed per day between actual and predicted dSocdt vectors,
-                   then averaged per device and across all devices.
+    cd path/to/project-folder
+    python generate_report.py
 
-NEW — Charging vs Discharging Discrimination Analysis:
-  Task A: Does the model's predicted dSocdt distribution for hours that were
-          ACTUALLY charging (ground truth dSocdt == 0) look statistically
-          different from hours that were actually mild discharge (small
-          negative dSocdt)? This checks whether the model has learned to
-          tell "no usage / charging" apart from "light usage", rather than
-          just predicting values close to zero everywhere.
-  Task B: Treat "predicted dSocdt close to zero" as the model's signal for
-          "charging is happening this hour", and compare against the actual
-          ground-truth charging hours (dSocdt == 0 in wide_csv) using
-          precision / recall / F1 — i.e. how good is the model at predicting
-          WHEN charging will happen tomorrow, not just how much discharge.
-
-Outputs (all inside results/final_validation/):
-  final_predictions_<device>.csv          — per-hour actual vs predicted + cosine sim
-  final_summary_all_thresholds.csv        — all thresholds × devices combined
-  final_summary_threshold_<T>.csv         — per-device metrics at threshold T
-  cosine_similarity_summary.csv           — per-device mean cosine sim + overall mean
-  final_validation_plot_<device>.png      — 6-panel grid: actual vs predicted dSocdt
-                                             for days sampled every 7 days (covers first
-                                             ~48 days). Each panel = one day, clean
-                                             side-by-side comparison.
-  cosine_similarity_plot.png              — per-device + overall mean cosine sim bar chart
-  threshold_accuracy_curve.png            — overall mean accuracy vs threshold value
-  charging_discrimination_summary.csv     — per-device separability stats (Task A)
-  charging_discrimination_plot.png        — distribution plot: predicted values for
-                                             actual-charging vs actual-mild-discharge hours
-  charging_event_detection_summary.csv    — per-device precision/recall/F1 (Task B)
-  charging_event_detection_plot.png       — confusion-matrix-style bar chart + per-device F1
-  charging_zero_threshold_sweep.csv       — F1 at different "near-zero" thresholds
-  charging_zero_threshold_sweep_plot.png  — F1 vs zero-threshold curve (helps pick best epsilon)
+Requirements:  pip install reportlab
 """
 
 import os
 import glob
-import warnings
-import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from xgboost import XGBRegressor
-from sklearn.metrics import (mean_absolute_error, mean_squared_error,
-                             precision_score, recall_score, f1_score,
-                             confusion_matrix)
-from sklearn.multioutput import MultiOutputRegressor
-
-warnings.filterwarnings("ignore")
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, PageBreak,
+    Table, TableStyle, HRFlowable, Image
+)
 
 # ─────────────────────────────────────────────────────────────
-# BEST HYPERPARAMETERS
+# PATHS — two parallel result sets
 # ─────────────────────────────────────────────────────────────
-BEST_PARAMS = {
-    "n_estimators"   : 25,
-    "max_depth"      : 2,
-    "learning_rate"  : 0.05,
-    "subsample"      : 0.95,
-    "colsample_bytree": 0.8,
-    "random_state"   : 42,
-    "verbosity"      : 0,
+ROOT       = "."
+R1         = os.path.join(ROOT, "results_old")   # Approach 1 (main branch)
+R2         = os.path.join(ROOT, "results")   # Approach 2 (test branch)
+OUTPUT_PDF = os.path.join(ROOT, "project_report.pdf")
+
+PATHS_1 = {
+    "ac_hc_plots"       : os.path.join(R1, "ac_hc_plots"),
+    "feature_importance": os.path.join(R1, "xgboost", "feature_importance"),
+    "final_validation"  : os.path.join(R1, "xgboost", "final_validation"),
+    "hypersearch"       : os.path.join(R1, "xgboost", "hypersearch"),
+    "val_curves"        : os.path.join(R1, "xgboost", "hypersearch", "validation_curves"),
+    "tree_rules"        : os.path.join(R1, "xgboost", "tree_rules"),
+    "all_users_summary" : os.path.join(R1, "all_users_summary.csv"),
+    "model_size"        : os.path.join(R1, "xgboost", "model_size_vs_samples.png"),
+    "inference_time"    : os.path.join(R1, "xgboost", "inference_time_vs_samples.png"),
+    # Task A/B plots not yet copied into this results folder — placeholder paths.
+    # Replace these once you add the charging-diagnostic PNGs to results_1/xgboost/final_validation/
+    "charging_discrimination": os.path.join(R1, "xgboost", "final_validation", "charging_discrimination_plot.png"),
+    "charging_detection"      : os.path.join(R1, "xgboost", "final_validation", "charging_event_detection_plot.png"),
+    "charging_eps_sweep"      : os.path.join(R1, "xgboost", "final_validation", "charging_zero_threshold_sweep_plot.png"),
 }
 
-# ─────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────
-WIDE_CSV_FOLDER = "results/wide_csv"
-OUTPUT_FOLDER   = "results/xgboost/final_validation"
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+PATHS_2 = {
+    "ac_hc_plots"       : os.path.join(R2, "ac_hc_plots"),
+    "feature_importance": os.path.join(R2, "xgboost", "feature_importance"),
+    "final_validation"  : os.path.join(R2, "xgboost", "final_validation"),
+    "hypersearch"       : os.path.join(R2, "xgboost", "hypersearch"),
+    "val_curves"        : os.path.join(R2, "xgboost", "hypersearch", "validation_curves"),
+    "tree_rules"        : os.path.join(R2, "xgboost", "tree_rules"),
+    "all_users_summary" : os.path.join(R2, "all_users_summary.csv"),
+}
 
-TRAIN_DAYS     = 14
-THRESHOLDS     = list(range(1, 11))   # 1, 2, 3, ... 10
-DEFAULT_PLOT_T = 2                    # threshold used for per-device plots
-HOURS          = list(range(24))
-
-# ── Charging-detection specific settings ────────────────────
-# "Actual charging" ground truth = dSocdt exactly 0 in wide_csv (already
-# clipped from +ve to 0 upstream, so 0 also includes true charging hours).
-# "Actual mild discharge" = small negative values, used for Task A comparison.
-MILD_DISCHARGE_UPPER = 0.0    # exclusive upper bound (must be < 0)
-MILD_DISCHARGE_LOWER = -1.0   # inclusive lower bound — "small" discharge band
-
-# Task B: a prediction is treated as "predicts charging" if it falls within
-# ZERO_EPSILON of 0. This is the main epsilon used for the headline metric.
-ZERO_EPSILON = 0.5
-
-# Range of epsilon values swept to show how detection quality changes
-# with the definition of "close enough to zero"
-ZERO_EPSILON_SWEEP = [0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0]
-
-# ─────────────────────────────────────────────────────────────
-# COLUMN DEFINITIONS
-# ─────────────────────────────────────────────────────────────
-DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
-SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
-DATE_FEAT_COUNT = 4
-FEATS_PER_DAY   = len(DSOCDT_COLS) + len(SOC_COLS) + DATE_FEAT_COUNT  # 52
+PAGE_W, PAGE_H = A4
+MARGIN = 2.2 * cm
 
 
 # ─────────────────────────────────────────────────────────────
-# FEATURE HELPERS
+# STYLES
 # ─────────────────────────────────────────────────────────────
+base_styles = getSampleStyleSheet()
 
-def date_feats(date_str):
-    ts = pd.Timestamp(date_str)
-    return [float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)]
+def make_styles():
+    s = {}
+    s["title"] = ParagraphStyle(
+        "ReportTitle", parent=base_styles["Title"],
+        fontSize=22, textColor=colors.HexColor("#1a2e4a"),
+        spaceAfter=6, alignment=TA_CENTER, fontName="Helvetica-Bold")
+    s["subtitle"] = ParagraphStyle(
+        "Subtitle", parent=base_styles["Normal"],
+        fontSize=12, textColor=colors.HexColor("#4a6fa5"),
+        spaceAfter=4, alignment=TA_CENTER, fontName="Helvetica")
+    s["h1"] = ParagraphStyle(
+        "H1", parent=base_styles["Heading1"],
+        fontSize=15, textColor=colors.HexColor("#1a2e4a"),
+        spaceBefore=18, spaceAfter=6, fontName="Helvetica-Bold", leading=18)
+    s["h2"] = ParagraphStyle(
+        "H2", parent=base_styles["Heading2"],
+        fontSize=12, textColor=colors.HexColor("#2c5282"),
+        spaceBefore=12, spaceAfter=4, fontName="Helvetica-Bold")
+    s["body"] = ParagraphStyle(
+        "Body", parent=base_styles["Normal"],
+        fontSize=10, leading=15, spaceAfter=6,
+        alignment=TA_JUSTIFY, fontName="Helvetica")
+    s["bullet"] = ParagraphStyle(
+        "Bullet", parent=base_styles["Normal"],
+        fontSize=10, leading=14, spaceAfter=3,
+        leftIndent=16, firstLineIndent=-10, fontName="Helvetica")
+    s["caption"] = ParagraphStyle(
+        "Caption", parent=base_styles["Normal"],
+        fontSize=8.5, textColor=colors.HexColor("#718096"),
+        alignment=TA_CENTER, spaceAfter=8, fontName="Helvetica-Oblique")
+    s["toc"] = ParagraphStyle(
+        "TOC", parent=base_styles["Normal"],
+        fontSize=10.5, leading=18, fontName="Helvetica",
+        textColor=colors.HexColor("#2d3748"))
+    s["warnbox"] = ParagraphStyle(
+        "WarnBox", parent=base_styles["Normal"],
+        fontSize=10, leading=15, spaceAfter=6,
+        alignment=TA_JUSTIFY, fontName="Helvetica",
+        textColor=colors.HexColor("#7a1f1f"),
+        backColor=colors.HexColor("#fff5f5"),
+        borderColor=colors.HexColor("#feb2b2"), borderWidth=0.6,
+        borderPadding=8)
+    s["notebox"] = ParagraphStyle(
+        "NoteBox", parent=base_styles["Normal"],
+        fontSize=9.5, leading=13, spaceAfter=6,
+        alignment=TA_JUSTIFY, fontName="Helvetica-Oblique",
+        textColor=colors.HexColor("#744210"),
+        backColor=colors.HexColor("#fffbea"),
+        borderColor=colors.HexColor("#f6e05e"), borderWidth=0.6,
+        borderPadding=8)
+    return s
 
-
-def build_feature_row(wide, train_start, train_end):
-    feats = []
-    for i in range(train_start, train_end):
-        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
-        feats.extend(wide.iloc[i][SOC_COLS].tolist())
-        feats.extend(date_feats(wide.index[i]))
-    return np.array(feats, dtype=float)
-
-
-def build_padded_feature_row(wide, context_start, context_end, pad_days):
-    feats = [0.0] * (pad_days * FEATS_PER_DAY)
-    for i in range(context_start, context_end):
-        feats.extend(wide.iloc[i][DSOCDT_COLS].tolist())
-        feats.extend(wide.iloc[i][SOC_COLS].tolist())
-        feats.extend(date_feats(wide.index[i]))
-    return feats
-
-
-def accuracy_at_threshold(actual, predicted, threshold):
-    return float(np.mean(np.abs(actual - predicted) <= threshold)) * 100.0
-
-
-def cosine_similarity(actual, predicted):
-    """
-    Cosine similarity between actual and predicted 24-hour dSocdt vectors.
-    Range: -1 (opposite) to +1 (identical direction).
-    Returns 0.0 if either vector is all-zeros (no discharge activity).
-    """
-    norm_a = np.linalg.norm(actual)
-    norm_p = np.linalg.norm(predicted)
-    if norm_a == 0.0 or norm_p == 0.0:
-        return 0.0
-    return float(np.dot(actual, predicted) / (norm_a * norm_p))
-
-
-# ─────────────────────────────────────────────────────────────
-# DAILY ROLLING PREDICTION  (runs once per device)
-# ─────────────────────────────────────────────────────────────
-
-def run_predictions(wide, device_name):
-    """
-    Returns list of per-day dicts with raw y_actual, y_pred, MAE, RMSE,
-    and cosine similarity. Accuracy is computed later per threshold.
-    """
-    n_days  = len(wide)
-    results = []
-
-    model = MultiOutputRegressor(
-        XGBRegressor(**BEST_PARAMS),
-        n_jobs=-1
-    )
-
-    total = n_days - TRAIN_DAYS
-    print(f"  Predicting {total} days...")
-
-    for predict_day_idx in range(TRAIN_DAYS, n_days):
-        train_start  = predict_day_idx - TRAIN_DAYS
-        train_end    = predict_day_idx
-        predict_date = wide.index[predict_day_idx]
-
-        X_train, y_train = [], []
-        for k in range(1, TRAIN_DAYS):
-            pad_days = TRAIN_DAYS - k
-            feats  = build_padded_feature_row(wide, train_start,
-                                               train_start + k, pad_days)
-            target = wide.iloc[train_start + k][DSOCDT_COLS].values.astype(float)
-            X_train.append(feats)
-            y_train.append(target)
-
-        X_train = np.array(X_train, dtype=float)
-        y_train = np.array(y_train, dtype=float)
-        model.fit(X_train, y_train)
-
-        X_pred   = build_feature_row(wide, train_start, train_end).reshape(1, -1)
-        y_pred   = model.predict(X_pred)[0]
-        y_pred   = np.clip(y_pred, a_min=None, a_max=0.0)
-        y_actual = wide.iloc[predict_day_idx][DSOCDT_COLS].values.astype(float)
-
-        cos_sim = cosine_similarity(y_actual, y_pred)
-        mae     = round(mean_absolute_error(y_actual, y_pred), 6)
-        rmse    = round(np.sqrt(mean_squared_error(y_actual, y_pred)), 6)
-
-        results.append({
-            "predict_date"   : predict_date,
-            "train_start"    : wide.index[train_start],
-            "train_end"      : wide.index[train_end - 1],
-            "y_actual"       : y_actual,
-            "y_pred"         : y_pred,
-            "mae"            : mae,
-            "rmse"           : rmse,
-            "cosine_sim"     : round(cos_sim, 6),
-        })
-
-        if (predict_day_idx - TRAIN_DAYS) % 10 == 0 or predict_day_idx == n_days - 1:
-            print(f"  Day {predict_day_idx - TRAIN_DAYS + 1:3d}/{total} "
-                  f"| {predict_date} | MAE: {mae:.5f} | CosSim: {cos_sim:.4f}")
-
-    return results
+S = make_styles()
 
 
 # ─────────────────────────────────────────────────────────────
-# METRICS
+# HELPERS
 # ─────────────────────────────────────────────────────────────
 
-def metrics_at_threshold(results, threshold):
-    daily_accs = [
-        accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
-        for r in results
-    ]
-    return {
-        "mean_accuracy_%": round(float(np.mean(daily_accs)), 4),
-        "mean_mae"        : round(float(np.mean([r["mae"]  for r in results])), 6),
-        "mean_rmse"       : round(float(np.mean([r["rmse"] for r in results])), 6),
-    }
+def hr(color="#cbd5e0", thickness=0.5):
+    return HRFlowable(width="100%", thickness=thickness,
+                      color=colors.HexColor(color), spaceAfter=6, spaceBefore=2)
 
+def section_header(text, level="h1"):
+    return [hr("#2c5282" if level == "h1" else "#a0aec0",
+               thickness=1.5 if level == "h1" else 0.5),
+            Paragraph(text, S[level]),
+            Spacer(1, 0.2 * cm)]
 
-# ─────────────────────────────────────────────────────────────
-# NEW — TASK A: ZERO vs SMALL-NEGATIVE DISCRIMINATION
-# ─────────────────────────────────────────────────────────────
+def body(text):
+    return Paragraph(text, S["body"])
 
-def charging_discrimination_stats(results):
-    """
-    For all (day, hour) pairs across the device's predictions, split into
-    two groups based on the ACTUAL ground-truth value:
-      Group 1 ("actual charging")     : y_actual == 0
-      Group 2 ("actual mild discharge"): MILD_DISCHARGE_LOWER <= y_actual < 0
+def warnbox(text):
+    return Paragraph(text, S["warnbox"])
 
-    Then look at what the MODEL PREDICTED for each group. If the model has
-    genuinely learned to distinguish charging from light usage, the predicted
-    values for Group 1 should be statistically higher (closer to 0) than
-    predicted values for Group 2.
+def notebox(text):
+    return Paragraph(text, S["notebox"])
 
-    Returns a dict of summary statistics plus the raw arrays for plotting.
-    """
-    all_actual = np.concatenate([r["y_actual"] for r in results])
-    all_pred   = np.concatenate([r["y_pred"]   for r in results])
+def bullet(text, symbol="•"):
+    return Paragraph(f"{symbol}  {text}", S["bullet"])
 
-    charging_mask = (all_actual == 0.0)
-    mild_mask     = (all_actual < 0.0) & (all_actual >= MILD_DISCHARGE_LOWER) \
-                     & (all_actual < MILD_DISCHARGE_UPPER)
+def caption(text):
+    return Paragraph(text, S["caption"])
 
-    pred_when_charging = all_pred[charging_mask]
-    pred_when_mild      = all_pred[mild_mask]
+def sp(h=0.3):
+    return Spacer(1, h * cm)
 
-    n_charging = int(charging_mask.sum())
-    n_mild      = int(mild_mask.sum())
-
-    if n_charging == 0 or n_mild == 0:
-        return {
-            "n_actual_charging_hours"     : n_charging,
-            "n_actual_mild_discharge_hours": n_mild,
-            "mean_pred_when_charging"     : np.nan,
-            "mean_pred_when_mild"         : np.nan,
-            "separation_gap"              : np.nan,
-            "pred_when_charging"          : pred_when_charging,
-            "pred_when_mild"              : pred_when_mild,
-        }
-
-    mean_charging = float(np.mean(pred_when_charging))
-    mean_mild      = float(np.mean(pred_when_mild))
-    # Signed gap: positive means model correctly predicts higher (closer to 0)
-    # values for actual-charging hours than for actual-mild-discharge hours.
-    # Negative means the model predicts MORE negative values for charging hours
-    # than for mild-discharge hours — i.e. it has learned an INVERTED signal,
-    # likely because heavy discharge momentum from the previous day often
-    # precedes a charging event (low battery -> user plugs in), so the model
-    # associates "strong recent discharge" with both "more discharge tomorrow"
-    # AND coincidentally with hours that turn out to be charging.
-    gap = mean_charging - mean_mild
-    abs_gap = abs(gap)
-
-    return {
-        "n_actual_charging_hours"      : n_charging,
-        "n_actual_mild_discharge_hours": n_mild,
-        "mean_pred_when_charging"      : round(mean_charging, 6),
-        "std_pred_when_charging"       : round(float(np.std(pred_when_charging)), 6),
-        "mean_pred_when_mild"          : round(mean_mild, 6),
-        "std_pred_when_mild"           : round(float(np.std(pred_when_mild)), 6),
-        "separation_gap"               : round(gap, 6),
-        "abs_separation_gap"           : round(abs_gap, 6),
-        "direction"                    : ("CORRECT (charging closer to 0)" if gap > 0
-                                          else "INVERTED (charging more negative)"),
-        "pred_when_charging"           : pred_when_charging,
-        "pred_when_mild"               : pred_when_mild,
-    }
-
-
-def plot_charging_discrimination(per_device_stats, plot_path):
-    """
-    Box/violin-style comparison: for each device, show the distribution of
-    predicted dSocdt for (a) hours that were actually charging vs
-    (b) hours that were actually mild discharge.
-
-    If boxes are well separated → model distinguishes charging from light use.
-    If boxes overlap heavily → model treats near-zero values as one blur.
-    """
-    devices = list(per_device_stats.keys())
-    n_dev   = len(devices)
-
-    fig, ax = plt.subplots(figsize=(max(12, n_dev * 1.3), 7))
-
-    positions_charging = np.arange(n_dev) * 2.2
-    positions_mild      = positions_charging + 0.9
-
-    box_data_charging, box_data_mild = [], []
-    for dev in devices:
-        s = per_device_stats[dev]
-        bc = s["pred_when_charging"]
-        bm = s["pred_when_mild"]
-        box_data_charging.append(bc if len(bc) > 0 else [np.nan])
-        box_data_mild.append(bm if len(bm) > 0 else [np.nan])
-
-    bp1 = ax.boxplot(box_data_charging, positions=positions_charging, widths=0.7,
-                     patch_artist=True, showfliers=False)
-    bp2 = ax.boxplot(box_data_mild, positions=positions_mild, widths=0.7,
-                     patch_artist=True, showfliers=False)
-
-    for patch in bp1["boxes"]:
-        patch.set_facecolor("steelblue")
-        patch.set_alpha(0.7)
-    for patch in bp2["boxes"]:
-        patch.set_facecolor("salmon")
-        patch.set_alpha(0.7)
-
-    ax.axhline(0, color="black", linewidth=0.8, linestyle="-")
-    mid_positions = (positions_charging + positions_mild) / 2
-    short_names = [d[:12] + "…" if len(d) > 12 else d for d in devices]
-    ax.set_xticks(mid_positions)
-    ax.set_xticklabels(short_names, rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel("Predicted dSocdt", fontsize=11)
-    ax.set_title(
-        "Predicted dSocdt: Actual-Charging Hours vs Actual-Mild-Discharge Hours\n"
-        "(blue = model's prediction when truth was charging/idle (dSocdt=0)  |  "
-        "red = model's prediction when truth was mild discharge "
-        f"({MILD_DISCHARGE_LOWER} to 0))\n"
-        "Note: if blue boxes sit BELOW red boxes, the model has learned an "
-        "inverted signal — it predicts stronger discharge right before charging,\n"
-        "likely because heavy recent usage often precedes the user plugging in the device.",
-        fontsize=10, fontweight="bold"
-    )
-    legend_elems = [
-        mpatches.Patch(facecolor="steelblue", alpha=0.7, label="Predicted value — actual charging hours"),
-        mpatches.Patch(facecolor="salmon",    alpha=0.7, label="Predicted value — actual mild discharge hours"),
-    ]
-    ax.legend(handles=legend_elems, fontsize=9, loc="lower right")
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Charging discrimination plot saved  →  {plot_path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# NEW — TASK B: CHARGING EVENT DETECTION (precision/recall/F1)
-# ─────────────────────────────────────────────────────────────
-
-def charging_event_detection_stats(results, epsilon=ZERO_EPSILON):
-    """
-    Binary classification framing:
-      Ground truth positive  = actual dSocdt == 0   (charging/idle hour)
-      Predicted positive     = |predicted dSocdt| <= epsilon  (model "thinks"
-                                this hour is charging/idle)
-
-    Returns precision, recall, F1, and confusion matrix counts, computed
-    over all (day, hour) pairs pooled together for this device.
-    """
-    all_actual = np.concatenate([r["y_actual"] for r in results])
-    all_pred   = np.concatenate([r["y_pred"]   for r in results])
-
-    y_true = (all_actual == 0.0).astype(int)
-    y_pred = (np.abs(all_pred) <= epsilon).astype(int)
-
-    # Handle edge case: all one class
-    if y_true.sum() == 0 or y_true.sum() == len(y_true):
-        precision = recall = f1 = np.nan
-        tn = fp = fn = tp = 0
+def insert_image(path, width_cm=14, caption_text=None, max_height_cm=10):
+    elems = []
+    if path and os.path.exists(path):
+        img_w = width_cm * cm
+        img_h = min(max_height_cm * cm, img_w * 0.6)
+        try:
+            elems.append(Image(path, width=img_w, height=img_h, kind="proportional"))
+        except Exception:
+            elems.append(body(f"[Image could not be loaded: {os.path.basename(path)}]"))
     else:
-        precision = precision_score(y_true, y_pred, zero_division=0)
-        recall    = recall_score(y_true, y_pred, zero_division=0)
-        f1        = f1_score(y_true, y_pred, zero_division=0)
-        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-        tn, fp, fn, tp = cm.ravel()
+        name = os.path.basename(path) if path else "image"
+        elems.append(Paragraph(
+            f'<font color="#a0aec0"><i>[Plot not found: {name} — placeholder, '
+            f'add the file to this path once available]</i></font>', S["body"]))
+    if caption_text:
+        elems.append(caption(caption_text))
+    elems.append(sp(0.3))
+    return elems
 
-    return {
-        "epsilon"                : epsilon,
-        "n_actual_charging_hours": int(y_true.sum()),
-        "n_total_hours"          : int(len(y_true)),
-        "n_pred_charging_hours"  : int(y_pred.sum()),
-        "precision"              : round(float(precision), 4) if not np.isnan(precision) else np.nan,
-        "recall"                 : round(float(recall), 4) if not np.isnan(recall) else np.nan,
-        "f1_score"                : round(float(f1), 4) if not np.isnan(f1) else np.nan,
-        "true_positive"          : int(tp),
-        "false_positive"         : int(fp),
-        "true_negative"          : int(tn),
-        "false_negative"         : int(fn),
-    }
+def glob_all(pattern):
+    return sorted(glob.glob(pattern))
+
+def kv_table(rows, col_widths=None):
+    if col_widths is None:
+        col_widths = [5 * cm, 10 * cm]
+    t = Table(rows, colWidths=col_widths)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#edf2f7")),
+        ("TEXTCOLOR",  (0, 0), (0, -1), colors.HexColor("#2d3748")),
+        ("FONTNAME",   (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME",   (1, 0), (1, -1), "Helvetica"),
+        ("FONTSIZE",   (0, 0), (-1, -1), 9.5),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.HexColor("#f7fafc")]),
+        ("GRID",       (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e0")),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+    ]))
+    return t
+
+def results_table(header, rows):
+    data = [header] + rows
+    col_w = (PAGE_W - 2 * MARGIN) / len(header)
+    t = Table(data, colWidths=[col_w] * len(header))
+    t.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#2c5282")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME",    (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE",    (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#ebf4ff")]),
+        ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#bee3f8")),
+        ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",  (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    return t
+
+def hurst_breakdown(csv_path):
+    """Returns (n_total, n_persistent, n_random, n_anti, mean_h) or None."""
+    if not os.path.exists(csv_path):
+        return None
+    df = pd.read_csv(csv_path)
+    n_total = len(df)
+    n_pers  = df["Regime"].str.contains("Persistent").sum()
+    n_rand  = df["Regime"].str.contains("Random").sum()
+    n_anti  = df["Regime"].str.contains("Anti").sum()
+    mean_h  = df["HurstExponent"].mean()
+    return n_total, n_pers, n_rand, n_anti, mean_h
+
+def feature_type_breakdown(csv_path):
+    """Returns dict {type: pct} or None."""
+    if not os.path.exists(csv_path):
+        return None
+    df = pd.read_csv(csv_path)
+    totals = df.groupby("feature_type")["importance"].sum()
+    total_sum = totals.sum()
+    return {k: 100 * v / total_sum for k, v in totals.items()}
 
 
-def plot_charging_event_detection(detection_df, plot_path):
-    """
-    Bar chart: precision, recall, F1 per device at the default epsilon,
-    plus overall mean line.
-    """
-    dev_data = detection_df[detection_df["device"] != "OVERALL_MEAN"].copy()
-    overall  = detection_df[detection_df["device"] == "OVERALL_MEAN"]
+# ─────────────────────────────────────────────────────────────
+# COVER PAGE & TOC
+# ─────────────────────────────────────────────────────────────
 
-    short_names = [d[:12] + "…" if len(d) > 12 else d for d in dev_data["device"]]
-    x = np.arange(len(dev_data))
-    width = 0.25
+def cover_page():
+    elems = []
+    elems.append(sp(2.5))
+    elems.append(Paragraph("Predictive Battery Management", S["title"]))
+    elems.append(Paragraph("Through Usage Pattern Recognition", S["title"]))
+    elems.append(sp(0.5))
+    elems.append(hr("#4a6fa5", thickness=2))
+    elems.append(sp(0.4))
+    elems.append(Paragraph("Project Progress Report — Two-Approach Methodology", S["subtitle"]))
+    elems.append(sp(2.5))
+    meta = [
+        ["Project" , "Predictive Battery Management Through Usage Pattern Recognition"],
+        ["Model"   , "XGBoost (Daily Rolling-Window, Sequential Hyperparameter Tuning)"],
+        ["Status"  , "In Progress — Approach 2 (revised methodology) complete"],
+        ["Scope"   , "Data Preprocessing | Statistical Analysis | Model Training | "
+                      "Interpretability | Model Complexity | Methodology Revision"],
+    ]
+    elems.append(kv_table(meta, col_widths=[3.5 * cm, 11.5 * cm]))
+    elems.append(sp(1))
+    elems.append(body(
+        "This report documents two successive approaches. <b>Approach 1</b> "
+        "(results_old/, main branch) clipped positive dSocdt values to zero and "
+        "used interpolation-based hourly resampling. Diagnostic analysis of "
+        "Approach 1 revealed the model could not reliably distinguish charging "
+        "events from light usage, motivating a methodology revision. "
+        "<b>Approach 2</b> (results/, test branch) retains positive dSocdt "
+        "values, uses average-based resampling with explicit NaN handling, and "
+        "repeats the full pipeline. This report is a living document."
+    ))
+    elems.append(PageBreak())
+    return elems
 
-    fig, ax = plt.subplots(figsize=(max(12, len(dev_data) * 1.4), 6.5))
-    ax.bar(x - width, dev_data["precision"], width, label="Precision",
-           color="steelblue", edgecolor="white")
-    ax.bar(x,          dev_data["recall"],    width, label="Recall",
-           color="darkorange", edgecolor="white")
-    ax.bar(x + width,  dev_data["f1_score"],   width, label="F1-score",
-           color="seagreen", edgecolor="white")
+def toc():
+    elems = []
+    elems += section_header("Table of Contents", "h1")
+    sections = [
+        ("PART A", "APPROACH 1 — ORIGINAL METHODOLOGY  (results_1/)"),
+        ("1",  "Project Overview & Problem Statement"),
+        ("2",  "Dataset Description & File Structure"),
+        ("3",  "Data Preprocessing (Interpolation-Based Resampling)"),
+        ("4",  "Statistical Analysis — Autocorrelation & Hurst Exponent"),
+        ("5",  "XGBoost Model & Hyperparameter Tuning"),
+        ("6",  "Final Validation Results"),
+        ("7",  "Feature Importance Analysis"),
+        ("8",  "Tree Rule Extraction & Interpretation"),
+        ("9",  "Model Size & Inference Time Analysis"),
+        ("10", "Charging-Detection Diagnostic (Task A & Task B)"),
+        ("11", "Limitations Identified in Approach 1"),
+        ("PART B", "APPROACH 2 — REVISED METHODOLOGY  (results_2/)"),
+        ("12", "Motivation for Methodology Revision"),
+        ("13", "Revised Data Preprocessing (Average-Based Resampling)"),
+        ("14", "Revised Hyperparameter Tuning"),
+        ("15", "Revised Final Validation Results"),
+        ("16", "Revised Feature Importance Analysis"),
+        ("17", "Revised Tree Rule Extraction & Interpretation"),
+        ("18", "Comparison: Approach 1 vs Approach 2"),
+        ("19", "Next Steps"),
+    ]
+    for num, title in sections:
+        if num in ("PART A", "PART B"):
+            elems.append(sp(0.15))
+            elems.append(Paragraph(f'<font name="Helvetica-Bold" color="#7a1f1f">{title}</font>', S["toc"]))
+            elems.append(sp(0.1))
+        else:
+            elems.append(Paragraph(f'<font name="Helvetica-Bold">{num}</font>  {title}', S["toc"]))
+    elems.append(PageBreak())
+    return elems
 
-    if not overall.empty:
-        ax.axhline(overall["f1_score"].values[0], color="crimson",
-                   linestyle="--", linewidth=1.8,
-                   label=f"Overall mean F1: {overall['f1_score'].values[0]:.3f}")
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(short_names, rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel("Score", fontsize=11)
-    ax.set_ylim(0, 1.1)
-    ax.set_title(
-        f"Charging Event Detection — Precision / Recall / F1 per Device\n"
-        f"('Predicted charging' = |predicted dSocdt| ≤ {ZERO_EPSILON})",
-        fontsize=12, fontweight="bold"
+# ═════════════════════════════════════════════════════════════
+# PART A — APPROACH 1
+# ═════════════════════════════════════════════════════════════
+
+def part_a_divider():
+    elems = []
+    elems.append(sp(6))
+    elems.append(Paragraph("PART A", S["title"]))
+    elems.append(Paragraph("APPROACH 1 — ORIGINAL METHODOLOGY", S["subtitle"]))
+    elems.append(sp(0.5))
+    elems.append(hr("#7a1f1f", thickness=2))
+    elems.append(sp(1))
+    elems.append(body(
+        "Positive dSocdt values (charging) were clipped to zero, and hourly "
+        "resampling used time-based linear interpolation to fill gaps. This "
+        "approach was later found to have a specific limitation, analysed in "
+        "Section 10, which motivated the revision described in Part B."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+def s1_overview():
+    elems = []
+    elems += section_header("1.  Project Overview & Problem Statement", "h1")
+    elems.append(body(
+        "The goal of this project is to predict future battery usage patterns "
+        "of mobile devices by learning from historical State-of-Charge (SoC) "
+        "time-series data. Accurate prediction of discharge behaviour enables "
+        "intelligent suggestions to users — such as optimal charging times, "
+        "expected battery life, and anomaly detection for degraded cells."
+    ))
+    elems.append(sp(0.5))
+    return elems
+
+def s2_dataset():
+    elems = []
+    elems += section_header("2.  Dataset Description & File Structure", "h1")
+    elems.append(body(
+        "Multiple CSV files are provided, each corresponding to one device/user, "
+        "with raw time-stamped SoC readings at irregular intervals."
+    ))
+    col_rows = [
+        ["ID",             "Device identifier (ignored in modelling)"],
+        ["TimeStamp",      "Unix timestamp (ignored in modelling)"],
+        ["ChargingStatus", "0 = discharging, 1 = charging"],
+        ["Soc",            "State of Charge — current battery percentage (0–100)"],
+        ["DischargeLevel", "Raw discharge counter"],
+        ["DateTime",       "Human-readable timestamp"],
+        ["dSocdt",         "Rate of change of SoC (+ve = charging, -ve = discharging, 0 = idle)"],
+    ]
+    elems.append(kv_table(col_rows, col_widths=[3.8 * cm, 11.2 * cm]))
+    elems.append(PageBreak())
+    return elems
+
+def s3_preprocessing_v1():
+    elems = []
+    elems += section_header(
+        "3.  Data Preprocessing (Interpolation-Based Resampling)", "h1")
+    elems.append(body(
+        "Implemented in <b>battery_analysis.py</b>:"))
+    for s in [
+        "Parse DateTime (mixed-format UTC) → convert to IST → strip timezone.",
+        "Create a clean hourly DatetimeIndex spanning start to end of data.",
+        "Apply time-based linear interpolation on Soc and DischargeLevel to fill gaps.",
+        "Re-derive dSocdt as the hourly difference of interpolated Soc.",
+        "Re-derive categorical columns (dayofweek, dayname, month, monthname).",
+        "CLIP all +ve dSocdt values to 0 — charging effect removed before modelling.",
+    ]:
+        elems.append(bullet(s))
+    elems.append(sp(0.3))
+    elems.append(warnbox(
+        "<b>Key design choice (later found problematic):</b> Positive dSocdt "
+        "values were clipped to zero so that only usage/discharge behaviour would "
+        "be modelled. This made a true charging hour indistinguishable from a "
+        "genuinely idle hour — both appeared as zero in the training target."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+def s4_statistical_v1():
+    elems = []
+    elems += section_header(
+        "4.  Statistical Analysis — Autocorrelation & Hurst Exponent", "h1")
+    elems.append(body(
+        "The key question investigated: does discharge behaviour exhibit "
+        "long-range temporal dependence? Pearson autocorrelation of the dSocdt "
+        "series was computed at lags 0–504 hours (discharge-only samples); the "
+        "Hurst exponent H was estimated per device via Rescaled Range (R/S) analysis."
+    ))
+    ac_plots = glob_all(os.path.join(PATHS_1["ac_hc_plots"], "autocorr_*.png"))
+    if ac_plots:
+        elems += insert_image(ac_plots[0], width_cm=15,
+            caption_text=f"Figure: Sample autocorrelation plot (device 1 of {len(ac_plots)} analysed)")
+    hc_plots = glob_all(os.path.join(PATHS_1["ac_hc_plots"], "hurst_*.png"))
+    if hc_plots:
+        elems += insert_image(hc_plots[0], width_cm=13,
+            caption_text=f"Figure: Sample Hurst exponent R/S plot (device 1 of {len(hc_plots)} analysed)")
+
+    hb = hurst_breakdown(PATHS_1["all_users_summary"])
+    if hb:
+        n_total, n_pers, n_rand, n_anti, mean_h = hb
+        elems.append(results_table(
+            ["Regime", "Device Count", "% of Devices"],
+            [
+                ["Persistent (H > 0.5)",      str(n_pers), f"{100*n_pers/n_total:.1f}%"],
+                ["Random walk (H ≈ 0.5)",     str(n_rand), f"{100*n_rand/n_total:.1f}%"],
+                ["Anti-persistent (H < 0.5)", str(n_anti), f"{100*n_anti/n_total:.1f}%"],
+                ["TOTAL",                     str(n_total), "100.0%"],
+            ]))
+        elems.append(sp(0.3))
+        elems.append(body(
+            f"Mean Hurst exponent across all {n_total} devices analysed: "
+            f"<b>{mean_h:.3f}</b>. {n_pers} of {n_total} devices ({100*n_pers/n_total:.0f}%) "
+            f"show persistent, long-range-dependent discharge behaviour, motivating "
+            f"a sequence-aware model with a multi-day feature window over "
+            f"pattern-clustering approaches such as SOM."
+        ))
+    elems.append(PageBreak())
+    return elems
+
+def s5_model_v1():
+    elems = []
+    elems += section_header("5.  XGBoost Model & Hyperparameter Tuning", "h1")
+    elems.append(body(
+        "XGBoost with a MultiOutputRegressor wrapper (one tree per output hour) "
+        "was trained using a daily rolling window: each prediction day uses the "
+        "preceding 14 actual days as context, flattened into a 728-feature vector "
+        "(24 dSocdt + 24 Soc + 4 date features, per day, × 14 days)."
+    ))
+    elems.append(kv_table([
+        ["Training window", "14 days, rolling by 1 day"],
+        ["Features/day",    "24 dSocdt + 24 Soc + 4 date = 52"],
+        ["Total features",  "14 × 52 = 728"],
+        ["Tuning method",   "Sequential coordinate-wise search"],
+    ], col_widths=[4 * cm, 11 * cm]))
+
+    param_rows = [
+        ("5.1", "n_estimators",  "10–350",              "25",   "58.94%", "val_curve_n_estimators.png"),
+        ("5.2", "max_depth",     "2, 3, 4, 5",           "2",    "59.10%", "val_curve_max_depth.png"),
+        ("5.3", "learning_rate", "0.01–0.24",            "0.05", "59.10%", "val_curve_learning_rate.png"),
+        ("5.4", "subsample",     "0.7–1.0",              "0.95", "59.23%", "val_curve_subsample.png"),
+    ]
+    for num, pname, prange, pbest, pacc, plotfile in param_rows:
+        elems += section_header(f"{num}  {pname}", "h2")
+        elems.append(kv_table([
+            ["Values tested", prange],
+            ["Best value",    pbest],
+            ["Best avg accuracy", pacc],
+        ], col_widths=[3.5 * cm, 11.5 * cm]))
+        elems.append(sp(0.2))
+        plot_path = os.path.join(PATHS_1["val_curves"], plotfile)
+        elems += insert_image(plot_path, width_cm=14,
+            caption_text=f"Figure: Validation curve for {pname} (Approach 1)")
+
+    elems += section_header("Final Selected Hyperparameters (Approach 1)", "h2")
+    elems.append(results_table(
+        ["Parameter", "Values Tried", "Best Value", "Best Avg Accuracy"],
+        [
+            ["n_estimators",    "10–350",   "25",   "58.94%"],
+            ["max_depth",       "2, 3, 4, 5", "2",  "59.10%"],
+            ["learning_rate",   "0.01–0.24", "0.05","59.10%"],
+            ["subsample",       "0.7–1.0",   "0.95","59.23%"],
+            ["colsample_bytree","fixed",     "0.8", "—"],
+        ]))
+    elems.append(PageBreak())
+    return elems
+
+def s6_final_validation_v1():
+    elems = []
+    elems += section_header("6.  Final Validation Results", "h1")
+    elems.append(body(
+        "Final validation was run across all devices with a threshold sweep "
+        "(|pred − actual| ≤ T) and cosine similarity between actual and predicted "
+        "24-hour dSocdt vectors, using n_estimators=25, max_depth=2, "
+        "learning_rate=0.05, subsample=0.95."
+    ))
+    thresh_csv = os.path.join(PATHS_1["final_validation"], "final_summary_all_thresholds.csv")
+    if os.path.exists(thresh_csv):
+        tdf = pd.read_csv(thresh_csv)
+        overall = tdf.groupby("threshold")["mean_accuracy_%"].mean().reset_index()
+        rows = [[f"{t:g}", f"{a:.2f}%"] for t, a in
+                zip(overall["threshold"], overall["mean_accuracy_%"])]
+        elems.append(results_table(["Accuracy Threshold", "Overall Mean Accuracy"], rows))
+        elems.append(sp(0.3))
+
+    tac_plot = os.path.join(PATHS_1["final_validation"], "threshold_accuracy_curve.png")
+    elems += insert_image(tac_plot, width_cm=14,
+        caption_text="Figure: Overall mean accuracy vs threshold value (Approach 1)")
+
+    cos_plot = os.path.join(PATHS_1["final_validation"], "cosine_similarity_plot.png")
+    elems += insert_image(cos_plot, width_cm=14,
+        caption_text="Figure: Mean cosine similarity per device (Approach 1)")
+
+    fv_plots = glob_all(os.path.join(PATHS_1["final_validation"], "final_validation_plot_*.png"))
+    if fv_plots:
+        elems += insert_image(fv_plots[0], width_cm=15,
+            caption_text="Figure: Sample device — actual vs predicted dSocdt (Approach 1)")
+    elems.append(PageBreak())
+    return elems
+
+def s7_feature_importance_v1():
+    elems = []
+    elems += section_header("7.  Feature Importance Analysis", "h1")
+    elems.append(body(
+        "XGBoost's built-in feature importance was extracted from the pooled "
+        "model, averaged across all 24 hour-estimators."
+    ))
+    fb = feature_type_breakdown(PATHS_1.get("feature_importance") and
+                                os.path.join(PATHS_1["feature_importance"], "feature_importance.csv"))
+    if fb:
+        elems.append(results_table(
+            ["Feature Type", "Total Importance Share"],
+            [[k, f"{v:.1f}%"] for k, v in sorted(fb.items(), key=lambda x: -x[1])]))
+        elems.append(sp(0.3))
+        elems.append(body(
+            "dSocdt dominates overwhelmingly (~86%), with Soc contributing a "
+            "modest ~11% and date/calendar features contributing a negligible "
+            "~2.6%. The model is therefore driven almost entirely by past "
+            "discharge <i>rate</i>, not battery level or calendar context."
+        ))
+
+    fi_plots = glob_all(os.path.join(PATHS_1["feature_importance"], "*.png"))
+    for fp in fi_plots[:3]:
+        elems += insert_image(fp, width_cm=14, caption_text=f"Figure: {os.path.basename(fp)}")
+    elems.append(PageBreak())
+    return elems
+
+def s8_tree_rules_v1():
+    elems = []
+    elems += section_header("8.  Tree Rule Extraction & Interpretation", "h1")
+    elems.append(body(
+        "Decision tree rules were extracted via <b>battery_tree_rules.py</b> "
+        "using XGBoost's <i>get_booster().get_dump(dump_format='json')</i>, "
+        "covering every split condition and leaf value across all trees of all "
+        "24 hour-estimators."
+    ))
+    tree_plots = [
+        ("tree_interp_root_features.png",     "Figure: Most frequent root-node split features"),
+        ("tree_interp_hour_vs_predictor.png", "Figure: Past-hour vs future-hour root-split heatmap"),
+        ("tree_interp_dsocdt_thresholds.png", "Figure: dSocdt split thresholds by hour"),
+        ("tree_interp_soc_thresholds.png",    "Figure: SoC threshold distribution"),
+        ("tree_interp_recency_dominance.png", "Figure: Split node usage vs days-back"),
+    ]
+    for fname, cap in tree_plots:
+        fpath = os.path.join(PATHS_1["tree_rules"], fname)
+        elems += insert_image(fpath, width_cm=14, caption_text=f"{cap} (Approach 1)")
+    elems.append(body(
+        "<b>Recency dominance:</b> 73.1% of all split conditions rely exclusively on "
+        "yesterday's data (day-minus-1), and 90.9% rely on either yesterday or the day "
+        "before. Features from 3 or more days ago collectively contribute less than 9%. "
+        "This empirically confirms that recent history dominates prediction and that "
+        "a very long training window adds diminishing returns per tree."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Most decisive features (root node analysis):</b> The single most important "
+        "first question each tree asks concerns the discharge rate at evening hours of "
+        "yesterday. The top 5 root-split features are: "
+        "dSocdt_h19_day_minus1 (64 trees), dSocdt_h14_day_minus1 (61 trees), "
+        "dSocdt_h23_day_minus1 (47 trees), dSocdt_h20_day_minus1 (45 trees), "
+        "dSocdt_h15_day_minus1 (41 trees). "
+        "This shows that evening phone usage (14:00–23:00 yesterday) is the "
+        "strongest predictor of tomorrow's discharge patterns — consistent with "
+        "the intuition that heavy evening use (gaming, video) tends to repeat."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Discharge rate thresholds:</b> The median split threshold across all "
+        "dSocdt nodes is -2.999% SoC/hour, meaning the model's typical decision boundary "
+        "is 'was the device losing more than 3% SoC per hour?' "
+        "Hours 22–23 use far more negative thresholds (~-5 to -15.8%/hr), meaning the "
+        "model only branches on late-night discharge when it is extreme. "
+        "Hours 3–5 AM use near-zero thresholds (~-0.9 to -1.0%/hr) since any "
+        "discharge at all during those hours is unusual."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Hour-of-day split clusters:</b> From the heatmap (tree_interp_hour_vs_predictor.png) "
+        "we observe that 54% of the splits based on hour of day belong to the evening cluster    "
+        "(hours 14-23) and 23% belong to the morning cluster (hours 03-06)."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>SoC thresholds:</b> When SoC features appear, the model looks at SoC at "
+        "10:00 (mid-morning) and 23:00 (end of day) from yesterday. The ~43% median "
+        "threshold distinguishes users who ended the day above vs below half charge — "
+        "a proxy for whether the device was charged during the day."
+    ))
+    elems.append(sp(0.2))
+    elems.append(PageBreak())
+    return elems
+
+def s9_model_complexity_v1():
+    elems = []
+    elems += section_header("9.  Model Size & Inference Time Analysis", "h1")
+    elems.append(body(
+        "To assess deployability, the trained model's serialised size and "
+        "per-sample inference time were measured as a function of the number of "
+        "training samples used."
+    ))
+    elems += insert_image(PATHS_1["model_size"], width_cm=14,
+        caption_text="Figure: Model size (KB) vs number of training samples")
+    elems += insert_image(PATHS_1["inference_time"], width_cm=14,
+        caption_text="Figure: Inference time vs number of training samples")
+    elems.append(body(
+        "Both model size and inference time remain modest and grow slowly with "
+        "the amount of training data, indicating the pipeline is lightweight "
+        "enough for practical on-device or edge deployment even as more "
+        "historical data accumulates."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+def s10_charging_diagnostic():
+    elems = []
+    elems += section_header(
+        "10.  Charging-Detection Diagnostic (Task A & Task B)", "h1")
+    elems.append(body(
+        "Two diagnostic checks were run on the Approach 1 model to test whether "
+        "the +ve-dSocdt clipping had hidden weaknesses:"
+    ))
+    elems.append(bullet(
+        "<b>Task A (Discrimination):</b> Does the model's predicted dSocdt for "
+        "hours where ground truth was charging (dSocdt = 0) look statistically "
+        "different from hours where ground truth was mild discharge?"))
+    elems.append(bullet(
+        "<b>Task B (Event Detection):</b> Treating |predicted dSocdt| ≤ epsilon "
+        "as 'model predicts charging', how well does this match true charging "
+        "hours (precision, recall, F1)?"))
+    elems.append(sp(0.3))
+
+    elems += insert_image(PATHS_1["charging_discrimination"], width_cm=15,
+        caption_text="Figure: Predicted dSocdt — actual-charging vs actual-mild-discharge hours, per device")
+    elems.append(body(
+        "<b>Finding:</b> For every device tested, mean predicted dSocdt during "
+        "actual-charging hours was <i>more negative</i> than during actual-mild-"
+        "discharge hours — an <b>inverted signal</b>. The model associates strong "
+        "recent discharge momentum with both 'more discharge tomorrow' and, "
+        "coincidentally, with hours that turn out to be charging (heavy usage "
+        "commonly precedes a user plugging in their device)."
+    ))
+
+    elems += insert_image(PATHS_1["charging_detection"], width_cm=15,
+        caption_text="Figure: Precision / Recall / F1-score per device (epsilon = 0.5)")
+    elems.append(body(
+        "<b>Finding:</b> F1-scores for charging event detection ranged from "
+        "approximately 0.03 to 0.47 across devices — well below the 0.5 "
+        "threshold considered minimally acceptable, and highly inconsistent "
+        "between devices."
+    ))
+
+    elems += insert_image(PATHS_1["charging_eps_sweep"], width_cm=14,
+        caption_text="Figure: F1-score vs epsilon (the 'near-zero' threshold for calling a prediction 'charging')")
+    elems.append(body(
+        "No choice of epsilon between 0.1 and 2.0 produced consistently strong "
+        "F1 scores across devices — this is not a threshold-tuning problem. The "
+        "model genuinely lacks the information needed to detect charging events "
+        "reliably under Approach 1."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+def s11_limitations():
+    elems = []
+    elems += section_header("11.  Limitations Identified in Approach 1", "h1")
+    elems.append(warnbox(
+        "<b>Root cause:</b> Clipping +ve dSocdt to 0 destroyed the only "
+        "information that could have taught the model to recognise charging as "
+        "a distinct event. Making 'charging' and 'idle, no discharge' "
+        "indistinguishable in the training target structurally prevented the "
+        "model from learning a genuine charging signal."
+    ))
+    elems.append(bullet(
+        "<b>Interpolation manufactured data that never existed.</b> Time-based "
+        "linear interpolation filled every missing hourly slot with a plausible "
+        "but fabricated value."))
+    elems.append(bullet(
+        "<b>No explicit charging signal for downstream tasks.</b> Any feature "
+        "built on this model (e.g. charging-time recommendations) would inherit "
+        "the same blind spot."))
+    elems.append(bullet(
+        "<b>Standard metrics alone did not reveal the issue.</b> Accuracy/MAE/"
+        "cosine-similarity on the clipped dSocdt looked reasonable; the "
+        "charging blind spot only became visible via dedicated Task A/B diagnostics."))
+    elems.append(sp(0.4))
+    elems.append(body(
+        "<b>Decision:</b> The methodology was revised — Approach 2 (Part B) "
+        "retains +ve dSocdt values and replaces interpolation with an "
+        "averaging-based resampling scheme that leaves genuinely missing hours "
+        "as NaN rather than fabricating values."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+
+# ═════════════════════════════════════════════════════════════
+# PART B — APPROACH 2
+# ═════════════════════════════════════════════════════════════
+
+def part_b_divider():
+    elems = []
+    elems.append(sp(6))
+    elems.append(Paragraph("PART B", S["title"]))
+    elems.append(Paragraph("APPROACH 2 — REVISED METHODOLOGY", S["subtitle"]))
+    elems.append(sp(0.5))
+    elems.append(hr("#2c5282", thickness=2))
+    elems.append(sp(1))
+    elems.append(body(
+        "This part repeats the full pipeline under the revised methodology "
+        "motivated by the limitations found in Part A."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+def s12_motivation():
+    elems = []
+    elems += section_header("12.  Motivation for Methodology Revision", "h1")
+    elems.append(bullet(
+        "<b>Retain +ve dSocdt values.</b> Charging hours are no longer clipped "
+        "to zero, giving the model genuine signed dSocdt information to "
+        "distinguish charging, idle, and discharging."))
+    elems.append(bullet(
+        "<b>Average-based hourly resampling instead of interpolation.</b> For "
+        "each target hour H, raw rows in [H−30min, H+30min) are averaged. If "
+        "none fall in that window, the hour is left as NaN — XGBoost's native "
+        "handling of missing values means no artificial filling is needed."))
+    elems.append(sp(0.3))
+    elems.append(body(
+        "Both changes required corresponding updates throughout the pipeline: "
+        "resampling, the wide-CSV pivot, hyperparameter tuning, final "
+        "validation, feature importance, and tree rule extraction all needed "
+        "NaN-safe handling and removal of the +ve-value clipping step."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+def s13_preprocessing_v2():
+    elems = []
+    elems += section_header(
+        "13.  Revised Data Preprocessing (Average-Based Resampling)", "h1")
+    elems.append(body(
+        "Implemented in <b>battery_resample_and_pivot.py</b>:"
+    ))
+    elems.append(kv_table([
+        ["Step 1", "For each date/hour H, average ChargingStatus, Soc, "
+                   "DischargeLevel, dSocdt over raw rows in [H−30min, H+30min)."],
+        ["No data in window", "Fill entire hour-row with NaN (not interpolated)."],
+        ["Step 2",  "Pivot to wide format: dSocdt_h0…h23 | Soc_h0…h23 (48 cols). "
+                    "+ve dSocdt retained. Missing hours remain NaN."],
+    ], col_widths=[3.2 * cm, 12.8 * cm]))
+    elems.append(sp(0.3))
+    elems.append(body(
+        "<b>Why NaN instead of interpolation:</b> XGBoost's tree-splitting "
+        "algorithm learns, during training, which branch to send missing values "
+        "down based on which direction minimises loss — using genuinely "
+        "observed data rather than inventing values never actually measured."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+def s14_hyperparam_v2():
+    elems = []
+    elems += section_header("15.  Revised Hyperparameter Tuning", "h1")
+    elems.append(body(
+        "Sequential coordinate-wise tuning was repeated on the revised wide "
+        "CSVs (NaN-aware, +ve dSocdt retained) using <b>battery_hypersearch.py</b>."
+    ))
+    param_order = [
+        ("14.1", "n_estimators",  "10–250",           "200",  "val_curve_n_estimators.png"),
+        ("14.2", "max_depth",     "2, 3, 4",          "2",    "val_curve_max_depth.png"),
+        ("14.3", "learning_rate", "0.01–0.2",         "0.1",  "val_curve_learning_rate.png"),
+        ("14.4", "subsample",     "0.7–0.95",         "0.95", "val_curve_subsample.png"),
+    ]
+    for num, pname, prange, pbest, plotfile in param_order:
+        elems += section_header(f"{num}  {pname}", "h2")
+        elems.append(kv_table([
+            ["Values tested", prange],
+            ["Best value",    pbest],
+        ], col_widths=[3.5 * cm, 11.5 * cm]))
+        elems.append(sp(0.2))
+        plot_path = os.path.join(PATHS_2["val_curves"], plotfile)
+        elems += insert_image(plot_path, width_cm=14,
+            caption_text=f"Figure: Validation curve for {pname} (Approach 2)")
+
+    elems += section_header("Final Selected Hyperparameters (Approach 2)", "h2")
+    elems.append(results_table(
+        ["Parameter", "Values Tried", "Best Value", "Best Avg Accuracy"],
+        [
+            ["n_estimators",    "10–250",   "200",  "68.27%"],
+            ["max_depth",       "2, 3, 4",  "2",    "68.27%"],
+            ["learning_rate",   "0.01–0.2", "0.1",  "68.49%"],
+            ["subsample",       "0.7–0.95", "0.95", "68.78%"],
+            ["colsample_bytree","fixed",    "0.8",  "—"],
+        ]))
+    elems.append(PageBreak())
+    return elems
+
+def s15_final_validation_v2():
+    elems = []
+    elems += section_header("15.  Revised Final Validation Results", "h1")
+    elems.append(body(
+        "Final validation was re-run with n_estimators=200, max_depth=2, "
+        "learning_rate=0.1, subsample=0.95, colsample_bytree=0.8 on the "
+        "NaN-aware, +ve-dSocdt-retained data. Task A/B charging diagnostics "
+        "were removed from this stage since the limitation they detected is "
+        "now addressed directly by retaining +ve dSocdt in training."
+    ))
+    thresh_csv = os.path.join(PATHS_2["final_validation"], "final_summary_all_thresholds.csv")
+    if os.path.exists(thresh_csv):
+        tdf = pd.read_csv(thresh_csv)
+        overall = tdf.groupby("threshold")["mean_accuracy_%"].mean().reset_index()
+        rows = [[f"{t:.4f}", f"{a:.2f}%"] for t, a in
+                zip(overall["threshold"], overall["mean_accuracy_%"])]
+        elems.append(results_table(["Accuracy Threshold", "Overall Mean Accuracy"], rows))
+        elems.append(sp(0.3))
+
+    cos_csv = os.path.join(PATHS_2["final_validation"], "cosine_similarity_summary.csv")
+    if os.path.exists(cos_csv):
+        cdf = pd.read_csv(cos_csv)
+        overall_row = cdf[cdf["device"] == "OVERALL_MEAN"]
+        if not overall_row.empty:
+            elems.append(body(
+                f"Overall mean cosine similarity: "
+                f"<b>{overall_row['mean_cosine_sim'].values[0]:.4f}</b> over "
+                f"{int(overall_row['total_days'].values[0])} device-days. Some "
+                f"devices show missing (not zero) cosine similarity where all "
+                f"predicted days were entirely NaN in ground truth, preserving "
+                f"the distinction between 'poor prediction' and "
+                f"'no ground truth available'."
+            ))
+    elems.append(sp(0.3))
+
+    tac_plot = glob_all(os.path.join(PATHS_2["final_validation"], "*hreshold*ccuracy*.png"))
+    if tac_plot:
+        elems += insert_image(tac_plot[0], width_cm=14,
+            caption_text="Figure: Overall mean accuracy vs threshold value (Approach 2)")
+    cos_plot = os.path.join(PATHS_2["final_validation"], "cosine_similarity_plot.png")
+    elems += insert_image(cos_plot, width_cm=14,
+        caption_text="Figure: Mean cosine similarity per device (Approach 2)")
+    fv_plots = glob_all(os.path.join(PATHS_2["final_validation"], "final_validation_plot_*.png"))
+    if fv_plots:
+        elems += insert_image(fv_plots[0], width_cm=15,
+            caption_text="Figure: Sample device — actual vs predicted dSocdt (Approach 2)")
+    elems.append(PageBreak())
+    return elems
+
+def s16_feature_importance_v2():
+    elems = []
+    elems += section_header("16.  Revised Feature Importance Analysis", "h1")
+    fb = feature_type_breakdown(os.path.join(PATHS_2["feature_importance"], "feature_importance.csv"))
+    if fb:
+        elems.append(results_table(
+            ["Feature Type", "Total Importance Share"],
+            [[k, f"{v:.1f}%"] for k, v in sorted(fb.items(), key=lambda x: -x[1])]))
+        elems.append(sp(0.3))
+        elems.append(body(
+            "Compared to Approach 1 (dSocdt ~86%, Soc ~11%), Approach 2 shows a "
+            "more balanced split. With charging information now present in "
+            "dSocdt, the model has a richer signal directly, but SoC level also "
+            "becomes more informative since it now correlates meaningfully with "
+            "imminent or recent charging — a relationship invisible when dSocdt "
+            "was clipped."
+        ))
+    fi_plots = glob_all(os.path.join(PATHS_2["feature_importance"], "*.png"))
+    for fp in fi_plots[:3]:
+        elems += insert_image(fp, width_cm=14, caption_text=f"Figure: {os.path.basename(fp)}")
+    elems.append(PageBreak())
+    return elems
+
+def s17_tree_rules_v2():
+    elems = []
+    elems += section_header(
+        "17.  Revised Tree Rule Extraction & Interpretation", "h1")
+    elems.append(body(
+        "Decision tree rules were re-extracted from the Approach 2 model. "
+        "<b>Key structural difference:</b> dSocdt split thresholds can now be "
+        "positive or negative. A threshold like <i>'dSocdt_h10 &gt; 0.003'</i> "
+        "represents a genuine charging-rate boundary that could not exist under "
+        "the clipped Approach 1 data."
+    ))
+    tree_plots = [
+        ("tree_interp_root_features.png",     "Figure: Most frequent root-node split features (Approach 2)"),
+        ("tree_interp_hour_vs_predictor.png", "Figure: Past-hour vs future-hour root-split heatmap (Approach 2)"),
+        ("tree_interp_dsocdt_thresholds.png", "Figure: dSocdt split thresholds by hour, signed (Approach 2)"),
+        ("tree_interp_soc_thresholds.png",    "Figure: SoC threshold distribution (Approach 2)"),
+        ("tree_interp_recency_dominance.png", "Figure: Split node usage vs days-back (Approach 2)"),
+    ]
+    for fname, cap in tree_plots:
+        fpath = os.path.join(PATHS_2["tree_rules"], fname)
+        elems += insert_image(fpath, width_cm=14, caption_text=cap)
+
+    elems.append(body(
+        "<b>Recency dominance — even stronger than Approach 1:</b> 96.0% of all "
+        "split conditions rely exclusively on yesterday's data (day-minus-1), "
+        "and 99.9% rely on either yesterday or the day before. Essentially none "
+        "of the model's decisions draw on data older than 2 days. This is a "
+        "sharper concentration on recent history than Approach 1's 73.1% / 90.9% "
+        "figures, suggesting that once charging information is available "
+        "directly in dSocdt, the model relies even more heavily on the most "
+        "immediate past rather than needing older days to compensate for "
+        "missing signal."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Most decisive features (root node analysis):</b> The top 5 "
+        "root-split features are: dSocdt_h17_day_minus1 (75 trees), "
+        "dSocdt_h20_day_minus1 (66 trees), dSocdt_h4_day_minus1 (50 trees), "
+        "Soc_h8_day_minus1 (49 trees), and day_day_minus1 (49 trees). "
+        "Evening hours (17:00, 20:00) again dominate as in Approach 1, but a "
+        "new pattern emerges: an early-morning hour (04:00) and a mid-morning "
+        "SoC feature (08:00) now also appear among the top root splits — signals "
+        "that were essentially invisible in Approach 1 because clipping removed "
+        "the charging information that gives these hours their predictive value "
+        "(a device charging overnight and reaching a certain SoC by 08:00 is now "
+        "directly informative)."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Discharge/charge rate thresholds — now signed:</b> Across all dSocdt "
+        "split nodes, 76.6% of thresholds are negative (discharge-side boundaries) "
+        "and 22.7% are positive (charging-side boundaries) — a capability that "
+        "did not exist in Approach 1, where 100% of thresholds were forced "
+        "negative or zero by clipping. Per-hour median thresholds show a clear "
+        "day/night pattern: hours 0:00–20:00 all have small negative median "
+        "thresholds (roughly -0.0003 to -0.0018), consistent with light-to-moderate "
+        "discharge, while hours 21:00–23:00 flip to small <b>positive</b> median "
+        "thresholds (+0.0013 to +0.0027) — directly capturing the late-evening "
+        "charging pattern that Approach 1 could never represent."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>Feature type balance at the root:</b> Root-node splits are 63.4% "
+        "dSocdt, 31.3% Soc, and 5.2% Date — noticeably more balanced than "
+        "Approach 1's overwhelming dSocdt dominance. This mirrors the global "
+        "feature importance shift reported in Section 16 (dSocdt ~62.5%, Soc "
+        "~35.8%) and reinforces that Soc now plays a materially larger role in "
+        "the model's earliest, most decisive splits — plausibly because SoC "
+        "level is now a more direct proxy for 'has this device recently "
+        "finished charging' once dSocdt itself carries charging information."
+    ))
+    elems.append(sp(0.2))
+    elems.append(body(
+        "<b>SoC thresholds:</b> The median SoC split threshold is 51.0%, close "
+        "to the halfway mark, similar in spirit to Approach 1's ~43% threshold. "
+        "The most-used SoC features are now Soc_h21, Soc_h22, Soc_h8, Soc_h0, and "
+        "Soc_h23 (all from day-minus-1) — a cluster of late-evening and midnight "
+        "hours plus one mid-morning hour, suggesting the model uses SoC "
+        "specifically around the hours when charging is most likely to begin or "
+        "end."
+    ))
+    elems.append(sp(0.2))
+    elems.append(PageBreak())
+    return elems
+
+def s18_comparison():
+    elems = []
+    elems += section_header("18.  Comparison: Approach 1 vs Approach 2", "h1")
+    elems.append(results_table(
+        ["Aspect", "Approach 1", "Approach 2"],
+        [
+            ["+ve dSocdt handling",  "Clipped to 0",                    "Retained as-is"],
+            ["Resampling method",    "Time-based linear interpolation", "Average within ±30 min window"],
+            ["Missing hours",        "Filled by interpolation",         "Left as NaN, handled natively"],
+            ["dSocdt importance",    "~86.3%",                          "~62.5%"],
+            ["Soc importance",       "~10.9%",                          "~35.8%"],
+            ["Date importance",      "~2.6%",                           "~1.7%"],
+            ["Charging detection",   "F1 = 0.03–0.47 (poor)",           "Native — charging is part of dSocdt"],
+            ["Best hyperparameters", "n_est=25, depth=2, lr=0.05, sub=0.95",
+                                     "n_est=200, depth=2, lr=0.1, sub=0.95"],
+        ]))
+    elems.append(sp(0.4))
+    elems.append(body(
+        "<b>Overall assessment:</b> Approach 2 directly addresses the "
+        "structural blind spot found in Approach 1, giving the model genuine "
+        "access to charging information rather than forcing it to infer "
+        "charging indirectly through correlated discharge patterns. The more "
+        "balanced feature importance split between dSocdt and Soc in Approach 2 "
+        "is itself evidence of a richer, more physically grounded model of "
+        "battery behaviour."
+    ))
+    elems.append(PageBreak())
+    return elems
+
+def s19_next_steps():
+    elems = []
+    elems += section_header("19.  Next Steps", "h1")
+    for item in [
+        " ",
+    ]:
+        elems.append(bullet(item))
+    elems.append(sp(1))
+    elems.append(hr())
+    elems.append(Paragraph(
+        "<i>This report was auto-generated by generate_report.py. "
+        "Re-run at any time to refresh with the latest plots and results.</i>",
+        S["caption"]))
+    return elems
+
+
+# ─────────────────────────────────────────────────────────────
+# BUILD PDF
+# ─────────────────────────────────────────────────────────────
+
+def build_pdf():
+    doc = SimpleDocTemplate(
+        OUTPUT_PDF, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=MARGIN,
+        title="Battery Management Project Report",
+        author="Project Team",
     )
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Charging event detection plot saved  →  {plot_path}")
+    story = []
+    story += cover_page()
+    story += toc()
 
+    story += part_a_divider()
+    story += s1_overview()
+    story += s2_dataset()
+    story += s3_preprocessing_v1()
+    story += s4_statistical_v1()
+    story += s5_model_v1()
+    story += s6_final_validation_v1()
+    story += s7_feature_importance_v1()
+    story += s8_tree_rules_v1()
+    story += s9_model_complexity_v1()
+    story += s10_charging_diagnostic()
+    story += s11_limitations()
 
-def plot_epsilon_sweep(sweep_df, plot_path):
-    """
-    Line plot: F1 score vs the epsilon threshold used to define
-    "predicted charging" (|predicted dSocdt| <= epsilon).
-    Helps decide the most meaningful epsilon for charging detection.
-    """
-    devices = sweep_df["device"].unique()
-    epsilons = sorted(sweep_df["epsilon"].unique())
+    story += part_b_divider()
+    story += s12_motivation()
+    story += s13_preprocessing_v2()
+    story += s14_hyperparam_v2()
+    story += s15_final_validation_v2()
+    story += s16_feature_importance_v2()
+    story += s17_tree_rules_v2()
+    story += s18_comparison()
+    story += s19_next_steps()
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    cmap = plt.cm.tab10
-    all_f1 = []
-    for di, dev in enumerate(devices):
-        dev_df = sweep_df[sweep_df["device"] == dev].sort_values("epsilon")
-        f1s    = dev_df["f1_score"].values
-        short  = dev[:14] + "…" if len(dev) > 14 else dev
-        ax.plot(epsilons, f1s, marker="o", linewidth=1.2, alpha=0.5,
-                color=cmap(di % 10), label=short)
-        all_f1.append(f1s)
+    doc.build(story)
+    print(f"\nReport generated:  {OUTPUT_PDF}")
 
-    overall = np.nanmean(all_f1, axis=0)
-    ax.plot(epsilons, overall, marker="D", linewidth=2.5, color="black",
-            label="Overall mean F1", zorder=5)
-    best_eps_idx = int(np.nanargmax(overall))
-    ax.axvline(epsilons[best_eps_idx], color="crimson", linestyle="--",
-               linewidth=1.5,
-               label=f"Best epsilon = {epsilons[best_eps_idx]} (F1={overall[best_eps_idx]:.3f})")
-
-    ax.set_xlabel("Epsilon (|predicted dSocdt| ≤ epsilon → 'predicted charging')",
-                  fontsize=11)
-    ax.set_ylabel("F1-score", fontsize=11)
-    ax.set_title("Charging Detection F1-score vs Zero-Threshold (Epsilon)\n"
-                 "(how the choice of 'near zero' definition affects detection quality)",
-                 fontsize=12, fontweight="bold")
-    ax.legend(fontsize=7, ncol=3, loc="lower right")
-    ax.grid(linestyle="--", alpha=0.4)
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Epsilon sweep plot saved  →  {plot_path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# PER-DEVICE PLOT
-# ─────────────────────────────────────────────────────────────
-
-def plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T):
-    """
-    Per-device plot showing ONLY actual vs predicted dSocdt, as a grid of
-    up to 6 separate subplots — one subplot per sampled day, sampled every
-    7 days (covering at most the first 48 days). Each subplot shows that
-    single day's actual (solid) and predicted (dashed) 24-hour dSocdt curve,
-    avoiding the clutter of overlaying many days on one axes.
-    """
-    SAMPLE_STEP  = 7
-    MAX_PANELS   = 6
-
-    sample_idx = list(range(0, min(len(results), SAMPLE_STEP * MAX_PANELS), SAMPLE_STEP))
-    sample_idx = sample_idx[:MAX_PANELS]
-
-    n_panels = len(sample_idx)
-    n_cols   = 3
-    n_rows   = int(np.ceil(n_panels / n_cols))
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 5 * n_rows))
-    axes = np.array(axes).reshape(-1)   # flatten regardless of shape
-
-    fig.suptitle(
-        f"Actual vs Predicted dSocdt — {device_name}\n"
-        f"n_estimators={BEST_PARAMS['n_estimators']}  "
-        f"max_depth={BEST_PARAMS['max_depth']}  "
-        f"lr={BEST_PARAMS['learning_rate']}  "
-        f"subsample={BEST_PARAMS['subsample']}",
-        fontsize=12, fontweight="bold"
-    )
-
-    for panel_i, idx in enumerate(sample_idx):
-        ax = axes[panel_i]
-        r  = results[idx]
-
-        ax.plot(HOURS, r["y_actual"], color="steelblue", linewidth=2.0,
-                marker="o", markersize=3, label="Actual")
-        ax.plot(HOURS, r["y_pred"],   color="crimson",   linewidth=2.0,
-                linestyle="--", marker="s", markersize=3, label="Predicted")
-
-        day_acc = accuracy_at_threshold(r["y_actual"], r["y_pred"], threshold)
-        ax.set_title(
-            f"{r['predict_date']}   |   Acc(T={threshold})={day_acc:.1f}%   |   "
-            f"MAE={r['mae']:.3f}   |   CosSim={r['cosine_sim']:.3f}",
-            fontsize=9.5
-        )
-        ax.set_xlabel("Hour of day", fontsize=9)
-        ax.set_ylabel("dSocdt", fontsize=9)
-        ax.set_xticks(range(0, 24, 4))
-        ax.legend(fontsize=8, loc="lower left")
-        ax.grid(linestyle="--", alpha=0.35)
-
-    # Hide any unused subplot axes (e.g. if fewer than 6 panels available)
-    for empty_i in range(n_panels, len(axes)):
-        axes[empty_i].axis("off")
-
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Device plot saved  →  {plot_path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# COSINE SIMILARITY SUMMARY PLOT
-# ─────────────────────────────────────────────────────────────
-
-def plot_cosine_summary(cosine_df):
-    """
-    Bar chart: mean cosine similarity per device + overall mean line.
-    """
-    dev_data = cosine_df[cosine_df["device"] != "OVERALL_MEAN"]
-    overall  = cosine_df[cosine_df["device"] == "OVERALL_MEAN"]["mean_cosine_sim"].values
-
-    fig, ax = plt.subplots(figsize=(max(10, len(dev_data) * 1.2), 6))
-
-    colors = ["steelblue" if v >= 0.5 else ("orange" if v >= 0 else "salmon")
-              for v in dev_data["mean_cosine_sim"]]
-    bars = ax.bar(range(len(dev_data)), dev_data["mean_cosine_sim"],
-                  color=colors, edgecolor="white", linewidth=0.8, zorder=3)
-
-    if len(overall) > 0:
-        ax.axhline(overall[0], color="crimson", linestyle="-", linewidth=2.0,
-                   label=f"Overall mean: {overall[0]:.4f}", zorder=5)
-
-    ax.axhline(0, color="black", linestyle="-", linewidth=0.8)
-
-    for bar, val in zip(bars, dev_data["mean_cosine_sim"]):
-        ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.01, f"{val:.3f}",
-                ha="center", va="bottom", fontsize=8, fontweight="bold")
-
-    short_names = [d[:12] + "…" if len(d) > 12 else d
-                   for d in dev_data["device"]]
-    ax.set_xticks(range(len(dev_data)))
-    ax.set_xticklabels(short_names, rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel("Mean Cosine Similarity", fontsize=12)
-    ax.set_ylim(-1.1, 1.2)
-    ax.set_title(
-        "Mean Cosine Similarity between Actual and Predicted dSocdt\n"
-        "(per device, averaged over all predicted days)",
-        fontsize=12, fontweight="bold"
-    )
-    ax.legend(fontsize=10)
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    plot_path = os.path.join(OUTPUT_FOLDER, "cosine_similarity_plot.png")
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Cosine similarity plot saved  →  {plot_path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# THRESHOLD ACCURACY CURVE PLOT
-# ─────────────────────────────────────────────────────────────
-
-def plot_threshold_curve(threshold_summary_df):
-    devices    = threshold_summary_df["device"].unique()
-    thresholds = sorted(threshold_summary_df["threshold"].unique())
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-    cmap = plt.cm.tab10
-
-    all_means = []
-    for di, device in enumerate(devices):
-        dev_df = threshold_summary_df[threshold_summary_df["device"] == device]
-        accs   = [dev_df[dev_df["threshold"] == t]["mean_accuracy_%"].values[0]
-                  for t in thresholds]
-        short  = device[:14] + "…" if len(device) > 14 else device
-        ax.plot(thresholds, accs, marker="o", linewidth=1.3,
-                color=cmap(di % 10), alpha=0.5, label=short)
-        all_means.append(accs)
-
-    overall = np.mean(all_means, axis=0)
-    ax.plot(thresholds, overall, marker="D", linewidth=2.5,
-            color="black", label="Overall mean", zorder=5)
-
-    for t, acc in zip(thresholds, overall):
-        ax.annotate(f"{acc:.1f}%", xy=(t, acc),
-                    xytext=(0, 7), textcoords="offset points",
-                    ha="center", fontsize=8, color="black", fontweight="bold")
-
-    ax.set_xlabel("Accuracy Threshold", fontsize=12)
-    ax.set_ylabel("Mean Accuracy (%)", fontsize=12)
-    ax.set_title(
-        "Overall Mean Accuracy vs Threshold Value\n"
-        f"(Best params: n_est={BEST_PARAMS['n_estimators']}, "
-        f"depth={BEST_PARAMS['max_depth']}, "
-        f"lr={BEST_PARAMS['learning_rate']}, "
-        f"subsample={BEST_PARAMS['subsample']})",
-        fontsize=12, fontweight="bold"
-    )
-    ax.set_xticks(thresholds)
-    ax.legend(fontsize=7, ncol=3, loc="lower right")
-    ax.grid(linestyle="--", alpha=0.4)
-    ax.set_ylim(0, 110)
-
-    plot_path = os.path.join(OUTPUT_FOLDER, "threshold_accuracy_curve.png")
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Threshold curve saved  →  {plot_path}")
-
-
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-
-    print("=" * 65)
-    print("FINAL COMBINED VALIDATION — BEST HYPERPARAMETERS")
-    print("=" * 65)
-    for k, v in BEST_PARAMS.items():
-        if k not in ("random_state", "verbosity"):
-            print(f"  {k:20s} = {v}")
-    print(f"\n  Thresholds evaluated : {THRESHOLDS}")
-    print(f"  Charging detection epsilon (default) : {ZERO_EPSILON}")
-    print("=" * 65 + "\n")
-
-    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
-    if not wide_files:
-        raise FileNotFoundError(
-            f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'. "
-            "Run battery_xgboost.py first."
-        )
-
-    all_threshold_rows   = []
-    cosine_rows          = []
-    discrimination_rows  = []   # Task A summary per device
-    detection_rows       = []   # Task B summary per device (default epsilon)
-    epsilon_sweep_rows    = []   # Task B sweep per device per epsilon
-    per_device_disc_stats = {}  # raw arrays, kept for the box-plot
-
-    for wf in wide_files:
-        device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
-        pred_path   = os.path.join(OUTPUT_FOLDER, f"final_predictions_{device_name}.csv")
-        plot_path   = os.path.join(OUTPUT_FOLDER, f"final_validation_plot_{device_name}.png")
-
-        print("=" * 65)
-        print(f"Device : {device_name}")
-        print("=" * 65)
-
-        try:
-            wide = pd.read_csv(wf, index_col="Date")
-            wide[DSOCDT_COLS] = wide[DSOCDT_COLS].clip(upper=0)
-
-            if len(wide) <= TRAIN_DAYS:
-                print(f"  Skipping: not enough days.\n")
-                continue
-
-            # Run model once — get raw predictions + cosine sim per day
-            results = run_predictions(wide, device_name)
-            if not results:
-                continue
-
-            # Save raw per-hour predictions CSV (includes cosine sim per day)
-            pred_rows = []
-            for r in results:
-                for h in HOURS:
-                    pred_rows.append({
-                        "predict_date"    : r["predict_date"],
-                        "train_start"     : r["train_start"],
-                        "train_end"       : r["train_end"],
-                        "hour"            : h,
-                        "actual_dSocdt"   : round(float(r["y_actual"][h]), 6),
-                        "pred_dSocdt"     : round(float(r["y_pred"][h]),   6),
-                        "abs_error"       : round(abs(float(r["y_actual"][h])
-                                                      - float(r["y_pred"][h])), 6),
-                        "daily_cosine_sim": r["cosine_sim"],
-                    })
-            pd.DataFrame(pred_rows).to_csv(pred_path, index=False)
-            print(f"\n  Raw predictions CSV  →  {pred_path}")
-
-            # Per-device plot — 6 actual-vs-predicted subplots (one per sampled day)
-            plot_device(results, device_name, plot_path, threshold=DEFAULT_PLOT_T)
-
-            # Threshold sweep
-            print(f"\n  Threshold sweep:")
-            for T in THRESHOLDS:
-                m = metrics_at_threshold(results, T)
-                print(f"    T={T:2d}  →  acc={m['mean_accuracy_%']:.2f}%  "
-                      f"mae={m['mean_mae']:.5f}  rmse={m['mean_rmse']:.5f}")
-                all_threshold_rows.append({
-                    "device"          : device_name,
-                    "threshold"       : T,
-                    "mean_accuracy_%" : m["mean_accuracy_%"],
-                    "mean_mae"        : m["mean_mae"],
-                    "mean_rmse"       : m["mean_rmse"],
-                    "n_estimators"    : BEST_PARAMS["n_estimators"],
-                    "max_depth"       : BEST_PARAMS["max_depth"],
-                    "learning_rate"   : BEST_PARAMS["learning_rate"],
-                    "subsample"       : BEST_PARAMS["subsample"],
-                })
-
-            # Cosine similarity
-            mean_cos = round(float(np.mean([r["cosine_sim"] for r in results])), 6)
-            min_cos  = round(float(np.min ([r["cosine_sim"] for r in results])), 6)
-            max_cos  = round(float(np.max ([r["cosine_sim"] for r in results])), 6)
-            print(f"\n  Cosine similarity — mean: {mean_cos:.4f}  "
-                  f"min: {min_cos:.4f}  max: {max_cos:.4f}")
-
-            cosine_rows.append({
-                "device"         : device_name,
-                "mean_cosine_sim": mean_cos,
-                "min_cosine_sim" : min_cos,
-                "max_cosine_sim" : max_cos,
-                "total_days"     : len(results),
-            })
-
-            # ── TASK A: Zero vs small-negative discrimination ────
-            disc_stats = charging_discrimination_stats(results)
-            per_device_disc_stats[device_name] = disc_stats
-            print(f"\n  [Task A] Charging vs mild-discharge discrimination:")
-            print(f"    Actual charging hours      : {disc_stats['n_actual_charging_hours']}")
-            print(f"    Actual mild-discharge hours: {disc_stats['n_actual_mild_discharge_hours']}")
-            if not np.isnan(disc_stats.get("separation_gap", np.nan)):
-                print(f"    Mean predicted (charging)  : {disc_stats['mean_pred_when_charging']:.4f}")
-                print(f"    Mean predicted (mild disch): {disc_stats['mean_pred_when_mild']:.4f}")
-                print(f"    Separation gap (absolute)   : {disc_stats['abs_separation_gap']:.4f}  "
-                      f"({'GOOD — model statistically distinguishes the two groups' if disc_stats['abs_separation_gap'] > 0.1 else 'WEAK — values overlap, model cannot tell them apart'})")
-                print(f"    Direction                   : {disc_stats['direction']}")
-            else:
-                print("    Not enough samples in one of the groups to compare.")
-
-            discrimination_rows.append({
-                "device"                        : device_name,
-                "n_actual_charging_hours"       : disc_stats["n_actual_charging_hours"],
-                "n_actual_mild_discharge_hours" : disc_stats["n_actual_mild_discharge_hours"],
-                "mean_pred_when_charging"       : disc_stats.get("mean_pred_when_charging", np.nan),
-                "std_pred_when_charging"        : disc_stats.get("std_pred_when_charging", np.nan),
-                "mean_pred_when_mild"           : disc_stats.get("mean_pred_when_mild", np.nan),
-                "std_pred_when_mild"            : disc_stats.get("std_pred_when_mild", np.nan),
-                "separation_gap"                : disc_stats.get("separation_gap", np.nan),
-                "abs_separation_gap"            : disc_stats.get("abs_separation_gap", np.nan),
-                "direction"                     : disc_stats.get("direction", "N/A"),
-            })
-
-            # ── TASK B: Charging event detection (precision/recall/F1) ──
-            det_stats = charging_event_detection_stats(results, epsilon=ZERO_EPSILON)
-            print(f"\n  [Task B] Charging event detection (epsilon={ZERO_EPSILON}):")
-            print(f"    Precision: {det_stats['precision']}  "
-                  f"Recall: {det_stats['recall']}  F1: {det_stats['f1_score']}")
-            print(f"    TP={det_stats['true_positive']}  FP={det_stats['false_positive']}  "
-                  f"TN={det_stats['true_negative']}  FN={det_stats['false_negative']}")
-
-            detection_rows.append({"device": device_name, **det_stats})
-
-            # Epsilon sweep for this device
-            for eps in ZERO_EPSILON_SWEEP:
-                sweep_stats = charging_event_detection_stats(results, epsilon=eps)
-                epsilon_sweep_rows.append({"device": device_name, **sweep_stats})
-
-        except Exception as e:
-            import traceback
-            print(f"  ERROR: {e}")
-            traceback.print_exc()
-
-        print()
-
-    # ── Save combined threshold summary CSV ──────────────────
-    threshold_df    = pd.DataFrame(all_threshold_rows)
-    all_thresh_path = os.path.join(OUTPUT_FOLDER, "final_summary_all_thresholds.csv")
-    threshold_df.to_csv(all_thresh_path, index=False)
-    print(f"All-threshold summary  →  {all_thresh_path}")
-
-    # ── Save cosine similarity summary CSV ───────────────────
-    cosine_df = pd.DataFrame(cosine_rows)
-    if not cosine_df.empty:
-        overall_cos = round(float(cosine_df["mean_cosine_sim"].mean()), 6)
-        cosine_df = pd.concat([
-            cosine_df,
-            pd.DataFrame([{
-                "device"         : "OVERALL_MEAN",
-                "mean_cosine_sim": overall_cos,
-                "min_cosine_sim" : round(float(cosine_df["min_cosine_sim"].min()), 6),
-                "max_cosine_sim" : round(float(cosine_df["max_cosine_sim"].max()), 6),
-                "total_days"     : cosine_df["total_days"].sum(),
-            }])
-        ], ignore_index=True)
-
-    cos_csv_path = os.path.join(OUTPUT_FOLDER, "cosine_similarity_summary.csv")
-    cosine_df.to_csv(cos_csv_path, index=False)
-    print(f"Cosine similarity summary  →  {cos_csv_path}")
-
-    # ── Save Task A discrimination summary CSV ───────────────
-    discrimination_df = pd.DataFrame(discrimination_rows)
-    if not discrimination_df.empty:
-        overall_gap = round(float(discrimination_df["separation_gap"].mean(skipna=True)), 6)
-        discrimination_df = pd.concat([
-            discrimination_df,
-            pd.DataFrame([{
-                "device"                        : "OVERALL_MEAN",
-                "n_actual_charging_hours"       : discrimination_df["n_actual_charging_hours"].sum(),
-                "n_actual_mild_discharge_hours" : discrimination_df["n_actual_mild_discharge_hours"].sum(),
-                "mean_pred_when_charging"       : round(float(discrimination_df["mean_pred_when_charging"].mean(skipna=True)), 6),
-                "std_pred_when_charging"        : np.nan,
-                "mean_pred_when_mild"           : round(float(discrimination_df["mean_pred_when_mild"].mean(skipna=True)), 6),
-                "std_pred_when_mild"            : np.nan,
-                "separation_gap"                : overall_gap,
-            }])
-        ], ignore_index=True)
-    disc_csv_path = os.path.join(OUTPUT_FOLDER, "charging_discrimination_summary.csv")
-    discrimination_df.to_csv(disc_csv_path, index=False)
-    print(f"Charging discrimination summary  →  {disc_csv_path}")
-
-    # ── Save Task B detection summary CSV ─────────────────────
-    detection_df = pd.DataFrame(detection_rows)
-    if not detection_df.empty:
-        detection_df = pd.concat([
-            detection_df,
-            pd.DataFrame([{
-                "device"                  : "OVERALL_MEAN",
-                "epsilon"                 : ZERO_EPSILON,
-                "n_actual_charging_hours" : detection_df["n_actual_charging_hours"].sum(),
-                "n_total_hours"           : detection_df["n_total_hours"].sum(),
-                "n_pred_charging_hours"   : detection_df["n_pred_charging_hours"].sum(),
-                "precision"               : round(float(detection_df["precision"].mean(skipna=True)), 4),
-                "recall"                  : round(float(detection_df["recall"].mean(skipna=True)), 4),
-                "f1_score"                 : round(float(detection_df["f1_score"].mean(skipna=True)), 4),
-                "true_positive"           : detection_df["true_positive"].sum(),
-                "false_positive"          : detection_df["false_positive"].sum(),
-                "true_negative"           : detection_df["true_negative"].sum(),
-                "false_negative"          : detection_df["false_negative"].sum(),
-            }])
-        ], ignore_index=True)
-    det_csv_path = os.path.join(OUTPUT_FOLDER, "charging_event_detection_summary.csv")
-    detection_df.to_csv(det_csv_path, index=False)
-    print(f"Charging event detection summary  →  {det_csv_path}")
-
-    # ── Save epsilon sweep CSV ─────────────────────────────────
-    sweep_df = pd.DataFrame(epsilon_sweep_rows)
-    sweep_csv_path = os.path.join(OUTPUT_FOLDER, "charging_zero_threshold_sweep.csv")
-    sweep_df.to_csv(sweep_csv_path, index=False)
-    print(f"Charging zero-threshold sweep  →  {sweep_csv_path}")
-
-    # ── Plots ─────────────────────────────────────────────────
-    plot_threshold_curve(threshold_df)
-    plot_cosine_summary(cosine_df)
-
-    if per_device_disc_stats:
-        plot_charging_discrimination(
-            per_device_disc_stats,
-            os.path.join(OUTPUT_FOLDER, "charging_discrimination_plot.png")
-        )
-
-    if not detection_df.empty:
-        plot_charging_event_detection(
-            detection_df,
-            os.path.join(OUTPUT_FOLDER, "charging_event_detection_plot.png")
-        )
-
-    if not sweep_df.empty:
-        plot_epsilon_sweep(
-            sweep_df,
-            os.path.join(OUTPUT_FOLDER, "charging_zero_threshold_sweep_plot.png")
-        )
-
-    # ── Final console summary ─────────────────────────────────
-    print("\n" + "=" * 65)
-    print("OVERALL MEAN ACCURACY PER THRESHOLD  (across all devices)")
-    print("=" * 65)
-    print(f"  {'Threshold':>10}  {'Mean Accuracy':>15}  {'Mean MAE':>12}  {'Mean RMSE':>12}")
-    print("  " + "─" * 55)
-    for T in THRESHOLDS:
-        t_df = threshold_df[threshold_df["threshold"] == T]
-        print(f"  {T:>10}  {t_df['mean_accuracy_%'].mean():>14.2f}%  "
-              f"{t_df['mean_mae'].mean():>12.5f}  "
-              f"{t_df['mean_rmse'].mean():>12.5f}")
-
-    print("\n" + "=" * 65)
-    print("COSINE SIMILARITY SUMMARY  (across all devices)")
-    print("=" * 65)
-    for _, row in cosine_df.iterrows():
-        print(f"  {row['device']:<35}  mean={row['mean_cosine_sim']:.4f}  "
-              f"min={row['min_cosine_sim']:.4f}  max={row['max_cosine_sim']:.4f}")
-
-    print("\n" + "=" * 65)
-    print("[Task A] CHARGING vs MILD-DISCHARGE DISCRIMINATION SUMMARY")
-    print("=" * 65)
-    print("  (abs_separation_gap > 0.1 means model statistically separates the two")
-    print("   groups; direction tells you whether the separation points the expected")
-    print("   way — charging closer to 0 — or is inverted.)")
-    for _, row in discrimination_df.iterrows():
-        gap = row["abs_separation_gap"]
-        gap_str = f"{gap:.4f}" if not pd.isna(gap) else "N/A"
-        direction = row.get("direction", "N/A")
-        print(f"  {row['device']:<35}  abs_gap={gap_str}  ({direction})")
-
-    print("\n" + "=" * 65)
-    print(f"[Task B] CHARGING EVENT DETECTION SUMMARY  (epsilon={ZERO_EPSILON})")
-    print("=" * 65)
-    for _, row in detection_df.iterrows():
-        print(f"  {row['device']:<35}  "
-              f"precision={row['precision']}  recall={row['recall']}  f1={row['f1_score']}")
-    print("=" * 65)
+    os.makedirs(R2, exist_ok=True)
+    build_pdf()
