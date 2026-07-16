@@ -1,25 +1,81 @@
-int ans=0;
-void f(node,adj,wt,val){
-    ans+=abs(wt[node]-val);
-    for(int child:adj[node]){
-        f(child,adj,wt,val+wt[node]-val);
-    }
-    return;
-}
-STAGE1_ROUNDS = 350   # bumped from 300 -> user found this reduced MAE 4.15 vs 4.55
+def run_device_walk_forward(wide, device_name):
+    X, y_event, y_bucket, y_actual_hour, dates = build_dataset(wide)
+    n_rows = len(X)
+    if n_rows < MIN_TRAIN_ROWS + 1:
+        print(f"  Skipping: only {n_rows} usable rows after feature warm-up.")
+        return []
 
-int main(){
-    int n;
-    cin>>n;
-    vector<int>wt(n);
-    for(int i=0;i<n;i++){
-        cin>>wt[i];
-        cin>>parent[i];
-        if(parent[i]==-1) root=i;
-        else{
-            adj[parent[i]].push_back(i);
+    train_window = min(TRAIN_WINDOW_DAYS, n_rows - 1)   # leave >=1 row to predict
+    train_window = max(MIN_TRAIN_ROWS, train_window)
+
+    results = []
+    cursor = train_window            # index of the first day we predict
+    n_retrains = 0
+    current_models = None
+
+    while cursor < n_rows:
+        chunk_end = min(cursor + RETRAIN_INTERVAL_DAYS, n_rows)
+
+        # Rolling window: most recent `train_window` rows strictly before `cursor`
+        train_start = max(0, cursor - train_window)
+        X_train = X[train_start:cursor]
+        y_event_train = y_event[train_start:cursor]
+        y_bucket_train = y_bucket[train_start:cursor]
+
+        trained = train_stage_models(X_train, y_event_train, y_bucket_train)
+        if trained is not None:
+            current_models = trained
+            n_retrains += 1
+        # if this window couldn't be trained (e.g. single class), we keep
+        # using the last successfully trained model rather than predicting
+        # blindly - same as a production system skipping a bad retrain
+
+        if current_models is not None:
+            booster1, booster2, fallback_bucket, event_threshold = current_models
+            X_chunk = X[cursor:chunk_end]
+            dchunk = xgb.DMatrix(X_chunk)
+            event_probs = booster1.predict(dchunk)
+
+            for local_idx in range(len(X_chunk)):
+                global_idx = cursor + local_idx
+                predicted_event = bool(event_probs[local_idx] >= event_threshold)
+                pred_peak = None
+                if predicted_event:
+                    if booster2 is not None:
+                        probs2 = booster2.predict(xgb.DMatrix(X_chunk[local_idx:local_idx + 1]))[0]
+                        pred_bucket = int(np.argmax(probs2))
+                    else:
+                        pred_bucket = fallback_bucket
+                    pred_peak = bucket_to_representative_hour(pred_bucket)
+
+                actual_val = y_actual_hour[global_idx]
+                actual_peak_out = None if np.isnan(actual_val) else float(actual_val)
+                error = (abs(actual_peak_out - pred_peak)
+                         if (actual_peak_out is not None and pred_peak is not None) else np.nan)
+
+                results.append({
+                    "predict_date": dates[global_idx], "actual_peak": actual_peak_out,
+                    "pred_peak": pred_peak, "error": error,
+                })
+
+        cursor = chunk_end
+
+    # Dump the final trained model's full hyperparameter/config JSON so it
+    # can be shared with the mentor for tuning review. Only the LAST
+    # successfully retrained model (most recent rolling window) is dumped,
+    # not every retrain along the walk-forward loop.
+    if current_models is not None:
+        booster1, booster2, fallback_bucket, event_threshold = current_models
+        config_path = os.path.join(OUTPUT_FOLDER, f"model_config_{device_name}.json")
+        dump = {
+            "stage1_event_classifier": json.loads(booster1.save_config()),
+            "stage2_bucket_classifier": json.loads(booster2.save_config()) if booster2 is not None else None,
+            "calibrated_event_threshold": event_threshold,
         }
-    }
+        with open(config_path, "w") as f:
+            json.dump(dump, f, indent=2)
+        print(f"  Model config dumped → {config_path}")
 
-    f(root,adj,wt,0);
-}
+    print(f"  Rows: {n_rows} total | rolling train window: {train_window} days | "
+          f"retrained {n_retrains}x every {RETRAIN_INTERVAL_DAYS} days | predicted {len(results)} days")
+    return results
