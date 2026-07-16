@@ -1,81 +1,189 @@
-def run_device_walk_forward(wide, device_name):
-    X, y_event, y_bucket, y_actual_hour, dates = build_dataset(wide)
-    n_rows = len(X)
-    if n_rows < MIN_TRAIN_ROWS + 1:
-        print(f"  Skipping: only {n_rows} usable rows after feature warm-up.")
-        return []
-
-    train_window = min(TRAIN_WINDOW_DAYS, n_rows - 1)   # leave >=1 row to predict
-    train_window = max(MIN_TRAIN_ROWS, train_window)
-
-    results = []
-    cursor = train_window            # index of the first day we predict
-    n_retrains = 0
-    current_models = None
-
-    while cursor < n_rows:
-        chunk_end = min(cursor + RETRAIN_INTERVAL_DAYS, n_rows)
-
-        # Rolling window: most recent `train_window` rows strictly before `cursor`
-        train_start = max(0, cursor - train_window)
-        X_train = X[train_start:cursor]
-        y_event_train = y_event[train_start:cursor]
-        y_bucket_train = y_bucket[train_start:cursor]
-
-        trained = train_stage_models(X_train, y_event_train, y_bucket_train)
-        if trained is not None:
-            current_models = trained
-            n_retrains += 1
-        # if this window couldn't be trained (e.g. single class), we keep
-        # using the last successfully trained model rather than predicting
-        # blindly - same as a production system skipping a bad retrain
-
-        if current_models is not None:
-            booster1, booster2, fallback_bucket, event_threshold = current_models
-            X_chunk = X[cursor:chunk_end]
-            dchunk = xgb.DMatrix(X_chunk)
-            event_probs = booster1.predict(dchunk)
-
-            for local_idx in range(len(X_chunk)):
-                global_idx = cursor + local_idx
-                predicted_event = bool(event_probs[local_idx] >= event_threshold)
-                pred_peak = None
-                if predicted_event:
-                    if booster2 is not None:
-                        probs2 = booster2.predict(xgb.DMatrix(X_chunk[local_idx:local_idx + 1]))[0]
-                        pred_bucket = int(np.argmax(probs2))
-                    else:
-                        pred_bucket = fallback_bucket
-                    pred_peak = bucket_to_representative_hour(pred_bucket)
-
-                actual_val = y_actual_hour[global_idx]
-                actual_peak_out = None if np.isnan(actual_val) else float(actual_val)
-                error = (abs(actual_peak_out - pred_peak)
-                         if (actual_peak_out is not None and pred_peak is not None) else np.nan)
-
-                results.append({
-                    "predict_date": dates[global_idx], "actual_peak": actual_peak_out,
-                    "pred_peak": pred_peak, "error": error,
-                })
-
-        cursor = chunk_end
-
-    # Dump the final trained model's full hyperparameter/config JSON so it
-    # can be shared with the mentor for tuning review. Only the LAST
-    # successfully retrained model (most recent rolling window) is dumped,
-    # not every retrain along the walk-forward loop.
-    if current_models is not None:
-        booster1, booster2, fallback_bucket, event_threshold = current_models
-        config_path = os.path.join(OUTPUT_FOLDER, f"model_config_{device_name}.json")
-        dump = {
-            "stage1_event_classifier": json.loads(booster1.save_config()),
-            "stage2_bucket_classifier": json.loads(booster2.save_config()) if booster2 is not None else None,
-            "calibrated_event_threshold": event_threshold,
+{
+  "stage1_event_classifier": {
+    "learner": {
+      "generic_param": {
+        "device": "cpu",
+        "fail_on_invalid_gpu_id": "0",
+        "n_jobs": "0",
+        "nthread": "0",
+        "random_state": "42",
+        "seed": "42",
+        "seed_per_iteration": "0",
+        "validate_parameters": "1"
+      },
+      "gradient_booster": {
+        "gbtree_model_param": {
+          "num_parallel_tree": "1",
+          "num_trees": "350"
+        },
+        "gbtree_train_param": {
+          "process_type": "default",
+          "tree_method": "auto",
+          "updater": "grow_quantile_histmaker",
+          "updater_seq": "grow_quantile_histmaker"
+        },
+        "name": "gbtree",
+        "specified_updater": false,
+        "tree_train_param": {
+          "alpha": "0",
+          "colsample_bylevel": "1",
+          "colsample_bynode": "1",
+          "colsample_bytree": "0.800000012",
+          "eta": "0.0799999982",
+          "gamma": "0",
+          "grow_policy": "depthwise",
+          "interaction_constraints": "",
+          "lambda": "1",
+          "learning_rate": "0.0799999982",
+          "max_bin": "256",
+          "max_cat_threshold": "64",
+          "max_cat_to_onehot": "4",
+          "max_delta_step": "0",
+          "max_depth": "3",
+          "max_leaves": "0",
+          "min_child_weight": "1",
+          "min_split_loss": "0",
+          "monotone_constraints": "()",
+          "refresh_leaf": "1",
+          "reg_alpha": "0",
+          "reg_lambda": "1",
+          "sampling_method": "uniform",
+          "sparse_threshold": "0.20000000000000001",
+          "subsample": "0.899999976"
+        },
+        "updater": [
+          {
+            "hist_train_param": {
+              "debug_synchronize": "0",
+              "max_cached_hist_node": "18446744073709551615"
+            },
+            "name": "grow_quantile_histmaker"
+          }
+        ]
+      },
+      "learner_model_param": {
+        "base_score": "[5E-1]",
+        "boost_from_average": "1",
+        "num_class": "0",
+        "num_feature": "12",
+        "num_target": "1"
+      },
+      "learner_train_param": {
+        "booster": "gbtree",
+        "disable_default_eval_metric": "0",
+        "multi_strategy": "one_output_per_tree",
+        "objective": "binary:logistic"
+      },
+      "metrics": [
+        {
+          "name": "logloss"
         }
-        with open(config_path, "w") as f:
-            json.dump(dump, f, indent=2)
-        print(f"  Model config dumped → {config_path}")
-
-    print(f"  Rows: {n_rows} total | rolling train window: {train_window} days | "
-          f"retrained {n_retrains}x every {RETRAIN_INTERVAL_DAYS} days | predicted {len(results)} days")
-    return results
+      ],
+      "objective": {
+        "name": "binary:logistic",
+        "reg_loss_param": {
+          "scale_pos_weight": "2.33333325"
+        }
+      }
+    },
+    "version": [
+      3,
+      2,
+      0
+    ]
+  },
+  "stage2_bucket_classifier": {
+    "learner": {
+      "generic_param": {
+        "device": "cpu",
+        "fail_on_invalid_gpu_id": "0",
+        "n_jobs": "0",
+        "nthread": "0",
+        "random_state": "42",
+        "seed": "42",
+        "seed_per_iteration": "0",
+        "validate_parameters": "1"
+      },
+      "gradient_booster": {
+        "gbtree_model_param": {
+          "num_parallel_tree": "1",
+          "num_trees": "2100"
+        },
+        "gbtree_train_param": {
+          "process_type": "default",
+          "tree_method": "auto",
+          "updater": "grow_quantile_histmaker",
+          "updater_seq": "grow_quantile_histmaker"
+        },
+        "name": "gbtree",
+        "specified_updater": false,
+        "tree_train_param": {
+          "alpha": "0",
+          "colsample_bylevel": "1",
+          "colsample_bynode": "1",
+          "colsample_bytree": "0.800000012",
+          "eta": "0.0799999982",
+          "gamma": "0",
+          "grow_policy": "depthwise",
+          "interaction_constraints": "",
+          "lambda": "1",
+          "learning_rate": "0.0799999982",
+          "max_bin": "256",
+          "max_cat_threshold": "64",
+          "max_cat_to_onehot": "4",
+          "max_delta_step": "0",
+          "max_depth": "3",
+          "max_leaves": "0",
+          "min_child_weight": "1",
+          "min_split_loss": "0",
+          "monotone_constraints": "()",
+          "refresh_leaf": "1",
+          "reg_alpha": "0",
+          "reg_lambda": "1",
+          "sampling_method": "uniform",
+          "sparse_threshold": "0.20000000000000001",
+          "subsample": "0.899999976"
+        },
+        "updater": [
+          {
+            "hist_train_param": {
+              "debug_synchronize": "0",
+              "max_cached_hist_node": "18446744073709551615"
+            },
+            "name": "grow_quantile_histmaker"
+          }
+        ]
+      },
+      "learner_model_param": {
+        "base_score": "[3.874835E0,-8.148922E0,3.4693727E0,-8.148922E0,3.874835E0,5.0788035E0]",
+        "boost_from_average": "1",
+        "num_class": "6",
+        "num_feature": "12",
+        "num_target": "1"
+      },
+      "learner_train_param": {
+        "booster": "gbtree",
+        "disable_default_eval_metric": "0",
+        "multi_strategy": "one_output_per_tree",
+        "objective": "multi:softprob"
+      },
+      "metrics": [
+        {
+          "name": "mlogloss"
+        }
+      ],
+      "objective": {
+        "name": "multi:softprob",
+        "softmax_multiclass_param": {
+          "num_class": "6"
+        }
+      }
+    },
+    "version": [
+      3,
+      2,
+      0
+    ]
+  },
+  "calibrated_event_threshold": 0.2
+}
