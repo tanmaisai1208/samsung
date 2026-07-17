@@ -1,3 +1,5 @@
+SHAPE_PARAMS = {"reg_lambda": 10, "reg_alpha": 0.1, "min_split_loss": 0.1, "min_child_weight": 1, "colsample_bytree": 0.8}
+
 """
 Battery Management - Final Combined Validation with Best Hyperparameters
 ======================================================================================
@@ -42,33 +44,6 @@ BEST_PARAMS = {
     "random_state"   : 42,
     "verbosity"      : 0,
 }
-
-# ─────────────────────────────────────────────────────────────
-# SEQUENTIAL SHAPE-TUNING (new params, tuned against cosine similarity)
-# ─────────────────────────────────────────────────────────────
-# n_estimators/max_depth/learning_rate/subsample are already tuned (above)
-# and are NOT touched here. These are untested params relevant to shape
-# matching specifically. Set TUNE_MODE=True and TUNE_PARAM to the ONE
-# parameter you're currently testing - only that param is swept, all
-# others stay fixed at BEST_PARAMS (plus any SHAPE_PARAMS already
-# finalized from a previous round). Once you find the best value, add it
-# to SHAPE_PARAMS below, move TUNE_PARAM to the next parameter, and
-# re-run. Set TUNE_MODE=False to skip sweeping and run the normal full
-# validation pipeline using BEST_PARAMS + SHAPE_PARAMS as-is.
-TUNE_MODE  = True
-TUNE_PARAM = "reg_lambda"   # change this once the current param is finalized
-
-PARAM_CANDIDATES = {
-    "reg_lambda"      : [0, 0.1, 0.5, 1, 2, 5, 10],
-    "reg_alpha"       : [0, 0.1, 0.5, 1, 2, 5],
-    "min_split_loss"  : [0, 0.1, 0.5, 1, 2, 5],
-    "min_child_weight": [1, 3, 5, 7, 10],
-    "colsample_bytree": [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-}
-
-# Params already finalized from previous sweep rounds go here, e.g.
-# once reg_lambda is decided: SHAPE_PARAMS = {"reg_lambda": 0.1}
-SHAPE_PARAMS = {}
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -139,21 +114,16 @@ def cosine_similarity(actual, predicted):
 # DAILY ROLLING PREDICTION  (runs once per device)
 # ─────────────────────────────────────────────────────────────
 
-def run_predictions(wide, device_name, params=None):
+def run_predictions(wide, device_name):
     """
     Returns list of per-day dicts with raw y_actual, y_pred, MAE, RMSE,
     and cosine similarity. Handles NaN values gracefully.
-    `params` overrides BEST_PARAMS when doing a sweep (see run_param_sweep);
-    defaults to BEST_PARAMS + SHAPE_PARAMS for normal full-pipeline runs.
     """
-    if params is None:
-        params = dict(BEST_PARAMS, **SHAPE_PARAMS)
-
     n_days  = len(wide)
     results = []
 
     model = MultiOutputRegressor(
-        XGBRegressor(**params),
+        XGBRegressor(**BEST_PARAMS),
         n_jobs=-1
     )
 
@@ -226,64 +196,6 @@ def run_predictions(wide, device_name, params=None):
                   f"| {predict_date} | MAE: {mae if not np.isnan(mae) else 'nan'} | CosSim: {cos_sim if not np.isnan(cos_sim) else 'nan'}")
 
     return results
-
-# ─────────────────────────────────────────────────────────────
-# SINGLE-PARAMETER SWEEP (shape-tuning mode)
-# ─────────────────────────────────────────────────────────────
-
-def run_param_sweep(wide_files):
-    """
-    Sweeps ONLY TUNE_PARAM across PARAM_CANDIDATES[TUNE_PARAM], holding
-    every other param fixed at BEST_PARAMS + SHAPE_PARAMS. For each
-    candidate value, runs the full rolling-window prediction across every
-    device and computes the mean cosine similarity (the shape-matching
-    metric, not MAE) across all devices. Prints a ranked table so you can
-    pick the best value, then add it to SHAPE_PARAMS and move to the next
-    parameter - same coordinate-wise flow as the original hypersearch.
-    """
-    candidates = PARAM_CANDIDATES[TUNE_PARAM]
-    print("=" * 65)
-    print(f"SHAPE-TUNING SWEEP — parameter: {TUNE_PARAM}")
-    print(f"Candidates: {candidates}")
-    print(f"Fixed params: {dict(BEST_PARAMS, **SHAPE_PARAMS)}")
-    print("=" * 65 + "\n")
-
-    sweep_rows = []
-
-    for candidate in candidates:
-        params = dict(BEST_PARAMS, **SHAPE_PARAMS)
-        params[TUNE_PARAM] = candidate
-
-        print(f"\n--- {TUNE_PARAM} = {candidate} ---")
-        all_cos = []
-        for wf in wide_files:
-            device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
-            wide = pd.read_csv(wf, index_col="Date")
-            if len(wide) <= TRAIN_DAYS:
-                continue
-            results = run_predictions(wide, device_name, params=params)
-            valid_cos = [r["cosine_sim"] for r in results if not np.isnan(r["cosine_sim"])]
-            if valid_cos:
-                dev_mean_cos = float(np.mean(valid_cos))
-                all_cos.append(dev_mean_cos)
-                print(f"  {device_name:<40} mean_cos={dev_mean_cos:.4f}")
-
-        overall_mean_cos = round(float(np.mean(all_cos)), 6) if all_cos else np.nan
-        print(f"  → Overall mean cosine similarity: {overall_mean_cos}")
-        sweep_rows.append({TUNE_PARAM: candidate, "overall_mean_cosine_sim": overall_mean_cos})
-
-    sweep_df = pd.DataFrame(sweep_rows).sort_values("overall_mean_cosine_sim", ascending=False)
-    sweep_path = os.path.join(OUTPUT_FOLDER, f"shape_sweep_{TUNE_PARAM}.csv")
-    sweep_df.to_csv(sweep_path, index=False)
-
-    print("\n" + "=" * 65)
-    print(f"RANKED RESULTS — {TUNE_PARAM} (best cosine similarity first)")
-    print("=" * 65)
-    print(sweep_df.to_string(index=False))
-    print(f"\nSaved  →  {sweep_path}")
-    print(f"\nOnce you've picked a value, add it to SHAPE_PARAMS, set "
-          f"TUNE_PARAM to the next parameter, and re-run.")
-    print("=" * 65)
 
 # ─────────────────────────────────────────────────────────────
 # METRICS
@@ -489,27 +401,21 @@ def plot_threshold_curve(threshold_summary_df):
 
 if __name__ == "__main__":
 
+    print("=" * 65)
+    print("FINAL COMBINED VALIDATION — BEST HYPERPARAMETERS")
+    print("=" * 65)
+    for k, v in BEST_PARAMS.items():
+        if k not in ("random_state", "verbosity"):
+            print(f"  {k:20s} = {v}")
+    print(f"\n  Thresholds evaluated : {THRESHOLDS}")
+    print("=" * 65 + "\n")
+
     wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
     if not wide_files:
         raise FileNotFoundError(
             f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'. "
             "Run battery_xgboost.py first."
         )
-
-    if TUNE_MODE:
-        run_param_sweep(wide_files)
-        raise SystemExit(0)
-
-    RUN_PARAMS = dict(BEST_PARAMS, **SHAPE_PARAMS)
-
-    print("=" * 65)
-    print("FINAL COMBINED VALIDATION — BEST HYPERPARAMETERS")
-    print("=" * 65)
-    for k, v in RUN_PARAMS.items():
-        if k not in ("random_state", "verbosity"):
-            print(f"  {k:20s} = {v}")
-    print(f"\n  Thresholds evaluated : {THRESHOLDS}")
-    print("=" * 65 + "\n")
 
     all_threshold_rows = []
     cosine_rows = []
@@ -532,7 +438,7 @@ if __name__ == "__main__":
                 continue
 
             # Run model once — get raw predictions + cosine sim per day
-            results = run_predictions(wide, device_name, params=RUN_PARAMS)
+            results = run_predictions(wide, device_name)
             if not results:
                 continue
 
@@ -568,10 +474,10 @@ if __name__ == "__main__":
                     "mean_accuracy_%" : m["mean_accuracy_%"],
                     "mean_mae"        : m["mean_mae"],
                     "mean_rmse"       : m["mean_rmse"],
-                    "n_estimators"    : RUN_PARAMS["n_estimators"],
-                    "max_depth"       : RUN_PARAMS["max_depth"],
-                    "learning_rate"   : RUN_PARAMS["learning_rate"],
-                    "subsample"       : RUN_PARAMS["subsample"],
+                    "n_estimators"    : BEST_PARAMS["n_estimators"],
+                    "max_depth"       : BEST_PARAMS["max_depth"],
+                    "learning_rate"   : BEST_PARAMS["learning_rate"],
+                    "subsample"       : BEST_PARAMS["subsample"],
                 })
 
                 # Cosine similarity summary per device
