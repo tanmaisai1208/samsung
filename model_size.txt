@@ -74,103 +74,85 @@ DSOCDT_COLS     = [f"dSocdt_h{h}" for h in HOURS]
 SOC_COLS        = [f"Soc_h{h}"    for h in HOURS]
 
 # ─────────────────────────────────────────────────────────────
-# COMPACT 12-FEATURE ENGINEERING (same feature design as
-# xgboost_charging_schedule.py's compact features) — REPLACES the old
-# 728-raw-feature block (24 dSocdt + 24 Soc + 4 date, x14 days). The
-# rolling 14-day train / 1-day test window loop is UNCHANGED; only what
-# each row's feature vector contains has changed. All 12 features below
-# are computed causally, using only days strictly inside the current
+# COMPACT 12-FEATURE ENGINEERING (trajectory-specific, NOT copied from
+# charging_schedule.py's event/bucket features — those don't map onto
+# predicting a full 24-hour shape). REPLACES the old 728-raw-feature
+# block (24 dSocdt + 24 Soc + 4 date, x14 days). The rolling 14-day
+# train / 1-day test window loop is UNCHANGED; only what each row's
+# feature vector contains has changed. All features are computed
+# causally, using only days strictly inside the current
 # [train_start, predict_day_idx) window - never crossing outside it, to
 # keep the same "14 days of context per window" boundary as before.
+# No peak-hour detection, no charging-event concept, no bucketing -
+# those were specific to the charging-schedule use case.
 # ─────────────────────────────────────────────────────────────
-BUCKET_SIZE = 4   # kept only for feature-parity with charging_schedule; not used for bucketing here
-MIN_HOURLY_RISE_ACTUAL = 0.0095   # same "significant rise" definition used in charging_schedule.py
 ROLL_SHORT = 3
 ROLL_LONG  = 7
-EVENT_HISTORY_LOOKBACK = 10
 N_COMPACT_FEATS = 12
 
 
-def find_top_peak_hour(dsocdt_24h, min_hourly_rise):
-    """Largest-total-rise contiguous run -> representative hour (0-23), or -1 if none."""
-    n = len(dsocdt_24h)
-    runs, i = [], 0
-    while i < n:
-        v = dsocdt_24h[i]
-        if not np.isnan(v) and v > min_hourly_rise:
-            run_hours, run_vals = [i], [v]
-            j = i + 1
-            while j < n and not np.isnan(dsocdt_24h[j]) and dsocdt_24h[j] > min_hourly_rise:
-                run_hours.append(j); run_vals.append(dsocdt_24h[j]); j += 1
-            total_rise = float(np.sum(run_vals)) * 60
-            weighted_hour = float(np.average(run_hours, weights=run_vals))
-            runs.append((total_rise, weighted_hour))
-            i = j
-        else:
-            i += 1
-    if not runs:
-        return -1
-    return int(round(max(runs, key=lambda x: x[0])[1]))
-
-
 def precompute_window_summaries(wide, window_start, window_end):
-    """One pass over just this window's days (bounded, same as before):
-    per-day peak hour, max dSocdt, min SoC, end-of-day SoC."""
+    """One pass over just this window's days: per-day total discharge
+    magnitude (sum of |dSocdt| over negative/discharging hours), mean
+    SoC across the day, end-of-day SoC, and max hourly |dSocdt| (peak
+    intensity, no event/threshold logic involved)."""
     idxs = list(range(window_start, window_end))
-    peak_hour = {}
-    day_max_dsocdt = {}
-    day_min_soc = {}
+    day_total_discharge = {}
+    day_mean_soc = {}
     day_end_soc = {}
+    day_max_abs_dsocdt = {}
+    day_dow = {}
     for i in idxs:
         dsocdt = wide.iloc[i][DSOCDT_COLS].values.astype(float)
         soc = wide.iloc[i][SOC_COLS].values.astype(float)
-        peak_hour[i] = find_top_peak_hour(dsocdt, MIN_HOURLY_RISE_ACTUAL)
-        day_max_dsocdt[i] = np.nanmax(dsocdt) if not np.all(np.isnan(dsocdt)) else np.nan
+        neg_vals = dsocdt[(~np.isnan(dsocdt)) & (dsocdt < 0)]
+        day_total_discharge[i] = float(np.sum(np.abs(neg_vals))) if len(neg_vals) else np.nan
+        day_mean_soc[i] = float(np.nanmean(soc)) if not np.all(np.isnan(soc)) else np.nan
         if not np.all(np.isnan(soc)):
-            day_min_soc[i] = np.nanmin(soc)
             valid = soc[~np.isnan(soc)]
             day_end_soc[i] = valid[-1] if len(valid) else np.nan
         else:
-            day_min_soc[i] = np.nan
             day_end_soc[i] = np.nan
-    return peak_hour, day_max_dsocdt, day_min_soc, day_end_soc
+        day_max_abs_dsocdt[i] = float(np.nanmax(np.abs(dsocdt))) if not np.all(np.isnan(dsocdt)) else np.nan
+        day_dow[i] = pd.Timestamp(wide.index[i]).dayofweek
+    return day_total_discharge, day_mean_soc, day_end_soc, day_max_abs_dsocdt, day_dow
 
 
 def compact_feats_for_day(wide, day_idx, window_start, summaries):
     """12 causal compact features for `day_idx`, using only days in
     [window_start, day_idx) - i.e. history strictly before this day, and
     never outside the current rolling window."""
-    peak_hour, day_max_dsocdt, day_min_soc, day_end_soc = summaries
+    day_total_discharge, day_mean_soc, day_end_soc, day_max_abs_dsocdt, day_dow = summaries
     ts = pd.Timestamp(wide.index[day_idx])
     dow, dom, month, year = float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)
 
-    days_since_event, last_event_hour = float(day_idx - window_start), 12.0
-    for back in range(1, day_idx - window_start + 1):
-        j = day_idx - back
-        if j < window_start:
-            break
-        if peak_hour.get(j, -1) != -1:
-            days_since_event = float(back)
-            last_event_hour = float(peak_hour[j])
-            break
+    prev_idx = day_idx - 1
+    yesterday_total_discharge = day_total_discharge.get(prev_idx, np.nan)
+    yesterday_total_discharge = float(yesterday_total_discharge) if prev_idx >= window_start and not np.isnan(yesterday_total_discharge) else 0.0
+    yesterday_mean_soc = day_mean_soc.get(prev_idx, np.nan)
+    yesterday_mean_soc = float(yesterday_mean_soc) if prev_idx >= window_start and not np.isnan(yesterday_mean_soc) else 50.0
+    yesterday_end_soc = day_end_soc.get(prev_idx, np.nan)
+    yesterday_end_soc = float(yesterday_end_soc) if prev_idx >= window_start and not np.isnan(yesterday_end_soc) else 50.0
+    yesterday_max_abs_dsocdt = day_max_abs_dsocdt.get(prev_idx, np.nan)
+    yesterday_max_abs_dsocdt = float(yesterday_max_abs_dsocdt) if prev_idx >= window_start and not np.isnan(yesterday_max_abs_dsocdt) else 0.0
 
     short_start = max(window_start, day_idx - ROLL_SHORT)
     long_start  = max(window_start, day_idx - ROLL_LONG)
-    short_vals = [day_max_dsocdt[j] for j in range(short_start, day_idx) if not np.isnan(day_max_dsocdt.get(j, np.nan))]
-    long_vals  = [day_max_dsocdt[j] for j in range(long_start, day_idx) if not np.isnan(day_max_dsocdt.get(j, np.nan))]
+    short_vals = [day_total_discharge[j] for j in range(short_start, day_idx) if not np.isnan(day_total_discharge.get(j, np.nan))]
+    long_vals  = [day_total_discharge[j] for j in range(long_start, day_idx) if not np.isnan(day_total_discharge.get(j, np.nan))]
     roll_mean_3 = float(np.mean(short_vals)) if short_vals else 0.0
     roll_mean_7 = float(np.mean(long_vals)) if long_vals else 0.0
     roll_std_7  = float(np.std(long_vals)) if long_vals else 0.0
 
-    past_event_hours = [peak_hour[j] for j in range(window_start, day_idx) if peak_hour.get(j, -1) != -1][-EVENT_HISTORY_LOOKBACK:]
-    mean_event_hour = float(np.mean(past_event_hours)) if past_event_hours else 12.0
+    # Habit feature: mean total discharge on prior occurrences of this
+    # same weekday within the window (no charging-event concept involved)
+    same_weekday_vals = [day_total_discharge[j] for j in range(window_start, day_idx)
+                          if day_dow.get(j) == int(dow) and not np.isnan(day_total_discharge.get(j, np.nan))]
+    same_weekday_mean_discharge = float(np.mean(same_weekday_vals)) if same_weekday_vals else roll_mean_7
 
-    prev_idx = day_idx - 1
-    y_min_soc = float(day_min_soc[prev_idx]) if prev_idx >= window_start and not np.isnan(day_min_soc.get(prev_idx, np.nan)) else 50.0
-    y_end_soc = float(day_end_soc[prev_idx]) if prev_idx >= window_start and not np.isnan(day_end_soc.get(prev_idx, np.nan)) else 50.0
-
-    return [dow, dom, month, year, days_since_event, last_event_hour,
-            roll_mean_3, roll_mean_7, roll_std_7, mean_event_hour, y_min_soc, y_end_soc]
+    return [dow, dom, month, year,
+            yesterday_total_discharge, yesterday_mean_soc, yesterday_end_soc, yesterday_max_abs_dsocdt,
+            roll_mean_3, roll_mean_7, roll_std_7, same_weekday_mean_discharge]
 
 
 def accuracy_at_threshold(actual, predicted, threshold):
