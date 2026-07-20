@@ -39,7 +39,6 @@ prior versions, so generate_report.py needs no changes:
 
 import os
 import glob
-import json
 import warnings
 import numpy as np
 import pandas as pd
@@ -92,6 +91,35 @@ STAGE2_ROUNDS = 350
 EVENT_THRESHOLD = 0.5
 THRESHOLD_CANDIDATES = np.round(np.arange(0.15, 0.86, 0.05), 2)
 
+# ─────────────────────────────────────────────────────────────
+# SEQUENTIAL MAE-TUNING (new regularization params, applied to BOTH
+# Stage 1 and Stage 2 identically, tuned against overall MAE hours)
+# ─────────────────────────────────────────────────────────────
+# max_depth/eta/subsample/colsample_bytree above are treated as the
+# current working baseline and are NOT touched here. These are untested
+# regularization params. Set TUNE_MODE=True and TUNE_PARAM to the ONE
+# parameter you're testing - only that param is swept (on both stages at
+# once), all others stay fixed at their defaults + whatever is already
+# in SHAPE_PARAMS. Runs the FULL walk-forward simulation per candidate
+# value (since MAE, unlike cosine similarity, can only be measured that
+# way) and ranks candidates by lowest overall MAE across all devices.
+# Once you find the best value, add it to SHAPE_PARAMS, move TUNE_PARAM
+# to the next parameter, and re-run. Set TUNE_MODE=False to run the
+# normal full walk-forward pipeline using SHAPE_PARAMS as-is.
+TUNE_MODE  = True
+TUNE_PARAM = "reg_lambda"   # change this once the current param is finalized
+
+PARAM_CANDIDATES = {
+    "reg_lambda"      : [0, 0.1, 0.5, 1, 2, 5, 10],
+    "reg_alpha"       : [0, 0.1, 0.5, 1, 2, 5],
+    "min_split_loss"  : [0, 0.1, 0.5, 1, 2, 5],
+    "min_child_weight": [1, 3, 5, 7, 10],
+}
+
+# Params already finalized from previous sweep rounds go here, e.g.
+# once reg_lambda is decided: SHAPE_PARAMS = {"reg_lambda": 2}
+SHAPE_PARAMS = {}
+
 WIDE_CSV_FOLDER = "results/wide_csv"
 OUTPUT_FOLDER   = "results/xgboost/charging_schedule"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -113,7 +141,7 @@ EVENT_HISTORY_LOOKBACK = 10
 # not derived from dividing an unknown total. Offline testing showed ~75%
 # of a ~70-75 day dataset (~56 days) worked well; rounded to 50 as the
 # fixed deployment window.
-TRAIN_WINDOW_DAYS     = 60    # fixed size, rolls forward - does NOT scale with dataset length
+TRAIN_WINDOW_DAYS     = 50    # fixed size, rolls forward - does NOT scale with dataset length
 RETRAIN_INTERVAL_DAYS = 7     # slide + retrain every N predicted days ("weekly retrain")
 MIN_TRAIN_ROWS        = 8     # don't attempt to train on fewer rows than this
 
@@ -237,13 +265,15 @@ def calibrate_event_threshold(booster1, X_train, y_event_train):
 def train_stage_models(X_train, y_event_train, y_bucket_train):
     """Train Stage 1 + Stage 2 on one rolling window. Returns (booster1,
     booster2_or_None, fallback_bucket, calibrated_threshold) or None if
-    the window can't support training (e.g. only one class present)."""
+    the window can't support training (e.g. only one class present).
+    SHAPE_PARAMS (regularization overrides from the sweep) are merged
+    into both stages' params identically."""
     n_event, n_no_event = int(y_event_train.sum()), int((y_event_train == 0).sum())
     if n_event == 0 or n_no_event == 0 or len(X_train) < MIN_TRAIN_ROWS:
         return None
 
     scale_pos_weight = n_no_event / n_event
-    stage1_params = dict(STAGE1_PARAMS, scale_pos_weight=scale_pos_weight)
+    stage1_params = dict(STAGE1_PARAMS, **SHAPE_PARAMS, scale_pos_weight=scale_pos_weight)
     dtrain1 = xgb.DMatrix(X_train, label=y_event_train)
     booster1 = xgb.train(stage1_params, dtrain1, num_boost_round=STAGE1_ROUNDS)
     calibrated_threshold = calibrate_event_threshold(booster1, X_train, y_event_train)
@@ -254,10 +284,12 @@ def train_stage_models(X_train, y_event_train, y_bucket_train):
     booster2 = None
     fallback_bucket = int(pd.Series(y_bucket_event_train).mode()[0]) if len(y_bucket_event_train) else 0
     if len(X_event_train) >= 2 and len(set(y_bucket_event_train.tolist())) >= 2:
+        stage2_params = dict(STAGE2_PARAMS, **SHAPE_PARAMS)
         dtrain2 = xgb.DMatrix(X_event_train, label=y_bucket_event_train)
-        booster2 = xgb.train(STAGE2_PARAMS, dtrain2, num_boost_round=STAGE2_ROUNDS)
+        booster2 = xgb.train(stage2_params, dtrain2, num_boost_round=STAGE2_ROUNDS)
 
     return booster1, booster2, fallback_bucket, calibrated_threshold
+
 
 def run_device_walk_forward(wide, device_name):
     X, y_event, y_bucket, y_actual_hour, dates = build_dataset(wide)
@@ -321,24 +353,10 @@ def run_device_walk_forward(wide, device_name):
 
         cursor = chunk_end
 
-    # Dump the final trained model's full hyperparameter/config JSON so it
-    # Only the LAST successfully retrained model (most recent rolling window) is dumped,
-    # not every retrain along the walk-forward loop.
-    if current_models is not None:
-        booster1, booster2, fallback_bucket, event_threshold = current_models
-        config_path = os.path.join(OUTPUT_FOLDER, f"model_config_{device_name}.json")
-        dump = {
-            "stage1_event_classifier": json.loads(booster1.save_config()),
-            "stage2_bucket_classifier": json.loads(booster2.save_config()) if booster2 is not None else None,
-            "calibrated_event_threshold": event_threshold,
-        }
-        with open(config_path, "w") as f:
-            json.dump(dump, f, indent=2)
-        print(f"  Model config dumped → {config_path}")
-
     print(f"  Rows: {n_rows} total | rolling train window: {train_window} days | "
           f"retrained {n_retrains}x every {RETRAIN_INTERVAL_DAYS} days | predicted {len(results)} days")
     return results
+
 
 def plot_mae_per_device(summary_df, plot_path):
     dev_data = summary_df[summary_df["device"] != "OVERALL_MEAN"]
@@ -394,7 +412,71 @@ def plot_sample_days(results, wide, device_name, plot_path, n_samples=6):
     print(f"  Saved: {plot_path}")
 
 
+def run_param_sweep(wide_files):
+    """
+    Sweeps ONLY TUNE_PARAM across PARAM_CANDIDATES[TUNE_PARAM], holding
+    everything else fixed. Runs the FULL walk-forward simulation for
+    every device at each candidate value (MAE can only be measured this
+    way, unlike cosine similarity in the trajectory model) and ranks
+    candidates by lowest overall MAE across all devices.
+    """
+    global SHAPE_PARAMS
+    candidates = PARAM_CANDIDATES[TUNE_PARAM]
+    print("=" * 65)
+    print(f"MAE-TUNING SWEEP — parameter: {TUNE_PARAM}")
+    print(f"Candidates: {candidates}")
+    print("=" * 65 + "\n")
+
+    sweep_rows = []
+    base_shape_params = dict(SHAPE_PARAMS)  # whatever was already finalized
+
+    for candidate in candidates:
+        SHAPE_PARAMS = dict(base_shape_params)
+        SHAPE_PARAMS[TUNE_PARAM] = candidate
+        print(f"\n--- {TUNE_PARAM} = {candidate} ---")
+
+        device_maes = []
+        for wf in wide_files:
+            device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
+            wide = pd.read_csv(wf, index_col="Date")
+            results = run_device_walk_forward(wide, device_name)
+            if not results:
+                continue
+            errors = [r["error"] for r in results if not pd.isna(r["error"])]
+            if errors:
+                dev_mae = float(np.mean(errors))
+                device_maes.append(dev_mae)
+                print(f"  {device_name:<40} MAE={dev_mae:.3f} hrs")
+
+        overall_mae = round(float(np.mean(device_maes)), 4) if device_maes else np.nan
+        print(f"  → Overall mean MAE: {overall_mae}")
+        sweep_rows.append({TUNE_PARAM: candidate, "overall_mae_hours": overall_mae})
+
+    SHAPE_PARAMS = base_shape_params  # restore - don't leave sweep state active
+
+    sweep_df = pd.DataFrame(sweep_rows).sort_values("overall_mae_hours", ascending=True)
+    sweep_path = os.path.join(OUTPUT_FOLDER, f"mae_sweep_{TUNE_PARAM}.csv")
+    sweep_df.to_csv(sweep_path, index=False)
+
+    print("\n" + "=" * 65)
+    print(f"RANKED RESULTS — {TUNE_PARAM} (lowest MAE first)")
+    print("=" * 65)
+    print(sweep_df.to_string(index=False))
+    print(f"\nSaved  →  {sweep_path}")
+    print(f"\nOnce you've picked a value, add it to SHAPE_PARAMS, set "
+          f"TUNE_PARAM to the next parameter, and re-run.")
+    print("=" * 65)
+
+
 if __name__ == "__main__":
+    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
+    if not wide_files:
+        raise FileNotFoundError(f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'.")
+
+    if TUNE_MODE:
+        run_param_sweep(wide_files)
+        raise SystemExit(0)
+
     print("=" * 65)
     print("CHARGING SCHEDULE PREDICTION — WALK-FORWARD ROLLING RETRAIN (v5)")
     print("=" * 65)
@@ -404,11 +486,8 @@ if __name__ == "__main__":
     print(f"  Retrain interval                         : every {RETRAIN_INTERVAL_DAYS} days")
     print(f"  Event probability threshold              : calibrated per window (F1-optimal on train)")
     print(f"  Stage rounds                              : {STAGE1_ROUNDS} / {STAGE2_ROUNDS}")
+    print(f"  Shape params                              : {SHAPE_PARAMS}")
     print("=" * 65 + "\n")
-
-    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
-    if not wide_files:
-        raise FileNotFoundError(f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'.")
 
     all_summary_rows = []
 
