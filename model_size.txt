@@ -1,189 +1,472 @@
-{
-  "stage1_event_classifier": {
-    "learner": {
-      "generic_param": {
-        "device": "cpu",
-        "fail_on_invalid_gpu_id": "0",
-        "n_jobs": "0",
-        "nthread": "0",
-        "random_state": "42",
-        "seed": "42",
-        "seed_per_iteration": "0",
-        "validate_parameters": "1"
-      },
-      "gradient_booster": {
-        "gbtree_model_param": {
-          "num_parallel_tree": "1",
-          "num_trees": "350"
-        },
-        "gbtree_train_param": {
-          "process_type": "default",
-          "tree_method": "auto",
-          "updater": "grow_quantile_histmaker",
-          "updater_seq": "grow_quantile_histmaker"
-        },
-        "name": "gbtree",
-        "specified_updater": false,
-        "tree_train_param": {
-          "alpha": "0",
-          "colsample_bylevel": "1",
-          "colsample_bynode": "1",
-          "colsample_bytree": "0.800000012",
-          "eta": "0.0799999982",
-          "gamma": "0",
-          "grow_policy": "depthwise",
-          "interaction_constraints": "",
-          "lambda": "1",
-          "learning_rate": "0.0799999982",
-          "max_bin": "256",
-          "max_cat_threshold": "64",
-          "max_cat_to_onehot": "4",
-          "max_delta_step": "0",
-          "max_depth": "3",
-          "max_leaves": "0",
-          "min_child_weight": "1",
-          "min_split_loss": "0",
-          "monotone_constraints": "()",
-          "refresh_leaf": "1",
-          "reg_alpha": "0",
-          "reg_lambda": "1",
-          "sampling_method": "uniform",
-          "sparse_threshold": "0.20000000000000001",
-          "subsample": "0.899999976"
-        },
-        "updater": [
-          {
-            "hist_train_param": {
-              "debug_synchronize": "0",
-              "max_cached_hist_node": "18446744073709551615"
-            },
-            "name": "grow_quantile_histmaker"
-          }
-        ]
-      },
-      "learner_model_param": {
-        "base_score": "[5E-1]",
-        "boost_from_average": "1",
-        "num_class": "0",
-        "num_feature": "12",
-        "num_target": "1"
-      },
-      "learner_train_param": {
-        "booster": "gbtree",
-        "disable_default_eval_metric": "0",
-        "multi_strategy": "one_output_per_tree",
-        "objective": "binary:logistic"
-      },
-      "metrics": [
-        {
-          "name": "logloss"
-        }
-      ],
-      "objective": {
-        "name": "binary:logistic",
-        "reg_loss_param": {
-          "scale_pos_weight": "2.33333325"
-        }
-      }
-    },
-    "version": [
-      3,
-      2,
-      0
-    ]
-  },
-  "stage2_bucket_classifier": {
-    "learner": {
-      "generic_param": {
-        "device": "cpu",
-        "fail_on_invalid_gpu_id": "0",
-        "n_jobs": "0",
-        "nthread": "0",
-        "random_state": "42",
-        "seed": "42",
-        "seed_per_iteration": "0",
-        "validate_parameters": "1"
-      },
-      "gradient_booster": {
-        "gbtree_model_param": {
-          "num_parallel_tree": "1",
-          "num_trees": "2100"
-        },
-        "gbtree_train_param": {
-          "process_type": "default",
-          "tree_method": "auto",
-          "updater": "grow_quantile_histmaker",
-          "updater_seq": "grow_quantile_histmaker"
-        },
-        "name": "gbtree",
-        "specified_updater": false,
-        "tree_train_param": {
-          "alpha": "0",
-          "colsample_bylevel": "1",
-          "colsample_bynode": "1",
-          "colsample_bytree": "0.800000012",
-          "eta": "0.0799999982",
-          "gamma": "0",
-          "grow_policy": "depthwise",
-          "interaction_constraints": "",
-          "lambda": "1",
-          "learning_rate": "0.0799999982",
-          "max_bin": "256",
-          "max_cat_threshold": "64",
-          "max_cat_to_onehot": "4",
-          "max_delta_step": "0",
-          "max_depth": "3",
-          "max_leaves": "0",
-          "min_child_weight": "1",
-          "min_split_loss": "0",
-          "monotone_constraints": "()",
-          "refresh_leaf": "1",
-          "reg_alpha": "0",
-          "reg_lambda": "1",
-          "sampling_method": "uniform",
-          "sparse_threshold": "0.20000000000000001",
-          "subsample": "0.899999976"
-        },
-        "updater": [
-          {
-            "hist_train_param": {
-              "debug_synchronize": "0",
-              "max_cached_hist_node": "18446744073709551615"
-            },
-            "name": "grow_quantile_histmaker"
-          }
-        ]
-      },
-      "learner_model_param": {
-        "base_score": "[3.874835E0,-8.148922E0,3.4693727E0,-8.148922E0,3.874835E0,5.0788035E0]",
-        "boost_from_average": "1",
-        "num_class": "6",
-        "num_feature": "12",
-        "num_target": "1"
-      },
-      "learner_train_param": {
-        "booster": "gbtree",
-        "disable_default_eval_metric": "0",
-        "multi_strategy": "one_output_per_tree",
-        "objective": "multi:softprob"
-      },
-      "metrics": [
-        {
-          "name": "mlogloss"
-        }
-      ],
-      "objective": {
-        "name": "multi:softprob",
-        "softmax_multiclass_param": {
-          "num_class": "6"
-        }
-      }
-    },
-    "version": [
-      3,
-      2,
-      0
-    ]
-  },
-  "calibrated_event_threshold": 0.2
+"""
+Battery Management - Charging Schedule Prediction (Walk-Forward Rolling Retrain)
+======================================================================================
+Reuses the same daily wide CSVs (Approach 2, no clipping, NaN-preserving) and
+the same pooled/compact feature set introduced in v4. This is v5, changing
+ONLY the train/test protocol - not the features or model architecture:
+
+  v4 (single 75/25 split, trained ONCE) -> MAE ~4.15 hrs (STAGE1/2_ROUNDS=350)
+     Worked well for offline evaluation, but isn't how this would behave in
+     production: a real device's timeline keeps moving forward, so a model
+     frozen at "day 75" would get staler and staler as new days arrive.
+
+  v5 (walk-forward, but window size = 75% of total rows) -> MAE ~3.89 hrs
+     Worked well offline, but "75% of total" only makes sense when you
+     already know the total day count upfront (a fixed CSV). A real
+     device accumulates data continuously and never knows its "total" in
+     advance, so a percentage-based window has nothing to divide.
+
+  v6 (fixed TRAIN_WINDOW_DAYS instead of a fraction) -> deployment-realistic
+     window sizing, but several devices still showed matched=0 and
+     MAE=N/A - caused by a fixed EVENT_THRESHOLD=0.5 defaulting devices
+     with a naturally low event-rate to "always predict no-event."
+
+  v7 (THIS FILE): same as v6, but the Stage-1 decision threshold is now
+     CALIBRATED per rolling window using only that window's training
+     labels (sweep candidate thresholds, pick whichever maximizes F1 for
+     the event class - no test data involved, no leakage). Devices whose
+     0.5 threshold was already working fine end up with a calibrated
+     threshold near 0.5 anyway, so this targets exactly the devices that
+     were stuck at matched=0 without changing behavior elsewhere.
+
+Outputs (results/xgboost/charging_schedule/) - same filenames/columns as
+prior versions, so generate_report.py needs no changes:
+  charging_schedule_predictions_<device>.csv
+  charging_schedule_summary.csv
+  charging_schedule_mae_plot.png
+  charging_schedule_sample_days_<device>.png
+"""
+
+import os
+import glob
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import xgboost as xgb
+
+warnings.filterwarnings("ignore")
+
+# --- Bucketing (Stage 2 label space) ------------------------------------
+BUCKET_SIZE     = 4
+N_HOUR_BUCKETS  = 24 // BUCKET_SIZE
+
+def hour_to_bucket(hour):
+    return hour // BUCKET_SIZE
+
+def bucket_to_representative_hour(bucket):
+    return bucket * BUCKET_SIZE + (BUCKET_SIZE - 1) / 2.0
+
+# --- Stage 1: event / no-event binary classifier -------------------------
+STAGE1_PARAMS = {
+    "max_depth": 3, "eta": 0.08,
+    "subsample": 0.9, "colsample_bytree": 0.8,
+    "seed": 42, "verbosity": 0,
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
 }
+STAGE1_ROUNDS = 350   # bumped from 300 -> user found this reduced MAE 4.15 vs 4.55
+
+# --- Stage 2: which bucket, given an event happens -----------------------
+STAGE2_PARAMS = {
+    "max_depth": 3, "eta": 0.08,
+    "subsample": 0.9, "colsample_bytree": 0.8,
+    "seed": 42, "verbosity": 0,
+    "objective": "multi:softprob",
+    "eval_metric": "mlogloss",
+    "num_class": N_HOUR_BUCKETS,
+}
+STAGE2_ROUNDS = 350
+# NOTE: EVENT_THRESHOLD below is now only a FALLBACK. The real decision
+# threshold is calibrated per rolling window in calibrate_event_threshold()
+# using only that window's training labels (no test/leakage) - a fixed
+# 0.5 was defaulting several devices to "always no-event" whenever their
+# training window had a naturally low event rate, which is exactly why
+# those devices showed matched=0/N and MAE=N/A. Calibrating the
+# threshold per window fixes that directly, without touching devices
+# whose 0.5 threshold was already working fine (their optimal threshold
+# will land near 0.5 anyway).
+EVENT_THRESHOLD = 0.5
+THRESHOLD_CANDIDATES = np.round(np.arange(0.15, 0.86, 0.05), 2)
+
+WIDE_CSV_FOLDER = "results/wide_csv"
+OUTPUT_FOLDER   = "results/xgboost/charging_schedule"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+HOURS = list(range(24))
+DSOCDT_COLS = [f"dSocdt_h{h}" for h in HOURS]
+SOC_COLS    = [f"Soc_h{h}"    for h in HOURS]
+
+MIN_HOURLY_RISE_ACTUAL = 0.0095   # defines what counts as "an event" (labeling decision)
+MIN_HISTORY_DAYS = 7              # days of raw history needed before the first feature row
+ROLL_SHORT = 3
+ROLL_LONG  = 7
+EVENT_HISTORY_LOOKBACK = 10
+
+# --- Walk-forward rolling-window retrain settings -------------------------
+# Fixed day-count, NOT a fraction of total history - a real device doesn't
+# know its "total" days in advance (data arrives continuously), so the
+# window size has to be a constant decided upfront from offline testing,
+# not derived from dividing an unknown total. Offline testing showed ~75%
+# of a ~70-75 day dataset (~56 days) worked well; rounded to 50 as the
+# fixed deployment window.
+TRAIN_WINDOW_DAYS     = 60    # fixed size, rolls forward - does NOT scale with dataset length
+RETRAIN_INTERVAL_DAYS = 7     # slide + retrain every N predicted days ("weekly retrain")
+MIN_TRAIN_ROWS        = 8     # don't attempt to train on fewer rows than this
+
+
+def find_top_peak_hour(dsocdt_24h, min_hourly_rise):
+    """Largest-total-rise contiguous run -> representative hour (0-23), or -1 if none."""
+    n = len(dsocdt_24h)
+    runs, i = [], 0
+    while i < n:
+        v = dsocdt_24h[i]
+        if not np.isnan(v) and v > min_hourly_rise:
+            run_hours, run_vals = [i], [v]
+            j = i + 1
+            while j < n and not np.isnan(dsocdt_24h[j]) and dsocdt_24h[j] > min_hourly_rise:
+                run_hours.append(j); run_vals.append(dsocdt_24h[j]); j += 1
+            total_rise = float(np.sum(run_vals)) * 60
+            weighted_hour = float(np.average(run_hours, weights=run_vals))
+            runs.append((total_rise, weighted_hour))
+            i = j
+        else:
+            i += 1
+    if not runs:
+        return -1
+    return int(round(max(runs, key=lambda x: x[0])[1]))
+
+
+def precompute_daily_summaries(wide):
+    n = len(wide)
+    peak_hour = np.full(n, -1, dtype=int)
+    day_max_dsocdt = np.full(n, np.nan)
+    day_min_soc = np.full(n, np.nan)
+    day_end_soc = np.full(n, np.nan)
+
+    for i in range(n):
+        dsocdt = wide.iloc[i][DSOCDT_COLS].values.astype(float)
+        soc = wide.iloc[i][SOC_COLS].values.astype(float)
+        peak_hour[i] = find_top_peak_hour(dsocdt, MIN_HOURLY_RISE_ACTUAL)
+        if not np.all(np.isnan(dsocdt)):
+            day_max_dsocdt[i] = np.nanmax(dsocdt)
+        if not np.all(np.isnan(soc)):
+            day_min_soc[i] = np.nanmin(soc)
+            last_valid = soc[~np.isnan(soc)]
+            day_end_soc[i] = last_valid[-1] if len(last_valid) else np.nan
+
+    return peak_hour, day_max_dsocdt, day_min_soc, day_end_soc
+
+
+def build_dataset(wide):
+    """One row per day from MIN_HISTORY_DAYS onward. Every feature is
+    computed causally (only ever using days strictly before day i)."""
+    n = len(wide)
+    peak_hour, day_max_dsocdt, day_min_soc, day_end_soc = precompute_daily_summaries(wide)
+    dates = wide.index.tolist()
+
+    rows, events, buckets, actual_hours, row_dates = [], [], [], [], []
+
+    for i in range(MIN_HISTORY_DAYS, n):
+        ts = pd.Timestamp(dates[i])
+        dow, dom, month, year = float(ts.dayofweek), float(ts.day), float(ts.month), float(ts.year)
+
+        days_since_event, last_event_hour = float(i), 12.0
+        for back in range(1, i + 1):
+            if peak_hour[i - back] != -1:
+                days_since_event = float(back)
+                last_event_hour = float(peak_hour[i - back])
+                break
+
+        short_win = day_max_dsocdt[max(0, i - ROLL_SHORT):i]
+        long_win  = day_max_dsocdt[max(0, i - ROLL_LONG):i]
+        roll_mean_3 = float(np.nanmean(short_win)) if not np.all(np.isnan(short_win)) else 0.0
+        roll_mean_7 = float(np.nanmean(long_win)) if not np.all(np.isnan(long_win)) else 0.0
+        roll_std_7  = float(np.nanstd(long_win)) if not np.all(np.isnan(long_win)) else 0.0
+
+        past_event_hours = [peak_hour[j] for j in range(i) if peak_hour[j] != -1][-EVENT_HISTORY_LOOKBACK:]
+        mean_event_hour = float(np.mean(past_event_hours)) if past_event_hours else 12.0
+
+        y_min_soc = float(day_min_soc[i - 1]) if not np.isnan(day_min_soc[i - 1]) else 50.0
+        y_end_soc = float(day_end_soc[i - 1]) if not np.isnan(day_end_soc[i - 1]) else 50.0
+
+        feats = [dow, dom, month, year, days_since_event, last_event_hour,
+                 roll_mean_3, roll_mean_7, roll_std_7, mean_event_hour,
+                 y_min_soc, y_end_soc]
+
+        rows.append(feats)
+        events.append(0 if peak_hour[i] == -1 else 1)
+        buckets.append(np.nan if peak_hour[i] == -1 else hour_to_bucket(peak_hour[i]))
+        actual_hours.append(np.nan if peak_hour[i] == -1 else float(peak_hour[i]))
+        row_dates.append(dates[i])
+
+    return (np.array(rows, dtype=float), np.array(events, dtype=int),
+            np.array(buckets, dtype=float), np.array(actual_hours, dtype=float), row_dates)
+
+
+def calibrate_event_threshold(booster1, X_train, y_event_train):
+    """Sweep candidate thresholds against the TRAINING labels only (no
+    test data involved) and return whichever maximizes F1 for the event
+    class. Falls back to EVENT_THRESHOLD if training has no positives
+    (shouldn't happen here since train_stage_models already requires
+    both classes present, but kept as a safety net)."""
+    dtrain = xgb.DMatrix(X_train)
+    train_probs = booster1.predict(dtrain)
+    y_true = y_event_train
+
+    best_thresh, best_f1 = EVENT_THRESHOLD, -1.0
+    for t in THRESHOLD_CANDIDATES:
+        y_pred = (train_probs >= t).astype(int)
+        tp = int(np.sum((y_pred == 1) & (y_true == 1)))
+        fp = int(np.sum((y_pred == 1) & (y_true == 0)))
+        fn = int(np.sum((y_pred == 0) & (y_true == 1)))
+        if tp == 0:
+            f1 = 0.0
+        else:
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        if f1 > best_f1:
+            best_f1, best_thresh = f1, float(t)
+    return best_thresh
+
+
+def train_stage_models(X_train, y_event_train, y_bucket_train):
+    """Train Stage 1 + Stage 2 on one rolling window. Returns (booster1,
+    booster2_or_None, fallback_bucket, calibrated_threshold) or None if
+    the window can't support training (e.g. only one class present)."""
+    n_event, n_no_event = int(y_event_train.sum()), int((y_event_train == 0).sum())
+    if n_event == 0 or n_no_event == 0 or len(X_train) < MIN_TRAIN_ROWS:
+        return None
+
+    scale_pos_weight = n_no_event / n_event
+    stage1_params = dict(STAGE1_PARAMS, scale_pos_weight=scale_pos_weight)
+    dtrain1 = xgb.DMatrix(X_train, label=y_event_train)
+    booster1 = xgb.train(stage1_params, dtrain1, num_boost_round=STAGE1_ROUNDS)
+    calibrated_threshold = calibrate_event_threshold(booster1, X_train, y_event_train)
+
+    event_mask = y_event_train == 1
+    X_event_train = X_train[event_mask]
+    y_bucket_event_train = y_bucket_train[event_mask].astype(int)
+    booster2 = None
+    fallback_bucket = int(pd.Series(y_bucket_event_train).mode()[0]) if len(y_bucket_event_train) else 0
+    if len(X_event_train) >= 2 and len(set(y_bucket_event_train.tolist())) >= 2:
+        dtrain2 = xgb.DMatrix(X_event_train, label=y_bucket_event_train)
+        booster2 = xgb.train(STAGE2_PARAMS, dtrain2, num_boost_round=STAGE2_ROUNDS)
+
+    return booster1, booster2, fallback_bucket, calibrated_threshold
+
+def run_device_walk_forward(wide, device_name):
+    X, y_event, y_bucket, y_actual_hour, dates = build_dataset(wide)
+    n_rows = len(X)
+    if n_rows < MIN_TRAIN_ROWS + 1:
+        print(f"  Skipping: only {n_rows} usable rows after feature warm-up.")
+        return []
+
+    train_window = min(TRAIN_WINDOW_DAYS, n_rows - 1)   # leave >=1 row to predict
+    train_window = max(MIN_TRAIN_ROWS, train_window)
+
+    results = []
+    cursor = train_window            # index of the first day we predict
+    n_retrains = 0
+    current_models = None
+
+    while cursor < n_rows:
+        chunk_end = min(cursor + RETRAIN_INTERVAL_DAYS, n_rows)
+
+        # Rolling window: most recent `train_window` rows strictly before `cursor`
+        train_start = max(0, cursor - train_window)
+        X_train = X[train_start:cursor]
+        y_event_train = y_event[train_start:cursor]
+        y_bucket_train = y_bucket[train_start:cursor]
+
+        trained = train_stage_models(X_train, y_event_train, y_bucket_train)
+        if trained is not None:
+            current_models = trained
+            n_retrains += 1
+        # if this window couldn't be trained (e.g. single class), we keep
+        # using the last successfully trained model rather than predicting
+        # blindly - same as a production system skipping a bad retrain
+
+        if current_models is not None:
+            booster1, booster2, fallback_bucket, event_threshold = current_models
+            X_chunk = X[cursor:chunk_end]
+            dchunk = xgb.DMatrix(X_chunk)
+            event_probs = booster1.predict(dchunk)
+
+            for local_idx in range(len(X_chunk)):
+                global_idx = cursor + local_idx
+                predicted_event = bool(event_probs[local_idx] >= event_threshold)
+                pred_peak = None
+                if predicted_event:
+                    if booster2 is not None:
+                        probs2 = booster2.predict(xgb.DMatrix(X_chunk[local_idx:local_idx + 1]))[0]
+                        pred_bucket = int(np.argmax(probs2))
+                    else:
+                        pred_bucket = fallback_bucket
+                    pred_peak = bucket_to_representative_hour(pred_bucket)
+
+                actual_val = y_actual_hour[global_idx]
+                actual_peak_out = None if np.isnan(actual_val) else float(actual_val)
+                error = (abs(actual_peak_out - pred_peak)
+                         if (actual_peak_out is not None and pred_peak is not None) else np.nan)
+
+                results.append({
+                    "predict_date": dates[global_idx], "actual_peak": actual_peak_out,
+                    "pred_peak": pred_peak, "error": error,
+                })
+
+        cursor = chunk_end
+
+    # Dump the final trained model's full hyperparameter/config JSON so it
+    # Only the LAST successfully retrained model (most recent rolling window) is dumped,
+    # not every retrain along the walk-forward loop.
+    if current_models is not None:
+        booster1, booster2, fallback_bucket, event_threshold = current_models
+        config_path = os.path.join(OUTPUT_FOLDER, f"model_config_{device_name}.json")
+        dump = {
+            "stage1_event_classifier": json.loads(booster1.save_config()),
+            "stage2_bucket_classifier": json.loads(booster2.save_config()) if booster2 is not None else None,
+            "calibrated_event_threshold": event_threshold,
+        }
+        with open(config_path, "w") as f:
+            json.dump(dump, f, indent=2)
+        print(f"  Model config dumped → {config_path}")
+
+    print(f"  Rows: {n_rows} total | rolling train window: {train_window} days | "
+          f"retrained {n_retrains}x every {RETRAIN_INTERVAL_DAYS} days | predicted {len(results)} days")
+    return results
+
+def plot_mae_per_device(summary_df, plot_path):
+    dev_data = summary_df[summary_df["device"] != "OVERALL_MEAN"]
+    overall  = summary_df[summary_df["device"] == "OVERALL_MEAN"]
+    short_names = [d[:12] + "…" if len(d) > 12 else d for d in dev_data["device"]]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(dev_data) * 1.2), 6))
+    bars = ax.bar(range(len(dev_data)), dev_data["mae_hours"],
+                  color="steelblue", edgecolor="white", zorder=3)
+    if not overall.empty:
+        ax.axhline(overall["mae_hours"].values[0], color="crimson", linestyle="--",
+                   linewidth=1.8, label=f"Overall mean MAE: {overall['mae_hours'].values[0]:.2f} hrs")
+    for bar, val in zip(bars, dev_data["mae_hours"]):
+        if not pd.isna(val):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                    f"{val:.2f}", ha="center", va="bottom", fontsize=8, fontweight="bold")
+    ax.set_xticks(range(len(dev_data))); ax.set_xticklabels(short_names, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("MAE (hours)", fontsize=11)
+    ax.set_title("Top-1 Charging Peak (Walk-Forward Rolling Retrain) — MAE per Device",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9); ax.grid(axis="y", linestyle="--", alpha=0.4)
+    fig.tight_layout(); fig.savefig(plot_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"  Saved: {plot_path}")
+
+
+def plot_sample_days(results, wide, device_name, plot_path, n_samples=6):
+    if not results:
+        return
+    sample_idx = list(range(0, len(results), max(1, len(results) // n_samples)))[:n_samples]
+    n_cols, n_rows = 3, int(np.ceil(len(sample_idx) / 3))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 5 * n_rows))
+    axes = np.array(axes).reshape(-1)
+    fig.suptitle(f"Charging Schedule (Walk-Forward, Rolling Retrain) — {device_name}", fontsize=13, fontweight="bold")
+
+    for panel_i, idx in enumerate(sample_idx):
+        ax, r = axes[panel_i], results[idx]
+        actual = wide.loc[r["predict_date"]][DSOCDT_COLS].values.astype(float)
+        valid = ~np.isnan(actual)
+        ax.plot(np.array(HOURS)[valid], actual[valid], color="steelblue", linewidth=1.8,
+                marker="o", markersize=3, label="Actual dSocdt")
+        if r["actual_peak"] is not None:
+            ax.axvline(r["actual_peak"], color="steelblue", linewidth=2, alpha=0.6, label="Actual peak")
+        if r["pred_peak"] is not None:
+            ax.axvline(r["pred_peak"], color="crimson", linestyle="--", linewidth=2, alpha=0.6, label="Predicted peak")
+        err_str = f"{r['error']:.2f}hrs" if not pd.isna(r["error"]) else "N/A"
+        ax.set_title(f"{r['predict_date']} | err={err_str}", fontsize=9)
+        ax.set_xlabel("Hour of day", fontsize=8); ax.set_ylabel("dSocdt", fontsize=8)
+        ax.set_xticks(range(0, 24, 4)); ax.legend(fontsize=7, loc="upper right")
+        ax.grid(linestyle="--", alpha=0.3)
+    for empty_i in range(len(sample_idx), len(axes)):
+        axes[empty_i].axis("off")
+    fig.tight_layout(); fig.savefig(plot_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"  Saved: {plot_path}")
+
+
+if __name__ == "__main__":
+    print("=" * 65)
+    print("CHARGING SCHEDULE PREDICTION — WALK-FORWARD ROLLING RETRAIN (v5)")
+    print("=" * 65)
+    print(f"  Label-defining min hourly rise (actual) : {MIN_HOURLY_RISE_ACTUAL}")
+    print(f"  Min history before first feature row     : {MIN_HISTORY_DAYS} days")
+    print(f"  Rolling train window                     : {TRAIN_WINDOW_DAYS} days (fixed)")
+    print(f"  Retrain interval                         : every {RETRAIN_INTERVAL_DAYS} days")
+    print(f"  Event probability threshold              : calibrated per window (F1-optimal on train)")
+    print(f"  Stage rounds                              : {STAGE1_ROUNDS} / {STAGE2_ROUNDS}")
+    print("=" * 65 + "\n")
+
+    wide_files = sorted(glob.glob(os.path.join(WIDE_CSV_FOLDER, "*_wide.csv")))
+    if not wide_files:
+        raise FileNotFoundError(f"No *_wide.csv files in '{WIDE_CSV_FOLDER}'.")
+
+    all_summary_rows = []
+
+    for wf in wide_files:
+        device_name = os.path.splitext(os.path.basename(wf))[0].replace("_wide", "")
+        pred_path = os.path.join(OUTPUT_FOLDER, f"charging_schedule_predictions_{device_name}.csv")
+        plot_path = os.path.join(OUTPUT_FOLDER, f"charging_schedule_sample_days_{device_name}.png")
+
+        print("=" * 65); print(f"Device : {device_name}"); print("=" * 65)
+        try:
+            wide = pd.read_csv(wf, index_col="Date")
+            results = run_device_walk_forward(wide, device_name)
+            if not results:
+                print()
+                continue
+
+            pd.DataFrame([{
+                "predict_date": r["predict_date"], "actual_peak_hr": r["actual_peak"],
+                "pred_peak_hr": r["pred_peak"], "error_hrs": r["error"],
+            } for r in results]).to_csv(pred_path, index=False)
+            print(f"  Predictions CSV  →  {pred_path}")
+
+            plot_sample_days(results, wide, device_name, plot_path)
+
+            errors = [r["error"] for r in results if not pd.isna(r["error"])]
+            device_mae = float(np.mean(errors)) if errors else np.nan
+            print(f"  MAE (hours)          : {device_mae:.3f}" if not np.isnan(device_mae) else "  MAE: N/A")
+            print(f"  Matched day pairs    : {len(errors)} / {len(results)}")
+
+            all_summary_rows.append({
+                "device": device_name, "total_days": len(results),
+                "matched_pairs": len(errors),
+                "mae_hours": round(device_mae, 4) if not np.isnan(device_mae) else np.nan,
+            })
+        except Exception as e:
+            import traceback
+            print(f"  ERROR: {e}"); traceback.print_exc()
+        print()
+
+    summary_df = pd.DataFrame(all_summary_rows)
+    if not summary_df.empty:
+        overall_mae = round(float(np.nanmean(summary_df["mae_hours"])), 4)
+        summary_df = pd.concat([summary_df, pd.DataFrame([{
+            "device": "OVERALL_MEAN", "total_days": summary_df["total_days"].sum(),
+            "matched_pairs": summary_df["matched_pairs"].sum(), "mae_hours": overall_mae,
+        }])], ignore_index=True)
+
+    summary_csv_path = os.path.join(OUTPUT_FOLDER, "charging_schedule_summary.csv")
+    summary_df.to_csv(summary_csv_path, index=False)
+    print(f"\nGlobal summary  →  {summary_csv_path}")
+
+    if not summary_df.empty:
+        plot_mae_per_device(summary_df, os.path.join(OUTPUT_FOLDER, "charging_schedule_mae_plot.png"))
+
+    print("\n" + "=" * 65)
+    print("FINAL SUMMARY")
+    print("=" * 65)
+    for _, row in summary_df.iterrows():
+        mae_str = f"{row['mae_hours']:.2f} hrs" if not pd.isna(row['mae_hours']) else "N/A"
+        print(f"  {row['device']:<35}  MAE={mae_str:>10}  matched={int(row['matched_pairs'])}/{int(row['total_days'])}")
+    print("=" * 65)
