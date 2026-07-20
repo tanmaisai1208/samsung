@@ -1,0 +1,18 @@
+1) 
+Dear AIl,
+As part of our AI Transformation, the adoption of AI coding assistants has significantly increased across our development teams. Measuring AI Productivity is now essential to understand its impact and gain meaningful insights into how AI is shaping our software delivery. 
+Toward this goal, we are rolling out AITRA (AI Productivity Measurement Agent)  — an agent that measures how AI coding assistants (ClineSR, Claude, Codex, Gemini) are contributing to our software development efforts.
+
+We have shared brodcast mail on the same yesterday.
+
+2)
+http://srib-ai-first-hub/app/marketplace/aitra
+
+
+3)
+First-Time Configuration
+Click "+ Add Workspace" and fill in details for all Linux workstations if you are accessing cline from them.
+
+
+4)
+NOTE: Adding a workspace is only needed when using a coding assistant with a remote host. No configuration is required for the primary Windows PC.
