@@ -1,18 +1,26 @@
-1) 
-Dear AIl,
-As part of our AI Transformation, the adoption of AI coding assistants has significantly increased across our development teams. Measuring AI Productivity is now essential to understand its impact and gain meaningful insights into how AI is shaping our software delivery. 
-Toward this goal, we are rolling out AITRA (AI Productivity Measurement Agent)  — an agent that measures how AI coding assistants (ClineSR, Claude, Codex, Gemini) are contributing to our software development efforts.
+Table of Contents
+APPROACH 1 — ORIGINAL METHODOLOGY (results_1/)
+1 Project Overview & Problem Statement
+2 Dataset Description & File Structure
+3 Data Preprocessing (Interpolation-Based Resampling)
+4 Statistical Analysis — Autocorrelation & Hurst Exponent
+5 XGBoost Model & Hyperparameter Tuning
+6 Final Validation Results
+7 Feature Importance Analysis
+8 Tree Rule Extraction & Interpretation
+9 Model Size & Inference Time Analysis
+10 Charging-Detection Diagnostic (Task A & Task B)
+11 Limitations Identified in Approach 1
 
-We have shared brodcast mail on the same yesterday.
+---------------------------------------------------------------------------------
 
-2)
-http://srib-ai-first-hub/app/marketplace/aitra
-
-
-3)
-First-Time Configuration
-Click "+ Add Workspace" and fill in details for all Linux workstations if you are accessing cline from them.
-
-
-4)
-NOTE: Adding a workspace is only needed when using a coding assistant with a remote host. No configuration is required for the primary Windows PC.
+APPROACH 2 — REVISED METHODOLOGY (results_2/)
+12 Motivation for Methodology Revision
+13 Revised Data Preprocessing (Average-Based Resampling)
+14 Revised Hyperparameter Tuning
+15 Revised Final Validation Results
+16 Revised Feature Importance Analysis
+17 Revised Tree Rule Extraction & Interpretation
+18 Comparison: Approach 1 vs Approach 2
+19 Charging Schedule Prediction (Pooled Model, Walk-Forward Retrain)
+20 Next Steps
